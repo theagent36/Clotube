@@ -49,10 +49,27 @@ class VlcPlayerManager(
     }
 
     private var activeMedia: Media? = null
+    private var activeFileId: String? = null
+    private var activeLocalFile: File? = null
+    var isPlaybackEnded: Boolean = false
+        private set
     private var pendingSeekJob: kotlinx.coroutines.Job? = null
     @Volatile
     var pendingStartPositionMs: Long = 0L
         private set
+
+    init {
+        mediaPlayer.setEventListener { event ->
+            when (event.type) {
+                MediaPlayer.Event.Playing -> {
+                    isPlaybackEnded = false
+                }
+                MediaPlayer.Event.EndReached -> {
+                    isPlaybackEnded = true
+                }
+            }
+        }
+    }
 
     fun attachLayout(layout: VLCVideoLayout) {
         try {
@@ -95,6 +112,9 @@ class VlcPlayerManager(
         startPositionMs: Long = 0L
     ) {
         pendingSeekJob?.cancel()
+        activeFileId = fileId
+        activeLocalFile = localFile
+        isPlaybackEnded = false
         mediaPlayer.stop()
         activeMedia?.release()
 
@@ -109,9 +129,9 @@ class VlcPlayerManager(
 
         media.apply {
             setHWDecoderEnabled(true, false)
-            if (startPositionMs > 1000L) {
-                addOption(":start-time=${startPositionMs / 1000}")
-            }
+            addOption("--no-sub-autodetect-file")
+            val startSecond = (startPositionMs / 1000L).coerceAtLeast(0L)
+            addOption(":start-time=$startSecond")
         }
 
         activeMedia = media
@@ -157,6 +177,13 @@ class VlcPlayerManager(
     fun seekTo(positionMs: Long) {
         pendingSeekJob?.cancel()
         pendingStartPositionMs = 0L
+        val isEndedOrEof = isPlaybackEnded || (!mediaPlayer.isPlaying && (mediaPlayer.time == -1L || (mediaPlayer.length > 0L && mediaPlayer.time >= mediaPlayer.length - 1500L)))
+        val currentFileId = activeFileId
+        if (isEndedOrEof && currentFileId != null) {
+            isPlaybackEnded = false
+            play(currentFileId, activeLocalFile, positionMs)
+            return
+        }
         val totalLength = mediaPlayer.length
         if (totalLength > 0L) {
             val maxSafeBoundaryMs = (totalLength - 3000L).coerceAtLeast(0L)

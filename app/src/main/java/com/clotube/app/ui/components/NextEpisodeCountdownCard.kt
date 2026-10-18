@@ -30,9 +30,11 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -51,7 +53,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.clotube.app.model.Episode
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 @Composable
 fun NextEpisodeCountdownCard(
@@ -60,42 +64,102 @@ fun NextEpisodeCountdownCard(
     isPlaying: Boolean,
     nextEpisode: Episode?,
     onPlayNext: (Episode) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    isScrubbing: Boolean = false
 ) {
     if (nextEpisode == null || durationMs <= 0L) return
 
     val remainingMs = (durationMs - currentPositionMs).coerceAtLeast(0L)
-    val shouldTriggerWindow = remainingMs in 1L..30_000L
+    val coroutineScope = rememberCoroutineScope()
 
     var isDismissed by remember(nextEpisode.id) { mutableStateOf(false) }
-    var countdownRemainingMs by remember(nextEpisode.id) { mutableLongStateOf(10_000L) }
+    var countdownRemainingSeconds by remember(nextEpisode.id) { mutableIntStateOf(30) }
+    var countdownRemainingMs by remember(nextEpisode.id) { mutableLongStateOf(30_000L) }
     var isCountdownActive by remember(nextEpisode.id) { mutableStateOf(false) }
+    var isPromptVisible by remember(nextEpisode.id) { mutableStateOf(false) }
+    var countdownJob by remember(nextEpisode.id) { mutableStateOf<Job?>(null) }
 
-    LaunchedEffect(shouldTriggerWindow, isDismissed) {
-        if (shouldTriggerWindow && !isDismissed) {
-            isCountdownActive = true
+    fun cancelCountdownAndReset(fullReset: Boolean = false) {
+        countdownJob?.cancel()
+        countdownJob = null
+        isCountdownActive = false
+        isPromptVisible = false
+        countdownRemainingSeconds = 30
+        countdownRemainingMs = 30_000L
+        if (fullReset) {
+            isDismissed = false
         }
     }
 
-    LaunchedEffect(isCountdownActive, isPlaying, countdownRemainingMs, isDismissed) {
-        if (isCountdownActive && isPlaying && !isDismissed && countdownRemainingMs > 0L) {
-            delay(100L)
-            countdownRemainingMs = (countdownRemainingMs - 100L).coerceAtLeast(0L)
-            if (countdownRemainingMs <= 0L) {
-                isCountdownActive = false
-                onPlayNext(nextEpisode)
+    // Cancel countdown and dismiss prompt on backward seek or scrubbing
+    LaunchedEffect(currentPositionMs, durationMs, isScrubbing) {
+        if (durationMs > 0L) {
+            val remaining = (durationMs - currentPositionMs).coerceAtLeast(0L)
+            if (isScrubbing || remaining > 30_000L) {
+                // If user is scrubbing or remaining duration > 30s:
+                // Immediately cancel active countdown Job, hide prompt, reset timer to 30
+                cancelCountdownAndReset(fullReset = remaining > 30_000L)
+            } else if (remaining in 1L..30_000L && !isDismissed && !isScrubbing && isPlaying) {
+                if (!isCountdownActive && countdownJob == null) {
+                    isCountdownActive = true
+                    isPromptVisible = true
+                    val currentSec = ((remaining + 999L) / 1000L).toInt().coerceIn(1, 30)
+                    countdownRemainingSeconds = currentSec
+                    countdownRemainingMs = remaining.coerceAtMost(30_000L)
+                    countdownJob = coroutineScope.launch {
+                        while (countdownRemainingMs > 0L) {
+                            delay(100L)
+                            countdownRemainingMs = (countdownRemainingMs - 100L).coerceAtLeast(0L)
+                            countdownRemainingSeconds = ((countdownRemainingMs + 999L) / 1000L).toInt().coerceIn(1, 30)
+                        }
+                        if (countdownRemainingMs <= 0L && !isScrubbing && !isDismissed) {
+                            isCountdownActive = false
+                            isPromptVisible = false
+                            onPlayNext(nextEpisode)
+                        }
+                    }
+                }
             }
         }
     }
 
-    val progressFraction = (countdownRemainingMs.toFloat() / 10_000f).coerceIn(0f, 1f)
+    // Handle pause / play toggle
+    LaunchedEffect(isPlaying) {
+        if (!isPlaying) {
+            countdownJob?.cancel()
+            countdownJob = null
+            isCountdownActive = false
+        } else if (isPlaying && !isScrubbing && !isDismissed && remainingMs in 1L..30_000L) {
+            if (!isCountdownActive && countdownJob == null) {
+                isCountdownActive = true
+                isPromptVisible = true
+                val currentSec = ((remainingMs + 999L) / 1000L).toInt().coerceIn(1, 30)
+                countdownRemainingSeconds = currentSec
+                countdownRemainingMs = remainingMs.coerceAtMost(30_000L)
+                countdownJob = coroutineScope.launch {
+                    while (countdownRemainingMs > 0L) {
+                        delay(100L)
+                        countdownRemainingMs = (countdownRemainingMs - 100L).coerceAtLeast(0L)
+                        countdownRemainingSeconds = ((countdownRemainingMs + 999L) / 1000L).toInt().coerceIn(1, 30)
+                    }
+                    if (countdownRemainingMs <= 0L && !isScrubbing && !isDismissed) {
+                        isCountdownActive = false
+                        isPromptVisible = false
+                        onPlayNext(nextEpisode)
+                    }
+                }
+            }
+        }
+    }
+
+    val progressFraction = (countdownRemainingMs.toFloat() / 30_000f).coerceIn(0f, 1f)
     val animatedProgress by animateFloatAsState(
         targetValue = progressFraction,
         animationSpec = tween(durationMillis = 100, easing = LinearEasing),
         label = "countdownBorderProgress"
     )
 
-    val isVisible = shouldTriggerWindow && !isDismissed
+    val isVisible = isPromptVisible && !isScrubbing && !isDismissed && isCountdownActive && (remainingMs in 1L..30_000L)
 
     AnimatedVisibility(
         visible = isVisible,
@@ -188,8 +252,8 @@ fun NextEpisodeCountdownCard(
                             fontSize = 12.sp,
                             fontWeight = FontWeight.Bold
                         )
-                        val secondsLeft = ((countdownRemainingMs + 999L) / 1000L).coerceIn(1L, 10L)
-                        if (secondsLeft in 1..10) {
+                        val secondsLeft = ((countdownRemainingMs + 999L) / 1000L).coerceIn(1L, 30L)
+                        if (secondsLeft in 1..30) {
                             Text(
                                 text = " • in ${secondsLeft}s",
                                 color = activeCyan,
@@ -218,7 +282,7 @@ fun NextEpisodeCountdownCard(
                 IconButton(
                     onClick = {
                         isDismissed = true
-                        isCountdownActive = false
+                        cancelCountdownAndReset(fullReset = false)
                     },
                     modifier = Modifier.size(24.dp)
                 ) {

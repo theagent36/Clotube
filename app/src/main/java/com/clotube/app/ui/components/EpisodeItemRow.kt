@@ -17,6 +17,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -24,6 +25,7 @@ import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import com.clotube.app.data.PlaybackHistoryManager
 import com.clotube.app.model.Episode
+import com.clotube.app.util.triggerClickHaptic
 import com.clotube.app.viewmodel.VideoViewModel
 import kotlinx.coroutines.launch
 
@@ -41,6 +43,7 @@ fun EpisodeItemRow(
     playbackHistoryManager: PlaybackHistoryManager?,
     modifier: Modifier = Modifier
 ) {
+    val view = LocalView.current
     val coroutineScope = rememberCoroutineScope()
 
     // Infinite transition for pulsing "NOW PLAYING" indicator
@@ -257,6 +260,7 @@ fun EpisodeItemRow(
                         .clip(RoundedCornerShape(8.dp))
                         .background(if (isWatched) Color(0xFF16322A) else Color(0xFF181F2C))
                         .clickable {
+                            view.triggerClickHaptic()
                             coroutineScope.launch {
                                 playbackHistoryManager?.toggleEpisodeWatched(
                                     episode = episode,
@@ -282,6 +286,7 @@ fun EpisodeItemRow(
                         .clip(RoundedCornerShape(8.dp))
                         .background(Color(0xFF181F2C))
                         .clickable {
+                            view.triggerClickHaptic()
                             if (isDownloading) onCancelDownload() else onStartDownload()
                         },
                     contentAlignment = Alignment.Center

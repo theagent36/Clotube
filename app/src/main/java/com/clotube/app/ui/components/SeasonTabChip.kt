@@ -39,10 +39,12 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.clotube.app.util.triggerClickHaptic
 import com.clotube.app.model.Season
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -55,6 +57,7 @@ fun SeasonTabChip(
     onMarkComplete: () -> Unit,
     onMarkIncomplete: () -> Unit
 ) {
+    val view = LocalView.current
     var isMenuOpen by remember { mutableStateOf(false) }
     val haptic = LocalHapticFeedback.current
 
@@ -169,6 +172,7 @@ fun SeasonTabChip(
                             }
                         },
                         onClick = {
+                            view.triggerClickHaptic()
                             isMenuOpen = false
                             onMarkIncomplete()
                         },
@@ -208,6 +212,7 @@ fun SeasonTabChip(
                             }
                         },
                         onClick = {
+                            view.triggerClickHaptic()
                             isMenuOpen = false
                             onMarkComplete()
                         },

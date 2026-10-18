@@ -19,6 +19,8 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
@@ -45,7 +47,9 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontFamily
+import com.clotube.app.util.triggerNavigationHaptic
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
@@ -64,6 +68,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.videolan.libvlc.LibVLC
@@ -158,8 +163,15 @@ fun ClotubeVideoPlayer(
                 }.apply {
                     addOption(":network-caching=3000")
                     addOption(":http-reconnect")
-                    if (startPositionMs > 1000L) {
-                        addOption(":start-time=${startPositionMs / 1000}")
+                    addOption("--no-sub-autodetect-file")
+                    val totalDuration = episode.durationMs
+                    val startSec = if (totalDuration > 0L && startPositionMs >= totalDuration - 5_000L) {
+                        0L
+                    } else {
+                        (startPositionMs / 1000L).coerceAtLeast(0L)
+                    }
+                    if (startSec > 0L) {
+                        addOption(":start-time=$startSec")
                     }
                     setHWDecoderEnabled(true, true)
                 }
@@ -213,11 +225,23 @@ fun ClotubeVideoPlayer(
         }
     }
 
-    // Initial launch with progress recovery
+    // Initial launch with progress recovery (Resets completed / already-watched episodes to 0L)
     LaunchedEffect(episode.id) {
         val initialSeek = withContext(Dispatchers.IO) {
             val savedProgress = viewModel.playbackHistoryManager.getProgressSync(episode.id)
-            if (savedProgress != null && savedProgress.positionMs > 2000L) savedProgress.positionMs else 0L
+            val isWatched = viewModel.playbackHistoryManager.isEpisodeWatched(episode.id).firstOrNull() ?: false
+            val totalDurationMs = if (savedProgress != null && savedProgress.durationMs > 0L) {
+                savedProgress.durationMs
+            } else {
+                episode.durationMs
+            }
+            val isNearEof = (totalDurationMs > 0L && savedProgress != null && savedProgress.positionMs >= totalDurationMs - 30_000L) ||
+                    (savedProgress != null && savedProgress.progressFraction >= 0.95f)
+            if (isWatched || isNearEof || savedProgress == null || savedProgress.positionMs <= 2000L) {
+                0L
+            } else {
+                savedProgress.positionMs
+            }
         }
         loadAndPlayStream(initialSeek)
     }
@@ -306,6 +330,7 @@ fun ClotubeVideoPlayer(
     onNavigateBack: () -> Unit
 ) {
     val context = LocalContext.current
+    val view = LocalView.current
     val activity = context as? Activity
     val lifecycleOwner = LocalLifecycleOwner.current
     val audioManager = remember { context.getSystemService(Context.AUDIO_SERVICE) as AudioManager }
@@ -386,11 +411,15 @@ fun ClotubeVideoPlayer(
         mutableLongStateOf(if (len > 0L) len else fallbackDurationMs)
     }
 
+    var isPlaybackEnded by remember(mediaId) { mutableStateOf(false) }
+    var hasStartedOnce by remember(mediaId) { mutableStateOf(false) }
+
     // Reset loading state whenever mediaId changes
     LaunchedEffect(mediaId) {
         isBuffering = true
         isSeeking = false
-        hasEnded = false
+        isPlaybackEnded = false
+        hasStartedOnce = false
         isFirstFrameRendered = false
         val len = mediaPlayer.length
         durationMs = if (len > 0L) len else fallbackDurationMs
@@ -411,9 +440,23 @@ fun ClotubeVideoPlayer(
     // Measured track width for pixel-perfect thumb and preview alignment
     var trackWidthPx by remember { mutableFloatStateOf(0f) }
 
-    // Scrubbing States
-    var isScrubbing by remember { mutableStateOf(false) }
-    var scrubFraction by remember { mutableFloatStateOf(0f) }
+    // 1. Local dragging state isolation: decouples slider thumb & timestamps from LibVLC TimeChanged events
+    var isDragging by remember { mutableStateOf(false) }
+    var dragFraction by remember { mutableFloatStateOf(0f) }
+
+    val actualFraction = if (durationMs > 0L) {
+        (currentPositionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
+    } else 0f
+
+    val displayFraction = if (isDragging) dragFraction else actualFraction
+    val displayedCurrentTimeMs = if (isDragging) {
+        (dragFraction * durationMs).toLong()
+    } else currentPositionMs
+
+    val isScrubbing = isDragging
+    val scrubFraction = dragFraction
+    val activeFraction = displayFraction
+    val displayPositionMs = displayedCurrentTimeMs
 
     // Floating Next Episode Dismissal
     var isFloatingNextDismissed by remember { mutableStateOf(false) }
@@ -475,8 +518,15 @@ fun ClotubeVideoPlayer(
                     }
                 }
                 MediaPlayer.Event.Buffering -> {
-                    isBuffering = event.buffering < 100f
-                    if (event.buffering >= 100f) {
+                    // Only set isBuffering = true if event.buffering < 100f && !isPlaying.
+                    // Once event.buffering >= 100f, set isBuffering = false.
+                    // Do NOT flip isPlaying to false during transient buffer events.
+                    if (event.buffering < 100f) {
+                        if (!isPlaying) {
+                            isBuffering = true
+                        }
+                    } else {
+                        isBuffering = false
                         isSeeking = false
                         val isCurrentlyResumed = lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
                         if (!isAppForegrounded || !isCurrentlyResumed) {
@@ -485,6 +535,7 @@ fun ClotubeVideoPlayer(
                             } catch (_: Exception) {}
                             isPlaying = false
                         } else if (mediaPlayer.isPlaying) {
+                            hasStartedOnce = true
                             isFirstFrameRendered = true
                         }
                     }
@@ -501,22 +552,37 @@ fun ClotubeVideoPlayer(
                         isPlaying = true
                         isBuffering = false
                         isSeeking = false
-                        hasEnded = false
+                        isPlaybackEnded = false
+                        hasStartedOnce = true
                         if (mediaPlayer.time > 0L) {
                             isFirstFrameRendered = true
                         }
                     }
                 }
-                MediaPlayer.Event.Paused, MediaPlayer.Event.Stopped -> {
+                MediaPlayer.Event.Paused -> {
                     isPlaying = false
+                    isBuffering = false
+                }
+                MediaPlayer.Event.Stopped -> {
+                    isPlaying = false
+                    isBuffering = false
                 }
                 MediaPlayer.Event.TimeChanged -> {
-                    isBuffering = false
-                    isSeeking = false
-                    isFirstFrameRendered = true
-                    if (!isScrubbing) {
+                    if (event.timeChanged > 0L) {
+                        isBuffering = false
+                        isPlaying = true
+                        hasStartedOnce = true
+                    }
+                    // Strictly ignore TimeChanged events while user is dragging the slider to eliminate jitter
+                    if (!isDragging) {
+                        isBuffering = false
+                        isSeeking = false
+                        isFirstFrameRendered = true
                         currentPositionMs = event.timeChanged.coerceAtLeast(0L)
                     }
+                }
+                MediaPlayer.Event.PositionChanged -> {
+                    // Strictly ignore PositionChanged while isDragging to prevent slider snap-backs
                 }
                 MediaPlayer.Event.LengthChanged -> {
                     if (event.lengthChanged > 0L) {
@@ -527,7 +593,7 @@ fun ClotubeVideoPlayer(
                     isPlaying = false
                     isBuffering = false
                     isSeeking = false
-                    hasEnded = true
+                    isPlaybackEnded = true
                     onPlaybackEnded?.invoke()
                 }
             }
@@ -565,16 +631,14 @@ fun ClotubeVideoPlayer(
     }
 
     // Polling Timeline Loop
-    LaunchedEffect(mediaPlayer, isPlaying, isScrubbing) {
+    LaunchedEffect(mediaPlayer, isDragging) {
         while (true) {
-            if (!isScrubbing) {
+            if (!isDragging) {
                 val currentTime = mediaPlayer.time.coerceAtLeast(0L)
                 currentPositionMs = currentTime
                 val len = mediaPlayer.length
                 if (len > 0L) durationMs = len
-                val currentlyPlaying = mediaPlayer.isPlaying
-                isPlaying = currentlyPlaying
-                if (currentlyPlaying && currentTime > 0L && !isSeeking) {
+                if (mediaPlayer.isPlaying && currentTime > 0L && !isSeeking) {
                     // Failsafe: if video is actively playing frames, dismiss loading spinner & placeholder immediately
                     isFirstFrameRendered = true
                     isBuffering = false
@@ -626,17 +690,35 @@ fun ClotubeVideoPlayer(
         activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
     }
 
-    val activeFraction = if (isScrubbing) {
-        scrubFraction
-    } else if (durationMs > 0L) {
-        (currentPositionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
-    } else {
-        0f
-    }
-
-    val displayPositionMs = if (isScrubbing) (scrubFraction * durationMs).toLong() else currentPositionMs
     val remainingMs = (durationMs - currentPositionMs).coerceAtLeast(0L)
     val showFloatingNext = false
+
+    fun seekTo(targetTimeMs: Long) {
+        val totalDur = if (durationMs > 0L) durationMs else mediaPlayer.length
+        val isEofOrEnded = isPlaybackEnded ||
+                (!mediaPlayer.isPlaying && mediaPlayer.time <= 0L && (hasStartedOnce || isFirstFrameRendered)) ||
+                (!mediaPlayer.isPlaying && mediaPlayer.time == -1L) ||
+                (totalDur > 0L && currentPositionMs >= totalDur - 1500L)
+        if (isEofOrEnded) {
+            val safeTarget = if (totalDur > 0L && targetTimeMs >= totalDur - 5000L) 0L else targetTimeMs.coerceAtLeast(0L)
+            isPlaybackEnded = false
+            isBuffering = true
+            isSeeking = true
+            currentPositionMs = safeTarget
+            if (onReloadMedia != null) {
+                onReloadMedia.invoke(safeTarget)
+            } else {
+                mediaPlayer.time = safeTarget
+                mediaPlayer.play()
+            }
+        } else {
+            isBuffering = true
+            isSeeking = true
+            mediaPlayer.time = targetTimeMs
+            currentPositionMs = targetTimeMs
+            if (!mediaPlayer.isPlaying) mediaPlayer.play()
+        }
+    }
 
     BoxWithConstraints(
         modifier = modifier
@@ -849,7 +931,7 @@ fun ClotubeVideoPlayer(
         // 6. Floating Next Episode Auto-Play Card
         if (nextEpisode != null) {
             NextEpisodeCountdownCard(
-                currentPositionMs = currentPositionMs,
+                currentPositionMs = if (isScrubbing) displayPositionMs else currentPositionMs,
                 durationMs = durationMs,
                 isPlaying = isPlaying,
                 nextEpisode = nextEpisode,
@@ -859,7 +941,8 @@ fun ClotubeVideoPlayer(
                 modifier = Modifier
                     .align(Alignment.BottomEnd)
                     .then(if (currentFullscreen) Modifier.navigationBarsPadding() else Modifier)
-                    .padding(end = 16.dp, bottom = if (currentFullscreen) 80.dp else 16.dp)
+                    .padding(end = 16.dp, bottom = if (currentFullscreen) 80.dp else 16.dp),
+                isScrubbing = isScrubbing
             )
         }
 
@@ -898,10 +981,17 @@ fun ClotubeVideoPlayer(
                     }
             ) {
                 // Top Action Bar
+                val isPortrait = configuration.orientation == Configuration.ORIENTATION_PORTRAIT
+                val insetModifier = if (isPortrait) {
+                    Modifier.statusBarsPadding()
+                } else {
+                    Modifier.windowInsetsPadding(WindowInsets.displayCutout)
+                }
+
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .statusBarsPadding()
+                        .then(insetModifier)
                         .padding(horizontal = 8.dp, vertical = 4.dp)
                         .clickable(
                             interactionSource = remember { MutableInteractionSource() },
@@ -917,6 +1007,7 @@ fun ClotubeVideoPlayer(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         IconButton(onClick = {
+                            view.triggerNavigationHaptic()
                             resetInactivityTimer()
                             val isLandscapeOrientation = activity?.resources?.configuration?.orientation == Configuration.ORIENTATION_LANDSCAPE
                             if (isLandscapeOrientation || currentFullscreen) {
@@ -1042,20 +1133,7 @@ fun ClotubeVideoPlayer(
                         onClick = {
                             resetInactivityTimer()
                             val newTime = (mediaPlayer.time - 10000L).coerceAtLeast(0L)
-                            if (hasEnded) {
-                                if (onReloadMedia != null) {
-                                    hasEnded = false
-                                    isBuffering = true
-                                    onReloadMedia.invoke(newTime)
-                                } else {
-                                    mediaPlayer.time = newTime
-                                    mediaPlayer.play()
-                                }
-                            } else {
-                                mediaPlayer.time = newTime
-                                currentPositionMs = newTime
-                                if (!mediaPlayer.isPlaying) mediaPlayer.play()
-                            }
+                            seekTo(newTime)
                         },
                         modifier = Modifier.size(44.dp)
                     ) {
@@ -1083,23 +1161,29 @@ fun ClotubeVideoPlayer(
                             IconButton(
                                 onClick = {
                                     if (mediaPlayer.isPlaying) {
-                                        mediaPlayer.pause()
                                         isPlaying = false
+                                        mediaPlayer.pause()
                                         autoHideJob?.cancel() // Keep controls visible while paused
                                     } else {
-                                        if (hasEnded || (durationMs > 0L && currentPositionMs >= durationMs - 1500L)) {
+                                        val totalDur = if (durationMs > 0L) durationMs else mediaPlayer.length
+                                        val isEofOrEnded = isPlaybackEnded ||
+                                                (!mediaPlayer.isPlaying && mediaPlayer.time <= 0L && (hasStartedOnce || isFirstFrameRendered)) ||
+                                                (totalDur > 0L && currentPositionMs >= totalDur - 1500L)
+                                        if (isEofOrEnded) {
+                                            val startMs = if (totalDur > 0L && currentPositionMs >= totalDur - 5000L) 0L else currentPositionMs.coerceAtLeast(0L)
+                                            currentPositionMs = startMs
+                                            isPlaybackEnded = false
+                                            isBuffering = true
+                                            isPlaying = true
                                             if (onReloadMedia != null) {
-                                                hasEnded = false
-                                                isBuffering = true
-                                                onReloadMedia.invoke(0L)
+                                                onReloadMedia.invoke(startMs)
                                             } else {
-                                                mediaPlayer.time = 0L
-                                                mediaPlayer.play()
+                                                seekTo(startMs)
                                             }
                                         } else {
+                                            isPlaying = true
                                             mediaPlayer.play()
                                         }
-                                        isPlaying = true
                                         resetInactivityTimer()
                                     }
                                 },
@@ -1120,20 +1204,7 @@ fun ClotubeVideoPlayer(
                             resetInactivityTimer()
                             val totalDuration = if (durationMs > 0) durationMs else mediaPlayer.length
                             val newTime = (mediaPlayer.time + 10000L).coerceAtMost(totalDuration)
-                            if (hasEnded) {
-                                if (onReloadMedia != null) {
-                                    hasEnded = false
-                                    isBuffering = true
-                                    onReloadMedia.invoke(newTime)
-                                } else {
-                                    mediaPlayer.time = newTime
-                                    mediaPlayer.play()
-                                }
-                            } else {
-                                mediaPlayer.time = newTime
-                                currentPositionMs = newTime
-                                if (!mediaPlayer.isPlaying) mediaPlayer.play()
-                            }
+                            seekTo(newTime)
                         },
                         modifier = Modifier.size(44.dp)
                     ) {
@@ -1267,89 +1338,38 @@ fun ClotubeVideoPlayer(
                             .fillMaxWidth()
                             .height(36.dp)
                             .onSizeChanged { trackWidthPx = it.width.toFloat() }
-                            .pointerInput(durationMs) {
-                                detectTapGestures(
-                                    onPress = { offset ->
-                                        if (durationMs > 0L && size.width > 0) {
-                                            resetInactivityTimer()
-                                            isScrubbing = true
-                                            isSeeking = true
-                                            val fraction = (offset.x / size.width.toFloat()).coerceIn(0f, 1f)
-                                            scrubFraction = fraction
+                            .pointerInput(Unit) {
+                                awaitEachGesture {
+                                    val down = awaitFirstDown(requireUnconsumed = false)
+                                    val currentWidth = size.width.toFloat()
+                                    if (currentWidth > 0f) {
+                                        resetInactivityTimer()
+                                        isDragging = true
+                                        dragFraction = (down.position.x / currentWidth).coerceIn(0f, 1f)
+                                    }
 
-                                            val released = tryAwaitRelease()
-                                            if (released) {
-                                                val targetMs = calculateSafeSeekTargetMs(scrubFraction, durationMs)
-                                                if (hasEnded || (durationMs > 0L && targetMs >= durationMs - 1500L)) {
-                                                    if (onReloadMedia != null) {
-                                                        hasEnded = false
-                                                        isBuffering = true
-                                                        onReloadMedia.invoke(targetMs)
-                                                    } else {
-                                                        mediaPlayer.time = targetMs
-                                                        mediaPlayer.play()
-                                                    }
-                                                } else {
-                                                    isBuffering = true
-                                                    isSeeking = true
-                                                    mediaPlayer.time = targetMs
-                                                    currentPositionMs = targetMs
-                                                    if (!mediaPlayer.isPlaying) mediaPlayer.play()
-                                                }
-                                                isScrubbing = false
-                                                resetInactivityTimer()
-                                            }
+                                    while (true) {
+                                        val event = awaitPointerEvent()
+                                        val pointerChange = event.changes.firstOrNull { it.id == down.id } ?: break
+                                        if (!pointerChange.pressed) {
+                                            pointerChange.consume()
+                                            break
+                                        }
+                                        pointerChange.consume()
+                                        resetInactivityTimer()
+                                        val width = size.width.toFloat()
+                                        if (width > 0f) {
+                                            dragFraction = (pointerChange.position.x / width).coerceIn(0f, 1f)
                                         }
                                     }
-                                )
-                            }
-                            .pointerInput(durationMs) {
-                                detectDragGestures(
-                                    onDragStart = { offset ->
-                                        if (durationMs > 0L && size.width > 0) {
-                                            resetInactivityTimer()
-                                            isScrubbing = true
-                                            isSeeking = true
-                                            scrubFraction = (offset.x / size.width.toFloat()).coerceIn(0f, 1f)
-                                        }
-                                    },
-                                    onDrag = { change, _ ->
-                                        change.consume()
-                                        if (durationMs > 0L && size.width > 0) {
-                                            resetInactivityTimer()
-                                            isSeeking = true
-                                            scrubFraction = (change.position.x / size.width.toFloat()).coerceIn(0f, 1f)
-                                        }
-                                    },
-                                    onDragEnd = {
-                                        if (durationMs > 0L) {
-                                            val targetMs = calculateSafeSeekTargetMs(scrubFraction, durationMs)
-                                            if (hasEnded || targetMs >= durationMs - 1500L) {
-                                                if (onReloadMedia != null) {
-                                                    hasEnded = false
-                                                    isBuffering = true
-                                                    onReloadMedia.invoke(targetMs)
-                                                } else {
-                                                    mediaPlayer.time = targetMs
-                                                    mediaPlayer.play()
-                                                }
-                                            } else {
-                                                isBuffering = true
-                                                isSeeking = true
-                                                mediaPlayer.time = targetMs
-                                                currentPositionMs = targetMs
-                                                if (!mediaPlayer.isPlaying) mediaPlayer.play()
-                                            }
-                                        }
-                                        isScrubbing = false
-                                        resetInactivityTimer()
-                                    },
-                                    onDragCancel = {
-                                        isScrubbing = false
-                                        isSeeking = false
-                                        resetInactivityTimer()
+
+                                    if (durationMs > 0L) {
+                                        val targetMs = calculateSafeSeekTargetMs(dragFraction, durationMs)
+                                        seekTo(targetMs)
                                     }
-                                )
+                                    isDragging = false
+                                    resetInactivityTimer()
+                                }
                             },
                         contentAlignment = Alignment.CenterStart
                     ) {

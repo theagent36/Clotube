@@ -30,6 +30,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
 import com.clotube.app.model.ContinueWatchingItem
@@ -116,6 +117,7 @@ fun VideoItem.toMovie(): Movie = Movie(
 
 data class ContinueWatchingData(
     val mediaId: String,
+    val seriesId: String = "",
     val title: String,
     val subtitle: String,
     val episodeTitle: String = "",
@@ -128,7 +130,6 @@ data class ContinueWatchingData(
     val rawMovie: Movie? = null
 ) {
     val episode: Episode? get() = rawEpisode
-    val seriesId: String get() = if (!isMovie) (rawEpisode?.id?.let { mediaId } ?: "") else ""
     val seriesTitle: String get() = if (!isMovie) title.substringBefore(" • ") else ""
     val seriesPosterUrl: String get() = thumbnailUrl
 }
@@ -215,10 +216,21 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             val downloadRepo = com.clotube.app.data.DownloadRepository(getApplication())
             val localFile = downloadRepo.getLocalFileIfDownloaded(fileId)
             val initialSeek = if (startPositionMs > 0L) {
-                startPositionMs
+                val totalDuration = movie?.durationMs ?: 0L
+                val isNearEof = (totalDuration > 0L && startPositionMs >= totalDuration - 30_000L)
+                if (isNearEof) 0L else startPositionMs
             } else {
                 val savedProgress = playbackHistoryManager.getProgressSync(fileId)
-                if (savedProgress != null && savedProgress.positionMs > 2000L) savedProgress.positionMs else 0L
+                val totalDuration = if (savedProgress != null && savedProgress.durationMs > 0L) savedProgress.durationMs else (movie?.durationMs ?: 0L)
+                val isCompletedOrNearEof = (savedProgress != null && (
+                    savedProgress.progressFraction >= 0.95f ||
+                    (totalDuration > 0L && savedProgress.positionMs >= totalDuration - 30_000L)
+                ))
+                if (isCompletedOrNearEof || savedProgress == null || savedProgress.positionMs <= 2000L) {
+                    0L
+                } else {
+                    savedProgress.positionMs
+                }
             }
             withContext(Dispatchers.Main) {
                 vlcPlayerManager.play(
@@ -235,10 +247,22 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             val downloadRepo = com.clotube.app.data.DownloadRepository(getApplication())
             val localFile = downloadRepo.getLocalFileIfDownloaded(episode.id)
             val initialSeek = if (startPositionMs > 0L) {
-                startPositionMs
+                val totalDuration = episode.durationMs
+                val isNearEof = (totalDuration > 0L && startPositionMs >= totalDuration - 30_000L)
+                if (isNearEof) 0L else startPositionMs
             } else {
                 val savedProgress = playbackHistoryManager.getProgressSync(episode.id)
-                if (savedProgress != null && savedProgress.positionMs > 2000L) savedProgress.positionMs else 0L
+                val isWatched = playbackHistoryManager.isEpisodeWatched(episode.id).firstOrNull() ?: false
+                val totalDuration = if (savedProgress != null && savedProgress.durationMs > 0L) savedProgress.durationMs else episode.durationMs
+                val isCompletedOrNearEof = isWatched || (savedProgress != null && (
+                    savedProgress.progressFraction >= 0.95f ||
+                    (totalDuration > 0L && savedProgress.positionMs >= totalDuration - 30_000L)
+                ))
+                if (isCompletedOrNearEof || savedProgress == null || savedProgress.positionMs <= 2000L) {
+                    0L
+                } else {
+                    savedProgress.positionMs
+                }
             }
             withContext(Dispatchers.Main) {
                 vlcPlayerManager.play(
@@ -590,88 +614,103 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         if (lastWatched == null) return@combine null
 
         // 1. Check if the last watched item is a Series Episode
-        val parentSeries = allSeries.firstOrNull { it.id == lastWatched.seriesId }
-            ?: loadCatalogFromDisk(getApplication()).firstOrNull { it.id == lastWatched.seriesId }
+        if (lastWatched.isSeries) {
+            val parentSeries = allSeries.firstOrNull { it.id == lastWatched.seriesId }
+                ?: loadCatalogFromDisk(getApplication()).firstOrNull { it.id == lastWatched.seriesId }
 
-        var matchedEpisode = parentSeries?.seasons
-            ?.flatMap { it.episodes }
-            ?.firstOrNull { it.id == lastWatched.episodeId }
-
-        if (matchedEpisode == null) {
-            val diskCatalog = loadCatalogFromDisk(getApplication())
-            val diskShow = diskCatalog.firstOrNull { it.id == lastWatched.seriesId }
-            matchedEpisode = diskShow?.seasons
+            var matchedEpisode = parentSeries?.seasons
                 ?.flatMap { it.episodes }
                 ?.firstOrNull { it.id == lastWatched.episodeId }
-        }
 
-        if (matchedEpisode == null && parentSeries != null && lastWatched.isSeries) {
-            val sNum = lastWatched.seasonNumber.coerceAtLeast(1)
-            val eNum = lastWatched.episodeNumber.coerceAtLeast(1)
-            val epMeta = com.clotube.app.data.metadata.OnlineMetadataResolver.resolveEpisode(
-                seriesName = parentSeries.title,
-                tvMazeSeriesId = 0L,
-                seasonNumber = sNum,
-                episodeNumber = eNum,
-                rawFileName = lastWatched.title
-            )
-            matchedEpisode = Episode(
-                id = lastWatched.episodeId,
-                seriesTitle = parentSeries.title,
-                displayTitle = epMeta.officialTitle.ifBlank { lastWatched.title },
-                seasonNumber = sNum,
-                episodeNumber = eNum,
-                thumbnailUrl = epMeta.thumbnailUrl.ifBlank { parentSeries.posterUrl.orEmpty() },
-                durationFormatted = if (lastWatched.durationMs > 0) formatTimestamp(lastWatched.durationMs) else "${epMeta.durationMinutes}:00"
-            )
-        }
-
-        if (parentSeries != null && matchedEpisode != null) {
-            val totalDuration = if (matchedEpisode.durationMs > 0) matchedEpisode.durationMs else lastWatched.durationMs
-            val progressPct = if (totalDuration > 0) {
-                ((lastWatched.positionMs.toFloat() / totalDuration.toFloat()) * 100).toInt().coerceIn(1, 99)
-            } else {
-                0
+            if (matchedEpisode == null) {
+                val diskCatalog = loadCatalogFromDisk(getApplication())
+                val diskShow = diskCatalog.firstOrNull { it.id == lastWatched.seriesId }
+                matchedEpisode = diskShow?.seasons
+                    ?.flatMap { it.episodes }
+                    ?.firstOrNull { it.id == lastWatched.episodeId }
             }
 
-            var artwork = matchedEpisode.thumbnailUrl.ifBlank { parentSeries.posterUrl.orEmpty() }
-            if (artwork.isBlank() || artwork.contains("googleusercontent.com") || artwork.contains("drive.google.com")) {
-                val sNum = matchedEpisode.seasonNumber.coerceAtLeast(1)
-                val eNum = matchedEpisode.episodeNumber.coerceAtLeast(1)
+            if (matchedEpisode == null && parentSeries != null) {
+                val sNum = lastWatched.seasonNumber.coerceAtLeast(1)
+                val eNum = lastWatched.episodeNumber.coerceAtLeast(1)
                 val epMeta = com.clotube.app.data.metadata.OnlineMetadataResolver.resolveEpisode(
                     seriesName = parentSeries.title,
                     tvMazeSeriesId = 0L,
                     seasonNumber = sNum,
                     episodeNumber = eNum,
-                    rawFileName = matchedEpisode.displayTitle
+                    rawFileName = lastWatched.title
+                )
+                matchedEpisode = Episode(
+                    id = lastWatched.episodeId,
+                    seriesTitle = parentSeries.title,
+                    displayTitle = epMeta.officialTitle.ifBlank { lastWatched.title },
+                    seasonNumber = sNum,
+                    episodeNumber = eNum,
+                    thumbnailUrl = epMeta.thumbnailUrl.ifBlank { parentSeries.posterUrl.orEmpty() },
+                    durationFormatted = if (lastWatched.durationMs > 0) formatTimestamp(lastWatched.durationMs) else "${epMeta.durationMinutes}:00"
+                )
+            }
+
+            val sNum = matchedEpisode?.seasonNumber ?: lastWatched.seasonNumber.coerceAtLeast(1)
+            val eNum = matchedEpisode?.episodeNumber ?: lastWatched.episodeNumber.coerceAtLeast(1)
+            val sTag = "S" + sNum.toString().padStart(2, '0')
+            val eTag = "E" + eNum.toString().padStart(2, '0')
+            val seriesName = parentSeries?.title
+                ?: lastWatched.seriesTitle?.ifBlank { null }
+                ?: "The Mentalist"
+            val epTitle = matchedEpisode?.displayTitle
+                ?: lastWatched.title
+            val totalDuration = (matchedEpisode?.durationMs ?: 0L).takeIf { it > 0L }
+                ?: lastWatched.durationMs
+            val progressPct = if (totalDuration > 0) {
+                ((lastWatched.positionMs.toFloat() / totalDuration.toFloat()) * 100).toInt().coerceIn(1, 99)
+            } else {
+                (lastWatched.progressFraction * 100).toInt().coerceIn(0, 100)
+            }
+
+            var artwork = matchedEpisode?.thumbnailUrl?.ifBlank { null }
+                ?: lastWatched.thumbnailUrl?.ifBlank { null }
+                ?: lastWatched.backdropUrl?.ifBlank { null }
+                ?: parentSeries?.posterUrl.orEmpty()
+
+            if (artwork.isBlank() || artwork.contains("googleusercontent.com") || artwork.contains("drive.google.com")) {
+                val epMeta = com.clotube.app.data.metadata.OnlineMetadataResolver.resolveEpisode(
+                    seriesName = seriesName,
+                    tvMazeSeriesId = 0L,
+                    seasonNumber = sNum,
+                    episodeNumber = eNum,
+                    rawFileName = epTitle
                 )
                 if (epMeta.thumbnailUrl.isNotBlank()) {
                     artwork = epMeta.thumbnailUrl
                 }
             }
-            if (artwork.isBlank()) {
-                artwork = parentSeries.posterUrl.orEmpty()
-            }
-
-            val sTag = "S" + matchedEpisode.seasonNumber.toString().padStart(2, '0')
-            val eTag = "E" + matchedEpisode.episodeNumber.toString().padStart(2, '0')
 
             return@combine ContinueWatchingData(
-                mediaId = matchedEpisode.id,
-                title = "${parentSeries.title} • $sTag:$eTag",
-                subtitle = matchedEpisode.displayTitle,
-                episodeTitle = matchedEpisode.displayTitle,
+                mediaId = lastWatched.episodeId,
+                seriesId = parentSeries?.id ?: lastWatched.seriesId.orEmpty(),
+                title = "$seriesName • $sTag:$eTag",
+                subtitle = epTitle,
+                episodeTitle = epTitle,
                 thumbnailUrl = artwork,
                 isMovie = false,
                 progressPercentage = progressPct,
                 currentPositionMs = lastWatched.positionMs,
                 durationMs = totalDuration,
-                rawEpisode = matchedEpisode.copy(thumbnailUrl = artwork),
+                rawEpisode = matchedEpisode?.copy(thumbnailUrl = artwork) ?: Episode(
+                    id = lastWatched.episodeId,
+                    seriesTitle = seriesName,
+                    displayTitle = epTitle,
+                    seasonNumber = sNum,
+                    episodeNumber = eNum,
+                    thumbnailUrl = artwork,
+                    durationFormatted = if (totalDuration > 0) formatTimestamp(totalDuration) else ""
+                ),
                 rawMovie = null
             )
         }
 
-        // 2. Check if the last watched item is a Movie
+        // 2. Check if the last watched item is a Movie (only when isSeries is false)
         val matchedMovie = allMovies.firstOrNull {
             it.id == lastWatched.episodeId || it.id == lastWatched.seriesId
         } ?: _moviesState.value.firstOrNull {
@@ -683,7 +722,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             val progressPct = if (totalDuration > 0) {
                 ((lastWatched.positionMs.toFloat() / totalDuration.toFloat()) * 100).toInt().coerceIn(1, 99)
             } else {
-                0
+                (lastWatched.progressFraction * 100).toInt().coerceIn(0, 100)
             }
 
             return@combine ContinueWatchingData(
@@ -691,13 +730,29 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                 title = matchedMovie.title,
                 subtitle = "Movie • Cinema",
                 episodeTitle = "",
-                thumbnailUrl = matchedMovie.thumbnailUrl.orEmpty(),
+                thumbnailUrl = matchedMovie.thumbnailUrl.orEmpty().ifBlank { lastWatched.thumbnailUrl.orEmpty() },
                 isMovie = true,
                 progressPercentage = progressPct,
                 currentPositionMs = lastWatched.positionMs,
                 durationMs = totalDuration,
                 rawEpisode = null,
                 rawMovie = matchedMovie
+            )
+        } else if (!lastWatched.isSeries) {
+            val totalDuration = lastWatched.durationMs
+            val progressPct = (lastWatched.progressFraction * 100).toInt().coerceIn(0, 100)
+            return@combine ContinueWatchingData(
+                mediaId = lastWatched.episodeId,
+                title = lastWatched.formattedDisplayTitle,
+                subtitle = "Movie",
+                episodeTitle = "",
+                thumbnailUrl = lastWatched.thumbnailUrl.orEmpty(),
+                isMovie = true,
+                progressPercentage = progressPct,
+                currentPositionMs = lastWatched.positionMs,
+                durationMs = totalDuration,
+                rawEpisode = null,
+                rawMovie = null
             )
         }
 

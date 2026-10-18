@@ -6,12 +6,21 @@ import android.content.res.Configuration
 import androidx.compose.ui.platform.LocalContext
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
@@ -28,9 +37,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.clotube.app.util.triggerNavigationHaptic
 import com.clotube.app.model.Episode
 import com.clotube.app.model.Series
 import com.clotube.app.model.TvSeries
@@ -49,9 +60,11 @@ fun SeriesDetailScreen(
     onEpisodeSelected: (Episode) -> Unit,
     onBackClick: () -> Unit,
     onClosePlayer: () -> Unit = onBackClick,
+    isLoadingEpisodes: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val view = LocalView.current
     val activity = context as? Activity
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
@@ -148,13 +161,21 @@ fun SeriesDetailScreen(
         // 1. TOP VIDEO PLAYER / BACKDROP BANNER
         // ========================================================
         Box(
-            modifier = if (isLandscape && activePlayingEpisode != null) {
-                Modifier
-                    .fillMaxSize()
-                    .background(Color.Black)
+            modifier = if (isLandscape) {
+                if (activePlayingEpisode != null) {
+                    Modifier
+                        .fillMaxSize()
+                        .background(Color.Black)
+                } else {
+                    Modifier
+                        .fillMaxWidth()
+                        .aspectRatio(16f / 9f)
+                        .background(Color.Black)
+                }
             } else {
                 Modifier
                     .fillMaxWidth()
+                    .statusBarsPadding()
                     .aspectRatio(16f / 9f)
                     .background(Color.Black)
             }
@@ -229,13 +250,19 @@ fun SeriesDetailScreen(
                         modifier = Modifier
                             .align(Alignment.TopCenter)
                             .fillMaxWidth()
-                            .statusBarsPadding()
                             .padding(horizontal = 12.dp, vertical = 8.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         IconButton(
-                            onClick = onBackClick,
+                            onClick = {
+                                view.triggerNavigationHaptic()
+                                if (isLandscape) {
+                                    activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                                } else {
+                                    onBackClick()
+                                }
+                            },
                             modifier = Modifier
                                 .size(36.dp)
                                 .clip(RoundedCornerShape(18.dp))
@@ -294,15 +321,44 @@ fun SeriesDetailScreen(
 
                     Spacer(modifier = Modifier.height(4.dp))
 
-                    Text(
-                        text = "${series.genre} • ${series.seasons.size} Seasons",
-                        color = Color(0xFF8899A6),
-                        fontSize = 12.sp
-                    )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        if (series.genre.isNotBlank()) {
+                            Text(
+                                text = series.genre,
+                                color = Color(0xFF8899A6),
+                                fontSize = 12.sp
+                            )
+                            Text(
+                                text = "•",
+                                color = Color(0xFF8899A6),
+                                fontSize = 12.sp
+                            )
+                        }
+
+                        if (isLoadingEpisodes) {
+                            Box(
+                                modifier = Modifier
+                                    .width(60.dp)
+                                    .height(14.dp)
+                                    .clip(RoundedCornerShape(4.dp))
+                                    .shimmerEffect()
+                            )
+                        } else {
+                            val seasonCount = series.seasons.size
+                            Text(
+                                text = "$seasonCount ${if (seasonCount == 1) "Season" else "Seasons"}",
+                                color = Color(0xFF8899A6),
+                                fontSize = 12.sp
+                            )
+                        }
+                    }
 
                     Spacer(modifier = Modifier.height(14.dp))
 
-                    // "Up Next" billboard card
+                    // "Up Next" billboard card or skeleton
                     val nextEpisode = activeSeason?.episodes?.firstOrNull()
                     if (nextEpisode != null) {
                         Surface(
@@ -377,6 +433,8 @@ fun SeriesDetailScreen(
                                 }
                             }
                         }
+                    } else if (isLoadingEpisodes) {
+                        UpNextCardSkeleton()
                     }
                 }
             }
@@ -389,48 +447,52 @@ fun SeriesDetailScreen(
                     shadowElevation = 6.dp
                 ) {
                     Column(modifier = Modifier.fillMaxWidth()) {
-                        LazyRow(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 16.dp, vertical = 10.dp),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            items(series.seasons, key = { it.seasonNumber }) { season ->
-                                val isCompleted by viewModel.playbackHistoryManager
-                                    .isSeasonFullyWatched(season.episodes)
-                                    .collectAsState(initial = false)
+                        if (isLoadingEpisodes && (series.seasons.isEmpty() || series.seasons.all { it.episodes.isEmpty() })) {
+                            SeasonSelectorRowSkeleton()
+                        } else {
+                            LazyRow(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                items(series.seasons, key = { it.seasonNumber }) { season ->
+                                    val isCompleted by viewModel.playbackHistoryManager
+                                        .isSeasonFullyWatched(season.episodes)
+                                        .collectAsState(initial = false)
 
-                                SeasonTabChip(
-                                    season = season,
-                                    isSelected = (activeSeason?.seasonNumber == season.seasonNumber),
-                                    isCompleted = isCompleted,
-                                    onSelect = {
-                                        currentSeasonNumber = season.seasonNumber
-                                        coroutineScope.launch {
-                                            listState.animateScrollToItem(index = 1, scrollOffset = 0)
+                                    SeasonTabChip(
+                                        season = season,
+                                        isSelected = (activeSeason?.seasonNumber == season.seasonNumber),
+                                        isCompleted = isCompleted,
+                                        onSelect = {
+                                            currentSeasonNumber = season.seasonNumber
+                                            coroutineScope.launch {
+                                                listState.animateScrollToItem(index = 1, scrollOffset = 0)
+                                            }
+                                        },
+                                        onMarkComplete = {
+                                            coroutineScope.launch {
+                                                viewModel.playbackHistoryManager.markSeasonAsComplete(
+                                                    seriesId = series.id,
+                                                    seriesTitle = series.title,
+                                                    seasonNumber = season.seasonNumber,
+                                                    episodes = season.episodes
+                                                )
+                                            }
+                                        },
+                                        onMarkIncomplete = {
+                                            coroutineScope.launch {
+                                                viewModel.playbackHistoryManager.markSeasonAsIncomplete(
+                                                    seriesId = series.id,
+                                                    seasonNumber = season.seasonNumber,
+                                                    episodes = season.episodes
+                                                )
+                                            }
                                         }
-                                    },
-                                    onMarkComplete = {
-                                        coroutineScope.launch {
-                                            viewModel.playbackHistoryManager.markSeasonAsComplete(
-                                                seriesId = series.id,
-                                                seriesTitle = series.title,
-                                                seasonNumber = season.seasonNumber,
-                                                episodes = season.episodes
-                                            )
-                                        }
-                                    },
-                                    onMarkIncomplete = {
-                                        coroutineScope.launch {
-                                            viewModel.playbackHistoryManager.markSeasonAsIncomplete(
-                                                seriesId = series.id,
-                                                seasonNumber = season.seasonNumber,
-                                                episodes = season.episodes
-                                            )
-                                        }
-                                    }
-                                )
+                                    )
+                                }
                             }
                         }
 
@@ -440,7 +502,11 @@ fun SeriesDetailScreen(
             }
 
             // EPISODES LIST
-            if (activeSeason == null || activeSeason.episodes.isEmpty()) {
+            if (isLoadingEpisodes) {
+                item(key = "series_episodes_skeleton") {
+                    SeriesEpisodesSkeleton()
+                }
+            } else if (activeSeason == null || activeSeason.episodes.isEmpty()) {
                 item(key = "empty_season_message") {
                     Box(
                         modifier = Modifier
@@ -512,8 +578,27 @@ fun SeriesDetailScreen(
 
     var currentSeries by remember(seriesId) { mutableStateOf(cachedSeries) }
 
+    val hasLoadedEpisodes = remember(cachedSeries) {
+        cachedSeries?.seasons?.any { it.episodes.isNotEmpty() } == true
+    }
+
+    var isLoadingEpisodes by remember(seriesId) {
+        mutableStateOf(!hasLoadedEpisodes)
+    }
+
+    LaunchedEffect(currentSeries) {
+        if (currentSeries?.seasons?.any { it.episodes.isNotEmpty() } == true) {
+            isLoadingEpisodes = false
+        }
+    }
+
     LaunchedEffect(seriesId) {
-        if (currentSeries == null || currentSeries?.seasons.isNullOrEmpty() || currentSeries?.seasons?.all { it.episodes.isEmpty() } == true) {
+        val needsFetch = currentSeries == null ||
+            currentSeries?.seasons.isNullOrEmpty() ||
+            currentSeries?.seasons?.all { it.episodes.isEmpty() } == true
+
+        if (needsFetch) {
+            isLoadingEpisodes = true
             kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                 try {
                     val authRepo = com.clotube.app.auth.GoogleAuthRepository(context)
@@ -523,11 +608,17 @@ fun SeriesDetailScreen(
                         currentSeries = freshShow
                         viewModel.updateSeriesInCatalog(freshShow)
                         com.clotube.app.viewmodel.saveShowToDisk(context, freshShow)
+                    } else if (freshShow.seasons.isNotEmpty()) {
+                        currentSeries = freshShow
                     }
                 } catch (e: Exception) {
                     android.util.Log.e("SeriesDetailScreen", "Failed on-demand episode fetch for $seriesId: ${e.message}")
+                } finally {
+                    isLoadingEpisodes = false
                 }
             }
+        } else {
+            isLoadingEpisodes = false
         }
     }
 
@@ -562,6 +653,7 @@ fun SeriesDetailScreen(
                     onNavigateBack()
                 }
             },
+            isLoadingEpisodes = isLoadingEpisodes,
             modifier = Modifier.fillMaxSize()
         )
     } else {
@@ -572,6 +664,251 @@ fun SeriesDetailScreen(
             contentAlignment = Alignment.Center
         ) {
             CircularProgressIndicator(color = Color(0xFF00E5FF))
+        }
+    }
+}
+
+/**
+ * Reusable shimmer brush modifier that creates a smooth, dark-theme-friendly
+ * infinite shimmer animation using [rememberInfiniteTransition] and [Brush.linearGradient].
+ *
+ * Base dark surface color: Color(0xFF161B22)
+ * Highlight shimmer sweep color: Color(0xFF262F3D)
+ * Cycle duration: 1100ms with LinearEasing
+ */
+@Composable
+fun Modifier.shimmerEffect(): Modifier {
+    val transition = rememberInfiniteTransition(label = "shimmer_transition")
+    val translateAnim by transition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1400f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1100, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "shimmer_translate"
+    )
+
+    val shimmerColors = listOf(
+        Color(0xFF161B22),
+        Color(0xFF262F3D),
+        Color(0xFF161B22)
+    )
+
+    val brush = Brush.linearGradient(
+        colors = shimmerColors,
+        start = Offset(translateAnim - 600f, translateAnim - 600f),
+        end = Offset(translateAnim, translateAnim)
+    )
+
+    return this.background(brush)
+}
+
+/**
+ * Up Next banner shimmer skeleton matching the loaded Up Next card geometry.
+ * Height ~88.dp, RoundedCornerShape(16.dp), left placeholder bars for badge/title/metadata,
+ * and a 48.dp circular shimmer placeholder on the right for the cyan Play button.
+ */
+@Composable
+fun UpNextCardSkeleton(modifier: Modifier = Modifier) {
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = Color(0xFF111722),
+        border = BorderStroke(1.dp, Color(0xFF1B2433)),
+        modifier = modifier
+            .fillMaxWidth()
+            .height(88.dp)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(14.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Box(
+                        modifier = Modifier
+                            .width(52.dp)
+                            .height(14.dp)
+                            .clip(RoundedCornerShape(4.dp))
+                            .shimmerEffect()
+                    )
+                    Box(
+                        modifier = Modifier
+                            .width(44.dp)
+                            .height(14.dp)
+                            .clip(RoundedCornerShape(4.dp))
+                            .shimmerEffect()
+                    )
+                }
+                Box(
+                    modifier = Modifier
+                        .width(160.dp)
+                        .height(16.dp)
+                        .clip(RoundedCornerShape(4.dp))
+                        .shimmerEffect()
+                )
+                Box(
+                    modifier = Modifier
+                        .width(100.dp)
+                        .height(12.dp)
+                        .clip(RoundedCornerShape(4.dp))
+                        .shimmerEffect()
+                )
+            }
+
+            Spacer(modifier = Modifier.width(12.dp))
+
+            Box(
+                modifier = Modifier
+                    .size(48.dp)
+                    .clip(CircleShape)
+                    .shimmerEffect()
+            )
+        }
+    }
+}
+
+/**
+ * Season selector row shimmer skeleton displaying 4 rounded pill boxes
+ * (width = 105.dp, height = 38.dp, RoundedCornerShape(10.dp)) with 8.dp horizontal spacing.
+ */
+@Composable
+fun SeasonSelectorRowSkeleton(modifier: Modifier = Modifier) {
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        repeat(4) {
+            Box(
+                modifier = Modifier
+                    .width(105.dp)
+                    .height(38.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .shimmerEffect()
+            )
+        }
+    }
+}
+
+/**
+ * Single episode item shimmer card matching the exact dimensions of EpisodeItemRow:
+ * fillMaxWidth, RoundedCornerShape(14.dp), padding(horizontal = 16.dp, vertical = 6.dp),
+ * 16:9 thumbnail box (130.dp x 76.dp), middle info bars, and two 32.dp action squares.
+ */
+@Composable
+fun EpisodeItemSkeleton(modifier: Modifier = Modifier) {
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = Color(0xFF131822),
+        border = BorderStroke(1.dp, Color(0xFF1E2638)),
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 6.dp)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // Left: 16:9 thumbnail box
+            Box(
+                modifier = Modifier
+                    .width(130.dp)
+                    .height(76.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .shimmerEffect()
+            )
+
+            Spacer(modifier = Modifier.width(12.dp))
+
+            // Middle (weight(1f))
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(end = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                // Small bar for S01:E01 code
+                Box(
+                    modifier = Modifier
+                        .width(60.dp)
+                        .height(12.dp)
+                        .clip(RoundedCornerShape(4.dp))
+                        .shimmerEffect()
+                )
+
+                // Medium bar for Episode Title
+                Box(
+                    modifier = Modifier
+                        .width(140.dp)
+                        .height(16.dp)
+                        .clip(RoundedCornerShape(4.dp))
+                        .shimmerEffect()
+                )
+
+                // Two small inline bars for file size and 1080p FHD badge
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .width(48.dp)
+                            .height(12.dp)
+                            .clip(RoundedCornerShape(4.dp))
+                            .shimmerEffect()
+                    )
+                    Box(
+                        modifier = Modifier
+                            .width(48.dp)
+                            .height(12.dp)
+                            .clip(RoundedCornerShape(4.dp))
+                            .shimmerEffect()
+                    )
+                }
+            }
+
+            // Right: Two 32.dp rounded square shimmer placeholders (RoundedCornerShape(8.dp))
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(32.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .shimmerEffect()
+                )
+                Box(
+                    modifier = Modifier
+                        .size(32.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .shimmerEffect()
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Series episodes skeleton container rendering 5 placeholder cards matching
+ * the episode list geometry during asynchronous loading.
+ */
+@Composable
+fun SeriesEpisodesSkeleton(modifier: Modifier = Modifier) {
+    Column(modifier = modifier.fillMaxWidth()) {
+        repeat(5) {
+            EpisodeItemSkeleton()
         }
     }
 }

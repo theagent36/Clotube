@@ -40,9 +40,11 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.clotube.app.util.triggerTabTickHaptic
 import com.clotube.app.viewmodel.NavigationTab
 
 /**
@@ -88,6 +90,8 @@ fun BottomNavBar(
     modifier: Modifier = Modifier,
     tabs: List<BottomNavTabItem> = DefaultNavTabs
 ) {
+    val view = LocalView.current
+
     Box(
         modifier = modifier
             .fillMaxWidth()
@@ -118,7 +122,10 @@ fun BottomNavBar(
                     BottomNavItem(
                         item = navItem,
                         isSelected = isSelected,
-                        onClick = { onTabSelected(navItem.tab) }
+                        onClick = {
+                            view.triggerTabTickHaptic()
+                            onTabSelected(navItem.tab)
+                        }
                     )
                 }
             }
