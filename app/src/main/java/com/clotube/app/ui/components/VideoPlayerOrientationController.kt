@@ -34,13 +34,13 @@ fun VideoPlayerOrientationController(
             insets?.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
             insets?.hide(WindowInsetsCompat.Type.systemBars())
         } else {
-            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
             insets?.show(WindowInsetsCompat.Type.systemBars())
         }
 
         onDispose {
-            // Restore natural orientation and system bars when leaving the player
-            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            // Restore portrait orientation and system bars when leaving the player
+            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
             insets?.show(WindowInsetsCompat.Type.systemBars())
         }
     }

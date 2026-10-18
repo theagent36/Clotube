@@ -62,6 +62,7 @@ import com.clotube.app.model.Episode
 import com.clotube.app.viewmodel.VideoViewModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -78,12 +79,6 @@ fun calculateSafeSeekTargetMs(fraction: Float, totalDuration: Long): Long {
     val rawTargetMs = (fraction * totalDuration).toLong()
     val maxSafeBoundaryMs = (totalDuration - 3000L).coerceAtLeast(0L)
     return rawTargetMs.coerceIn(0L, maxSafeBoundaryMs)
-}
-
-enum class VideoScaleMode(val label: String) {
-    BEST_FIT("Fit to Screen"),
-    ZOOM_CROP("Zoom (Fill Width)"),
-    STRETCH("Stretch")
 }
 
 @Composable
@@ -118,68 +113,26 @@ fun ClotubeVideoPlayer(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
-    val activity = context as? Activity
-    val configuration = LocalConfiguration.current
-    val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
     val coroutineScope = rememberCoroutineScope()
 
-    var mediaPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
-    var libVLCInstance by remember { mutableStateOf<LibVLC?>(null) }
-    var isBuffering by remember { mutableStateOf(true) }
-    var hasEnded by remember { mutableStateOf(false) }
-
-    var currentScaleMode by remember { mutableStateOf(VideoScaleMode.BEST_FIT) }
-    var currentScale by remember(episode.id) { mutableFloatStateOf(1.0f) }
-    var scaleIndicatorText by remember { mutableStateOf<String?>(null) }
-
-    var currentPositionMs by remember(episode.id) { mutableLongStateOf(0L) }
-    var durationMs by remember(episode.id) { mutableLongStateOf(episode.durationMs) }
-
-    // Intercept back button: In landscape, switch to portrait; in portrait, close player
-    BackHandler {
-        if (isLandscape) {
-            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-        } else {
-            onClosePlayer()
-        }
+    val libVLCInstance = remember(episode.id) {
+        LibVLC(
+            context.applicationContext,
+            arrayListOf(
+                "--network-caching=3000",
+                "--http-reconnect",
+                "--no-drop-late-frames",
+                "--no-skip-frames",
+                "--rtsp-tcp"
+            )
+        )
     }
 
-    fun triggerIndicator(text: String) {
-        scaleIndicatorText = text
-        coroutineScope.launch {
-            delay(1800)
-            if (scaleIndicatorText == text) {
-                scaleIndicatorText = null
-            }
-        }
-    }
-
-    fun applyScaleMode(mode: VideoScaleMode) {
-        currentScaleMode = mode
-        val player = mediaPlayer
-        when (mode) {
-            VideoScaleMode.BEST_FIT -> {
-                currentScale = 1.0f
-                player?.aspectRatio = null
-                triggerIndicator("Original (Fit)")
-            }
-            VideoScaleMode.ZOOM_CROP -> {
-                currentScale = 1.34f
-                player?.aspectRatio = null
-                triggerIndicator("Zoomed (Crop Bars)")
-            }
-            VideoScaleMode.STRETCH -> {
-                currentScale = 1.0f
-                player?.aspectRatio = "20:9"
-                triggerIndicator("Stretch to Screen")
-            }
-        }
+    val mediaPlayer = remember(libVLCInstance) {
+        MediaPlayer(libVLCInstance)
     }
 
     fun loadAndPlayStream(startPositionMs: Long = 0L) {
-        val player = mediaPlayer ?: return
-        val vlc = libVLCInstance ?: return
-
         coroutineScope.launch(Dispatchers.IO) {
             try {
                 val streamUrl = viewModel.getStreamUrlForEpisode(episode.id)
@@ -195,9 +148,9 @@ fun ClotubeVideoPlayer(
                 val downloadRepo = com.clotube.app.data.DownloadRepository(context)
                 val localFile = downloadRepo.getLocalFileIfDownloaded(episode.id)
                 val media = if (localFile != null && localFile.exists()) {
-                    Media(vlc, Uri.fromFile(localFile))
+                    Media(libVLCInstance, Uri.fromFile(localFile))
                 } else {
-                    Media(vlc, Uri.parse(streamUrl)).apply {
+                    Media(libVLCInstance, Uri.parse(streamUrl)).apply {
                         if (!token.isNullOrBlank()) {
                             addOption(":http-header=Authorization: Bearer $token")
                         }
@@ -205,17 +158,16 @@ fun ClotubeVideoPlayer(
                 }.apply {
                     addOption(":network-caching=3000")
                     addOption(":http-reconnect")
-                    if (startPositionMs > 0L) {
+                    if (startPositionMs > 1000L) {
                         addOption(":start-time=${startPositionMs / 1000}")
                     }
                     setHWDecoderEnabled(true, true)
                 }
 
                 withContext(Dispatchers.Main) {
-                    hasEnded = false
-                    player.media = media
+                    mediaPlayer.media = media
                     media.release()
-                    player.play()
+                    mediaPlayer.play()
                 }
             } catch (e: Exception) {
                 Log.e("ClotubePlayer", "Playback launch error: ${e.message}", e)
@@ -223,206 +175,112 @@ fun ClotubeVideoPlayer(
         }
     }
 
+    // MediaTek Hardware Decoder & Crash Prevention (Strict Order: detachViews -> stop -> release)
     DisposableEffect(episode.id) {
         onDispose {
             try {
-                mediaPlayer?.let { player ->
-                    player.setEventListener(null)
-                    player.detachViews()
-                    player.stop()
-                    player.release()
+                val current = mediaPlayer.time
+                val total = mediaPlayer.length
+                if (total > 0L && current >= 1000L) {
+                    viewModel.savePlaybackPositionImmediate(
+                        fileId = episode.id,
+                        positionMs = current,
+                        durationMs = total,
+                        title = episode.displayTitle,
+                        seriesTitle = episode.seriesTitle.ifBlank { null },
+                        seasonNumber = episode.seasonNumber,
+                        episodeNumber = episode.episodeNumber,
+                        isSeries = true,
+                        thumbnailUrl = episode.thumbnailUrl.ifBlank { null }
+                    )
                 }
-                libVLCInstance?.release()
-                mediaPlayer = null
-                libVLCInstance = null
+                viewModel.playbackHistoryManager.backupToCloudImmediately()
+            } catch (_: Exception) {}
+
+            try {
+                mediaPlayer.setEventListener(null)
+                mediaPlayer.detachViews()
+                mediaPlayer.stop()
+                mediaPlayer.release()
             } catch (t: Throwable) {
-                Log.e("ClotubePlayer", "Player disposal error: ${t.message}")
+                Log.e("ClotubePlayer", "Safe LibVLC release error: ${t.message}")
+            }
+            try {
+                libVLCInstance.release()
+            } catch (t: Throwable) {
+                Log.e("ClotubePlayer", "Safe LibVLC release error: ${t.message}")
             }
         }
     }
 
-    LaunchedEffect(mediaPlayer) {
-        val player = mediaPlayer ?: return@LaunchedEffect
+    // Initial launch with progress recovery
+    LaunchedEffect(episode.id) {
+        val initialSeek = withContext(Dispatchers.IO) {
+            val savedProgress = viewModel.playbackHistoryManager.getProgressSync(episode.id)
+            if (savedProgress != null && savedProgress.positionMs > 2000L) savedProgress.positionMs else 0L
+        }
+        loadAndPlayStream(initialSeek)
+    }
+
+    // Periodic progress saving loop
+    LaunchedEffect(episode.id, mediaPlayer) {
         while (true) {
-            if (player.isPlaying) {
-                isBuffering = false
-                hasEnded = false
-            } else if (player.length > 0L && player.time >= player.length - 1500L) {
-                hasEnded = true
-                isBuffering = false
+            delay(4000L)
+            if (mediaPlayer.isPlaying) {
+                val current = mediaPlayer.time
+                val total = mediaPlayer.length
+                if (total > 0L && current >= 3000L) {
+                    viewModel.playbackHistoryManager.saveProgress(
+                        fileId = episode.id,
+                        title = episode.displayTitle,
+                        seriesTitle = episode.seriesTitle.ifBlank { null },
+                        seasonNumber = episode.seasonNumber,
+                        episodeNumber = episode.episodeNumber,
+                        isSeries = true,
+                        positionMs = current,
+                        durationMs = total,
+                        thumbnailUrl = episode.thumbnailUrl.ifBlank { null }
+                    )
+                }
             }
-            val t = player.time
-            if (t >= 0L) {
-                currentPositionMs = t
-            }
-            val len = player.length
-            if (len > 0L) {
-                durationMs = len
-            }
-            delay(250L)
         }
     }
 
-    Box(
-        modifier = modifier
-            .fillMaxSize()
-            .background(Color.Black)
-            .clipToBounds()
-            .pointerInput(Unit) {
-                detectTransformGestures { _, _, zoom, _ ->
-                    if (zoom != 1.0f) {
-                        val newScale = (currentScale * zoom).coerceIn(1.0f, 2.0f)
-                        currentScale = newScale
-                        currentScaleMode = if (newScale > 1.05f) VideoScaleMode.ZOOM_CROP else VideoScaleMode.BEST_FIT
-                    }
-                }
-            }
-            .pointerInput(Unit) {
-                detectTapGestures(
-                    onDoubleTap = {
-                        if (currentScale > 1.05f) {
-                            applyScaleMode(VideoScaleMode.BEST_FIT)
-                        } else {
-                            applyScaleMode(VideoScaleMode.ZOOM_CROP)
-                        }
-                    }
+    val sNum = episode.seasonNumber.toString().padStart(2, '0')
+    val eNum = episode.episodeNumber.toString().padStart(2, '0')
+    val formattedEpisodeTitle = "S${sNum}:E${eNum} • ${episode.displayTitle}"
+
+    ClotubeVideoPlayer(
+        mediaPlayer = mediaPlayer,
+        mediaId = episode.id,
+        title = formattedEpisodeTitle,
+        thumbnailUrl = episode.thumbnailUrl,
+        fallbackDurationMs = episode.durationMs,
+        modifier = modifier,
+        isInitiallyFullscreen = false,
+        onPreviousEpisode = onPreviousEpisode,
+        onNextEpisode = onNextEpisode,
+        nextEpisode = nextEpisode,
+        onPlayNextEpisode = { nextEp ->
+            onNextEpisode?.invoke()
+        },
+        onReloadMedia = { startPositionMs ->
+            loadAndPlayStream(startPositionMs)
+        },
+        onPlaybackEnded = {
+            val total = mediaPlayer.length.coerceAtLeast(1000L)
+            coroutineScope.launch(NonCancellable + Dispatchers.IO) {
+                viewModel.playbackHistoryManager.markCompleted(
+                    fileId = episode.id,
+                    title = episode.displayTitle,
+                    durationMs = total,
+                    isSeries = true,
+                    thumbnailUrl = episode.thumbnailUrl
                 )
             }
-    ) {
-        AndroidView(
-            factory = { ctx ->
-                VLCVideoLayout(ctx).apply {
-                    layoutParams = FrameLayout.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT,
-                        ViewGroup.LayoutParams.MATCH_PARENT
-                    )
-
-                    val vlc = LibVLC(
-                        ctx,
-                        arrayListOf(
-                            "--network-caching=3000",
-                            "--http-reconnect",
-                            "--no-drop-late-frames",
-                            "--no-skip-frames",
-                            "--rtsp-tcp"
-                        )
-                    )
-                    libVLCInstance = vlc
-
-                    val player = MediaPlayer(vlc)
-                    mediaPlayer = player
-
-                    var isAttached = false
-                    val layoutListener = View.OnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
-                        val w = right - left
-                        val h = bottom - top
-                        if (w > 0 && h > 0) {
-                            if (!isAttached) {
-                                player.attachViews(this, null, false, false)
-                                isAttached = true
-                            } else if (w != (oldRight - oldLeft) || h != (oldBottom - oldTop)) {
-                                player.updateVideoSurfaces()
-                            }
-                        }
-                    }
-                    addOnLayoutChangeListener(layoutListener)
-
-                    post {
-                        if (!isAttached && width > 0 && height > 0) {
-                            player.attachViews(this, null, false, false)
-                            isAttached = true
-                        }
-                    }
-
-                    player.setEventListener { event ->
-                        when (event.type) {
-                            MediaPlayer.Event.Buffering -> isBuffering = (event.buffering < 100f)
-                            MediaPlayer.Event.Playing -> {
-                                isBuffering = false
-                                hasEnded = false
-                            }
-                            MediaPlayer.Event.EndReached -> {
-                                isBuffering = false
-                                hasEnded = true
-                            }
-                            MediaPlayer.Event.EncounteredError -> isBuffering = false
-                            MediaPlayer.Event.TimeChanged -> {
-                                currentPositionMs = event.timeChanged.coerceAtLeast(0L)
-                            }
-                            MediaPlayer.Event.LengthChanged -> {
-                                if (event.lengthChanged > 0L) {
-                                    durationMs = event.lengthChanged
-                                }
-                            }
-                        }
-                    }
-
-                    loadAndPlayStream(0L)
-                }
-            },
-            update = { /* State driven */ },
-            modifier = Modifier
-                .fillMaxSize()
-                .graphicsLayer {
-                    scaleX = currentScale
-                    scaleY = currentScale
-                }
-        )
-
-        if (isBuffering) {
-            Box(
-                modifier = Modifier.fillMaxSize(),
-                contentAlignment = Alignment.Center
-            ) {
-                CircularProgressIndicator(
-                    color = Color(0xFF00E5FF),
-                    strokeWidth = 3.dp,
-                    modifier = Modifier.size(48.dp)
-                )
-            }
-        }
-
-        AnimatedVisibility(
-            visible = scaleIndicatorText != null,
-            enter = fadeIn(),
-            exit = fadeOut(),
-            modifier = Modifier.align(Alignment.Center)
-        ) {
-            scaleIndicatorText?.let { text ->
-                Box(
-                    modifier = Modifier
-                        .background(Color(0xCC0E1A2B), RoundedCornerShape(8.dp))
-                        .padding(horizontal = 16.dp, vertical = 8.dp)
-                ) {
-                    Text(
-                        text = text,
-                        color = Color(0xFF00E5FF),
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-            }
-        }
-
-        mediaPlayer?.let { player ->
-            PlayerControlsOverlay(
-                mediaPlayer = player,
-                durationMs = if (durationMs > 0L) durationMs else episode.durationMs,
-                currentPositionMs = currentPositionMs,
-                episodeTitle = "S${episode.seasonNumber.toString().padStart(2, '0')}:E${episode.episodeNumber.toString().padStart(2, '0')} • ${episode.displayTitle}",
-                onSeekTo = { targetMs ->
-                    if (hasEnded || (player.length > 0 && targetMs >= player.length - 1500L)) {
-                        loadAndPlayStream(targetMs)
-                    } else {
-                        player.time = targetMs
-                        currentPositionMs = targetMs
-                        if (!player.isPlaying) player.play()
-                    }
-                },
-                onClosePlayer = onClosePlayer
-            )
-        }
-    }
+        },
+        onNavigateBack = onClosePlayer
+    )
 }
 
 @Composable
@@ -444,6 +302,7 @@ fun ClotubeVideoPlayer(
     onFullscreenChanged: ((Boolean) -> Unit)? = null,
     onIsPlayingChanged: ((Boolean) -> Unit)? = null,
     onPlaybackEnded: (() -> Unit)? = null,
+    onReloadMedia: ((startPositionMs: Long) -> Unit)? = null,
     onNavigateBack: () -> Unit
 ) {
     val context = LocalContext.current
@@ -465,6 +324,7 @@ fun ClotubeVideoPlayer(
     var isPlaying by remember { mutableStateOf(mediaPlayer.isPlaying) }
     var isBuffering by remember { mutableStateOf(true) }
     var isSeeking by remember { mutableStateOf(false) }
+    var hasEnded by remember(mediaId) { mutableStateOf(false) }
     var isFirstFrameRendered by remember(mediaId) { mutableStateOf(false) }
     var lastAttachedLayout by remember { mutableStateOf<VLCVideoLayout?>(null) }
     var autoHideJob by remember { mutableStateOf<Job?>(null) }
@@ -530,6 +390,7 @@ fun ClotubeVideoPlayer(
     LaunchedEffect(mediaId) {
         isBuffering = true
         isSeeking = false
+        hasEnded = false
         isFirstFrameRendered = false
         val len = mediaPlayer.length
         durationMs = if (len > 0L) len else fallbackDurationMs
@@ -640,6 +501,7 @@ fun ClotubeVideoPlayer(
                         isPlaying = true
                         isBuffering = false
                         isSeeking = false
+                        hasEnded = false
                         if (mediaPlayer.time > 0L) {
                             isFirstFrameRendered = true
                         }
@@ -665,6 +527,7 @@ fun ClotubeVideoPlayer(
                     isPlaying = false
                     isBuffering = false
                     isSeeking = false
+                    hasEnded = true
                     onPlaybackEnded?.invoke()
                 }
             }
@@ -754,9 +617,13 @@ fun ClotubeVideoPlayer(
         }
     )
 
-    BackHandler(enabled = currentFullscreen) {
+    val configuration = LocalConfiguration.current
+    val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+
+    BackHandler(enabled = isLandscape || currentFullscreen) {
         internalFullscreen = false
         onFullscreenChanged?.invoke(false)
+        activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
     }
 
     val activeFraction = if (isScrubbing) {
@@ -1051,9 +918,11 @@ fun ClotubeVideoPlayer(
                     ) {
                         IconButton(onClick = {
                             resetInactivityTimer()
-                            if (currentFullscreen) {
+                            val isLandscapeOrientation = activity?.resources?.configuration?.orientation == Configuration.ORIENTATION_LANDSCAPE
+                            if (isLandscapeOrientation || currentFullscreen) {
                                 internalFullscreen = false
                                 onFullscreenChanged?.invoke(false)
+                                activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
                             } else {
                                 onNavigateBack()
                             }
@@ -1173,8 +1042,20 @@ fun ClotubeVideoPlayer(
                         onClick = {
                             resetInactivityTimer()
                             val newTime = (mediaPlayer.time - 10000L).coerceAtLeast(0L)
-                            mediaPlayer.time = newTime
-                            currentPositionMs = newTime
+                            if (hasEnded) {
+                                if (onReloadMedia != null) {
+                                    hasEnded = false
+                                    isBuffering = true
+                                    onReloadMedia.invoke(newTime)
+                                } else {
+                                    mediaPlayer.time = newTime
+                                    mediaPlayer.play()
+                                }
+                            } else {
+                                mediaPlayer.time = newTime
+                                currentPositionMs = newTime
+                                if (!mediaPlayer.isPlaying) mediaPlayer.play()
+                            }
                         },
                         modifier = Modifier.size(44.dp)
                     ) {
@@ -1206,7 +1087,18 @@ fun ClotubeVideoPlayer(
                                         isPlaying = false
                                         autoHideJob?.cancel() // Keep controls visible while paused
                                     } else {
-                                        mediaPlayer.play()
+                                        if (hasEnded || (durationMs > 0L && currentPositionMs >= durationMs - 1500L)) {
+                                            if (onReloadMedia != null) {
+                                                hasEnded = false
+                                                isBuffering = true
+                                                onReloadMedia.invoke(0L)
+                                            } else {
+                                                mediaPlayer.time = 0L
+                                                mediaPlayer.play()
+                                            }
+                                        } else {
+                                            mediaPlayer.play()
+                                        }
                                         isPlaying = true
                                         resetInactivityTimer()
                                     }
@@ -1228,8 +1120,20 @@ fun ClotubeVideoPlayer(
                             resetInactivityTimer()
                             val totalDuration = if (durationMs > 0) durationMs else mediaPlayer.length
                             val newTime = (mediaPlayer.time + 10000L).coerceAtMost(totalDuration)
-                            mediaPlayer.time = newTime
-                            currentPositionMs = newTime
+                            if (hasEnded) {
+                                if (onReloadMedia != null) {
+                                    hasEnded = false
+                                    isBuffering = true
+                                    onReloadMedia.invoke(newTime)
+                                } else {
+                                    mediaPlayer.time = newTime
+                                    mediaPlayer.play()
+                                }
+                            } else {
+                                mediaPlayer.time = newTime
+                                currentPositionMs = newTime
+                                if (!mediaPlayer.isPlaying) mediaPlayer.play()
+                            }
                         },
                         modifier = Modifier.size(44.dp)
                     ) {
@@ -1375,11 +1279,23 @@ fun ClotubeVideoPlayer(
 
                                             val released = tryAwaitRelease()
                                             if (released) {
-                                                isBuffering = true
-                                                isSeeking = true
                                                 val targetMs = calculateSafeSeekTargetMs(scrubFraction, durationMs)
-                                                mediaPlayer.time = targetMs
-                                                currentPositionMs = targetMs
+                                                if (hasEnded || (durationMs > 0L && targetMs >= durationMs - 1500L)) {
+                                                    if (onReloadMedia != null) {
+                                                        hasEnded = false
+                                                        isBuffering = true
+                                                        onReloadMedia.invoke(targetMs)
+                                                    } else {
+                                                        mediaPlayer.time = targetMs
+                                                        mediaPlayer.play()
+                                                    }
+                                                } else {
+                                                    isBuffering = true
+                                                    isSeeking = true
+                                                    mediaPlayer.time = targetMs
+                                                    currentPositionMs = targetMs
+                                                    if (!mediaPlayer.isPlaying) mediaPlayer.play()
+                                                }
                                                 isScrubbing = false
                                                 resetInactivityTimer()
                                             }
@@ -1407,11 +1323,23 @@ fun ClotubeVideoPlayer(
                                     },
                                     onDragEnd = {
                                         if (durationMs > 0L) {
-                                            isBuffering = true
-                                            isSeeking = true
                                             val targetMs = calculateSafeSeekTargetMs(scrubFraction, durationMs)
-                                            mediaPlayer.time = targetMs
-                                            currentPositionMs = targetMs
+                                            if (hasEnded || targetMs >= durationMs - 1500L) {
+                                                if (onReloadMedia != null) {
+                                                    hasEnded = false
+                                                    isBuffering = true
+                                                    onReloadMedia.invoke(targetMs)
+                                                } else {
+                                                    mediaPlayer.time = targetMs
+                                                    mediaPlayer.play()
+                                                }
+                                            } else {
+                                                isBuffering = true
+                                                isSeeking = true
+                                                mediaPlayer.time = targetMs
+                                                currentPositionMs = targetMs
+                                                if (!mediaPlayer.isPlaying) mediaPlayer.play()
+                                            }
                                         }
                                         isScrubbing = false
                                         resetInactivityTimer()

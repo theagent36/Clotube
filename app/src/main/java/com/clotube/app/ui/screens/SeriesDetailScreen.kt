@@ -91,6 +91,13 @@ fun SeriesDetailScreen(
         }
     }
 
+    LaunchedEffect(activePlayingEpisode?.seasonNumber) {
+        val epSeason = activePlayingEpisode?.seasonNumber
+        if (epSeason != null && epSeason != currentSeasonNumber) {
+            currentSeasonNumber = epSeason
+        }
+    }
+
     var hasAutoScrolled by remember(series.id) { mutableStateOf(false) }
 
     val activeSeason = series.seasons.firstOrNull { it.seasonNumber == currentSeasonNumber }
@@ -157,7 +164,14 @@ fun SeriesDetailScreen(
                 val currentIndex = currentEpisodeList.indexOfFirst { it.id == activePlayingEpisode.id }
 
                 val prevEpisode = if (currentIndex > 0) currentEpisodeList[currentIndex - 1] else null
-                val nextEpisode = if (currentIndex != -1 && currentIndex < currentEpisodeList.lastIndex) currentEpisodeList[currentIndex + 1] else null
+                val nextEpisode = if (currentIndex != -1 && currentIndex < currentEpisodeList.lastIndex) {
+                    currentEpisodeList[currentIndex + 1]
+                } else if (currentIndex != -1 && currentIndex == currentEpisodeList.lastIndex) {
+                    val currentSeasonIdx = series.seasons.indexOfFirst { it.seasonNumber == currentSeasonNumber }
+                    if (currentSeasonIdx != -1 && currentSeasonIdx < series.seasons.lastIndex) {
+                        series.seasons[currentSeasonIdx + 1].episodes.firstOrNull()
+                    } else null
+                } else null
 
                 ClotubeVideoPlayer(
                     episode = activePlayingEpisode,

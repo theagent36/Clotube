@@ -130,6 +130,9 @@ fun NativeVideoPlayerScreen(
                 )
             }
         },
+        onReloadMedia = { startMs ->
+            viewModel.prepareAndPlayMovie(fileId, startMs)
+        },
         onNavigateBack = {
             mediaPlayer.pause()
             try {
