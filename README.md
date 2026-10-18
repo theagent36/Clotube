@@ -24,7 +24,7 @@
 | **Minimum SDK** | Android 8.0 Oreo (API 26) |
 | **Language & Runtime** | Kotlin 2.1.0 • Java 21 LTS |
 | **UI Framework** | Jetpack Compose (BOM 2024.10.00) • Material Design 3 |
-| **Media Player** | AndroidX Media3 (ExoPlayer 1.4.1) |
+| **Media Player** | LibVLC |
 | **Networking** | OkHttp 4.12.0 • User-Agent: `Clotube/1.0` |
 | **Image Loading** | Coil Compose 2.7.0 |
 | **Google Identity** | AndroidX Credentials 1.3.0 • Google ID 1.1.1 • Drive API v3 |
