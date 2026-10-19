@@ -1,48 +1,53 @@
 package com.clotube.app.model
 
+import androidx.annotation.Keep
 import androidx.compose.runtime.Immutable
 import com.clotube.app.player.DriveMediaSourceFactory
+import com.google.gson.annotations.SerializedName
+import java.io.Serializable
 
 /**
  * External subtitle track representation for sidecar captions.
  */
+@Keep
 @Immutable
 data class ExternalSubtitleTrack(
-    val fileId: String,
-    val fileName: String,
-    val languageCode: String,     // e.g., "en", "es", "und"
-    val label: String,            // e.g., "English (External)", "Spanish"
-    val mimeType: String,         // e.g., MimeTypes.APPLICATION_SUBRIP
-    val streamUri: String
-)
+    @SerializedName("fileId") val fileId: String,
+    @SerializedName("fileName") val fileName: String,
+    @SerializedName("languageCode") val languageCode: String,     // e.g., "en", "es", "und"
+    @SerializedName("label") val label: String,            // e.g., "English (External)", "Spanish"
+    @SerializedName("mimeType") val mimeType: String,         // e.g., MimeTypes.APPLICATION_SUBRIP
+    @SerializedName("streamUri") val streamUri: String
+) : Serializable
 
 /**
  * Stable domain model representing a Google Drive video item with pre-calculated formatting.
  * Marked with @Immutable to guarantee Compose compiler stability and eliminate unnecessary recompositions.
  */
+@Keep
 @Immutable
 data class VideoItem(
-    val id: String,
-    val displayTitle: String,
-    val durationFormatted: String, // Pre-calculated (e.g., "02:10:24")
-    val fileSizeFormatted: String,  // Pre-calculated (e.g., "2.0 GB")
-    val genreFormatted: String,     // Pre-calculated (e.g., "Action • Thriller")
-    val resolutionBadge: String,    // Pre-calculated (e.g., "1080p FHD")
-    val streamUri: String,
-    val thumbnailUrl: String,
-    val fpsBadge: String = "",
-    val mimeType: String = "video/mp4",
-    val bitrateFormatted: String = "",
-    val codec: String = "",
-    val audioProfile: String = "",
-    val hdrBadge: String? = null,
-    val width: Int = 0,
-    val height: Int = 0,
-    val durationMs: Long = 0L,
-    val sizeBytes: Long = 0L,
-    val externalSubtitles: List<ExternalSubtitleTrack> = emptyList(),
-    val watchProgressFraction: Float = 0.0f
-) {
+    @SerializedName("id") val id: String,
+    @SerializedName("displayTitle") val displayTitle: String,
+    @SerializedName("durationFormatted") val durationFormatted: String, // Pre-calculated (e.g., "02:10:24")
+    @SerializedName("fileSizeFormatted") val fileSizeFormatted: String,  // Pre-calculated (e.g., "2.0 GB")
+    @SerializedName("genreFormatted") val genreFormatted: String,     // Pre-calculated (e.g., "Action • Thriller")
+    @SerializedName("resolutionBadge") val resolutionBadge: String,    // Pre-calculated (e.g., "1080p FHD")
+    @SerializedName("streamUri") val streamUri: String,
+    @SerializedName("thumbnailUrl") val thumbnailUrl: String,
+    @SerializedName("fpsBadge") val fpsBadge: String = "",
+    @SerializedName("mimeType") val mimeType: String = "video/mp4",
+    @SerializedName("bitrateFormatted") val bitrateFormatted: String = "",
+    @SerializedName("codec") val codec: String = "",
+    @SerializedName("audioProfile") val audioProfile: String = "",
+    @SerializedName("hdrBadge") val hdrBadge: String? = null,
+    @SerializedName("width") val width: Int = 0,
+    @SerializedName("height") val height: Int = 0,
+    @SerializedName("durationMs") val durationMs: Long = 0L,
+    @SerializedName("sizeBytes") val sizeBytes: Long = 0L,
+    @SerializedName("externalSubtitles") val externalSubtitles: List<ExternalSubtitleTrack> = emptyList(),
+    @SerializedName("watchProgressFraction") val watchProgressFraction: Float = 0.0f
+) : Serializable {
     val title: String get() = displayTitle
     val fileId: String get() = id
     val sizeFormatted: String get() = fileSizeFormatted

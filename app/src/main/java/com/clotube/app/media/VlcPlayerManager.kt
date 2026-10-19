@@ -30,9 +30,9 @@ class VlcPlayerManager(
 
     private val libVLC: LibVLC by lazy {
         val options = arrayListOf(
-            "--network-caching=600",
-            "--file-caching=500",
-            "--live-caching=500",
+            "--network-caching=5000",
+            "--file-caching=3000",
+            "--live-caching=3000",
             "--clock-jitter=0",
             "--drop-late-frames",
             "--skip-frames",
@@ -106,6 +106,13 @@ class VlcPlayerManager(
         } catch (_: Exception) {}
     }
 
+    fun softReload(positionMs: Long = mediaPlayer.time) {
+        val currentFileId = activeFileId ?: return
+        val resumeMs = positionMs.coerceAtLeast(0L)
+        Log.d(TAG, "softReload invoked for $currentFileId at ${resumeMs}ms")
+        play(currentFileId, activeLocalFile, resumeMs)
+    }
+
     fun play(
         fileId: String,
         localFile: File? = null,
@@ -122,16 +129,13 @@ class VlcPlayerManager(
             Media(libVLC, Uri.fromFile(localFile))
         } else {
             val proxyUrl = "http://127.0.0.1:${LocalStreamProxy.PORT}/stream?fileId=$fileId"
-            Media(libVLC, Uri.parse(proxyUrl)).apply {
-                addOption(":network-caching=600")
-            }
+            Media(libVLC, Uri.parse(proxyUrl))
         }
 
         media.apply {
             setHWDecoderEnabled(true, false)
-            addOption("--no-sub-autodetect-file")
             val startSecond = (startPositionMs / 1000L).coerceAtLeast(0L)
-            addOption(":start-time=$startSecond")
+            applyClotubeMediaOptions(startSecond)
         }
 
         activeMedia = media

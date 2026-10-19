@@ -1,23 +1,27 @@
 package com.clotube.app.data
 
 import android.content.Context
+import androidx.annotation.Keep
 import com.clotube.app.model.TvSeries
 import com.clotube.app.model.VideoItem
 import com.google.gson.Gson
+import com.google.gson.annotations.SerializedName
 import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.Serializable
 
 /**
  * Serialized data envelope for cached media library.
  * Persisted on disk to enable instant 0ms cold-start rendering.
  */
+@Keep
 data class CachedCatalog(
-    val movies: List<VideoItem> = emptyList(),
-    val series: List<TvSeries> = emptyList(),
-    val lastSyncTimestamp: Long = 0L
-)
+    @SerializedName("movies") val movies: List<VideoItem> = emptyList(),
+    @SerializedName("series") val series: List<TvSeries> = emptyList(),
+    @SerializedName("lastSyncTimestamp") val lastSyncTimestamp: Long = 0L
+) : Serializable
 
 /**
  * Manages local disk caching of the Google Drive catalog using internal app storage.

@@ -50,6 +50,7 @@ import com.clotube.app.viewmodel.NavigationTab
 /**
  * Navigation item specification for the floating bottom navigation capsule.
  */
+@androidx.annotation.Keep
 data class BottomNavTabItem(
     val tab: NavigationTab,
     val label: String,

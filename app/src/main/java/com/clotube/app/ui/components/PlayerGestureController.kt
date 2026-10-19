@@ -33,6 +33,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
+@androidx.annotation.Keep
 enum class PlayerGestureMode {
     BRIGHTNESS,
     VOLUME

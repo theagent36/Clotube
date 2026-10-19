@@ -62,6 +62,9 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import coil.compose.AsyncImage
+import com.clotube.app.auth.TokenRefreshProvider
+import com.clotube.app.media.NetworkMonitor
+import com.clotube.app.media.applyClotubeMediaOptions
 import com.clotube.app.model.Episode
 import com.clotube.app.viewmodel.VideoViewModel
 import kotlinx.coroutines.Dispatchers
@@ -69,6 +72,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.firstOrNull
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.videolan.libvlc.LibVLC
@@ -77,6 +81,7 @@ import org.videolan.libvlc.MediaPlayer
 import org.videolan.libvlc.util.VLCVideoLayout
 import kotlin.math.roundToInt
 
+@androidx.annotation.Keep
 data class TrackInfoItem(val id: Int, val name: String, val isSelected: Boolean)
 
 fun calculateSafeSeekTargetMs(fraction: Float, totalDuration: Long): Long {
@@ -124,7 +129,9 @@ fun ClotubeVideoPlayer(
         LibVLC(
             context.applicationContext,
             arrayListOf(
-                "--network-caching=3000",
+                "--network-caching=5000",
+                "--file-caching=3000",
+                "--live-caching=3000",
                 "--http-reconnect",
                 "--no-drop-late-frames",
                 "--no-skip-frames",
@@ -137,11 +144,14 @@ fun ClotubeVideoPlayer(
         MediaPlayer(libVLCInstance)
     }
 
-    fun loadAndPlayStream(startPositionMs: Long = 0L) {
+    var activeStreamUrl by remember(episode.id) { mutableStateOf("") }
+
+    fun loadAndPlayStream(startPositionMs: Long = 0L, forceRefreshToken: Boolean = false) {
         coroutineScope.launch(Dispatchers.IO) {
             try {
                 val streamUrl = viewModel.getStreamUrlForEpisode(episode.id)
-                val token = viewModel.getFreshGoogleDriveAccessToken()
+                activeStreamUrl = streamUrl
+                val token = viewModel.getFreshGoogleDriveAccessToken(forceRefresh = forceRefreshToken)
 
                 if (streamUrl.isBlank()) {
                     withContext(Dispatchers.Main) {
@@ -161,22 +171,18 @@ fun ClotubeVideoPlayer(
                         }
                     }
                 }.apply {
-                    addOption(":network-caching=3000")
-                    addOption(":http-reconnect")
-                    addOption("--no-sub-autodetect-file")
                     val totalDuration = episode.durationMs
                     val startSec = if (totalDuration > 0L && startPositionMs >= totalDuration - 5_000L) {
                         0L
                     } else {
                         (startPositionMs / 1000L).coerceAtLeast(0L)
                     }
-                    if (startSec > 0L) {
-                        addOption(":start-time=$startSec")
-                    }
+                    applyClotubeMediaOptions(startSec)
                     setHWDecoderEnabled(true, true)
                 }
 
                 withContext(Dispatchers.Main) {
+                    mediaPlayer.stop()
                     mediaPlayer.media = media
                     media.release()
                     mediaPlayer.play()
@@ -280,6 +286,8 @@ fun ClotubeVideoPlayer(
         title = formattedEpisodeTitle,
         thumbnailUrl = episode.thumbnailUrl,
         fallbackDurationMs = episode.durationMs,
+        activeStreamUrl = activeStreamUrl,
+        tokenRefreshProvider = viewModel.tokenRefreshProvider,
         modifier = modifier,
         isInitiallyFullscreen = false,
         onPreviousEpisode = onPreviousEpisode,
@@ -289,7 +297,7 @@ fun ClotubeVideoPlayer(
             onNextEpisode?.invoke()
         },
         onReloadMedia = { startPositionMs ->
-            loadAndPlayStream(startPositionMs)
+            loadAndPlayStream(startPositionMs, forceRefreshToken = true)
         },
         onPlaybackEnded = {
             val total = mediaPlayer.length.coerceAtLeast(1000L)
@@ -315,6 +323,8 @@ fun ClotubeVideoPlayer(
     thumbnailUrl: String? = null,
     fallbackDurationMs: Long = 0L,
     initialPositionMs: Long = 0L,
+    activeStreamUrl: String = "",
+    tokenRefreshProvider: TokenRefreshProvider? = null,
     modifier: Modifier = Modifier,
     isInitiallyFullscreen: Boolean = false,
     isFullscreen: Boolean = isInitiallyFullscreen,
@@ -330,6 +340,9 @@ fun ClotubeVideoPlayer(
     onNavigateBack: () -> Unit
 ) {
     val context = LocalContext.current
+    val effectiveTokenRefreshProvider = remember(tokenRefreshProvider, context) {
+        tokenRefreshProvider ?: TokenRefreshProvider(context.applicationContext)
+    }
     val view = LocalView.current
     val activity = context as? Activity
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -354,6 +367,128 @@ fun ClotubeVideoPlayer(
     var lastAttachedLayout by remember { mutableStateOf<VLCVideoLayout?>(null) }
     var autoHideJob by remember { mutableStateOf<Job?>(null) }
 
+    // Dynamic Network Handover, 8s Buffer Underrun Stall Watchdog & State
+    var lastValidPositionMs by remember(mediaId) {
+        val curTime = mediaPlayer.time
+        mutableLongStateOf(if (curTime > 0L) curTime else initialPositionMs)
+    }
+    var userIntendedToPlay by remember(mediaId) { mutableStateOf(true) }
+    var isReconnecting by remember { mutableStateOf(false) }
+    var pendingReloadOnReconnect by remember { mutableStateOf(false) }
+    var stallWatchdogJob by remember { mutableStateOf<Job?>(null) }
+
+    var currentActiveStreamUrl by remember(mediaId, activeStreamUrl) {
+        mutableStateOf(activeStreamUrl)
+    }
+    var currentAccessToken by remember(mediaId) { mutableStateOf("") }
+    var lastTokenRefreshTimeMs by remember(mediaId) {
+        mutableLongStateOf(System.currentTimeMillis())
+    }
+    var proactiveTokenRotationJob by remember(mediaId) {
+        mutableStateOf<Job?>(null)
+    }
+
+    val coroutineScope = rememberCoroutineScope()
+
+    // Proactive 45-Minute Background Token Rotation
+    LaunchedEffect(mediaId) {
+        proactiveTokenRotationJob?.cancel()
+        proactiveTokenRotationJob = launch {
+            while (isActive) {
+                delay(45 * 60 * 1000L) // 45 minutes
+                Log.d("ClotubePlayer", "Proactive 45-minute token rotation triggered for $mediaId")
+                val freshToken = effectiveTokenRefreshProvider.refreshAccessToken()
+                if (!freshToken.isNullOrBlank()) {
+                    currentAccessToken = freshToken
+                    lastTokenRefreshTimeMs = System.currentTimeMillis()
+                    val newUrl = effectiveTokenRefreshProvider.buildAuthenticatedStreamUrl(mediaId, freshToken)
+                    currentActiveStreamUrl = newUrl
+                    Log.i("ClotubePlayer", "Proactively rotated token and updated currentActiveStreamUrl at 45m mark")
+                }
+            }
+        }
+    }
+
+    fun softReloadStream(forceTokenRefresh: Boolean = false) {
+        if (isReconnecting) return
+        isReconnecting = true
+        isBuffering = true
+        stallWatchdogJob?.cancel()
+        stallWatchdogJob = null
+
+        coroutineScope.launch {
+            try {
+                val now = System.currentTimeMillis()
+                val elapsedSinceRefresh = now - lastTokenRefreshTimeMs
+                val needsTokenRefresh = forceTokenRefresh || elapsedSinceRefresh >= 40 * 60 * 1000L
+
+                if (needsTokenRefresh) {
+                    Log.d("ClotubePlayer", "Executing token refresh in softReloadStream (elapsed=${elapsedSinceRefresh}ms, force=$forceTokenRefresh)")
+                    val freshToken = withContext(Dispatchers.IO) {
+                        effectiveTokenRefreshProvider.refreshAccessToken()
+                    }
+                    if (!freshToken.isNullOrBlank()) {
+                        currentAccessToken = freshToken
+                        lastTokenRefreshTimeMs = System.currentTimeMillis()
+                        val newUrl = effectiveTokenRefreshProvider.buildAuthenticatedStreamUrl(mediaId, freshToken)
+                        currentActiveStreamUrl = newUrl
+                        Log.i("ClotubePlayer", "Successfully refreshed token reactive in softReloadStream")
+                    }
+                }
+
+                val resumeMs = lastValidPositionMs.coerceAtLeast(0L)
+                val resumeSec = (resumeMs / 1000L).coerceAtLeast(0L)
+                Log.d("ClotubePlayer", "softReloadStream() at resumeMs=$resumeMs, resumeSec=$resumeSec, userIntendedToPlay=$userIntendedToPlay")
+
+                if (onReloadMedia != null) {
+                    onReloadMedia.invoke(resumeMs)
+                    if (!userIntendedToPlay) {
+                        try { mediaPlayer.pause() } catch (_: Exception) {}
+                    }
+                    isReconnecting = false
+                } else {
+                    val streamUrl = currentActiveStreamUrl.ifBlank {
+                        activeStreamUrl.ifBlank {
+                            try { mediaPlayer.media?.uri?.toString().orEmpty() } catch (_: Exception) { "" }
+                        }
+                    }
+                    if (streamUrl.isNotBlank()) {
+                        mediaPlayer.stop()
+                        val media = Media(mediaPlayer.libVLC, Uri.parse(streamUrl)).apply {
+                            if (currentAccessToken.isNotBlank()) {
+                                addOption(":http-header=Authorization: Bearer $currentAccessToken")
+                            }
+                            applyClotubeMediaOptions(resumeSec)
+                            setHWDecoderEnabled(true, false)
+                        }
+                        mediaPlayer.media = media
+                        media.release()
+
+                        if (userIntendedToPlay && isAppForegrounded) {
+                            mediaPlayer.play()
+                        } else {
+                            mediaPlayer.pause()
+                        }
+                    }
+                    isReconnecting = false
+                }
+            } catch (e: Exception) {
+                Log.e("ClotubePlayer", "Error during softReloadStream: ${e.message}", e)
+                isReconnecting = false
+            }
+        }
+    }
+
+    val networkMonitor = remember {
+        NetworkMonitor(context) {
+            Log.d("ClotubePlayer", "onNetworkHandover callback: pendingReload=$pendingReloadOnReconnect, userIntendedToPlay=$userIntendedToPlay, isEnded=$hasEnded")
+            if (pendingReloadOnReconnect || (userIntendedToPlay && !hasEnded)) {
+                pendingReloadOnReconnect = false
+                softReloadStream(forceTokenRefresh = false)
+            }
+        }
+    }
+
     // 1. LIFECYCLE CONTROLLER: Intercept backgrounding and stop playback leaks
     DisposableEffect(lifecycleOwner, mediaPlayer) {
         val observer = LifecycleEventObserver { _, event ->
@@ -364,6 +499,9 @@ fun ClotubeVideoPlayer(
                 Lifecycle.Event.ON_PAUSE,
                 Lifecycle.Event.ON_STOP -> {
                     isAppForegrounded = false
+                    stallWatchdogJob?.cancel()
+                    stallWatchdogJob = null
+                    isBuffering = false
                     if (mediaPlayer.isPlaying) {
                         try {
                             mediaPlayer.pause()
@@ -373,6 +511,8 @@ fun ClotubeVideoPlayer(
                 }
                 Lifecycle.Event.ON_DESTROY -> {
                     isAppForegrounded = false
+                    stallWatchdogJob?.cancel()
+                    stallWatchdogJob = null
                     try {
                         mediaPlayer.detachViews()
                     } catch (_: Exception) {}
@@ -421,10 +561,18 @@ fun ClotubeVideoPlayer(
         isPlaybackEnded = false
         hasStartedOnce = false
         isFirstFrameRendered = false
+        userIntendedToPlay = true
+        pendingReloadOnReconnect = false
+        lastTokenRefreshTimeMs = System.currentTimeMillis()
+        stallWatchdogJob?.cancel()
+        stallWatchdogJob = null
         val len = mediaPlayer.length
         durationMs = if (len > 0L) len else fallbackDurationMs
         if (currentPositionMs == 0L && initialPositionMs > 0L) {
             currentPositionMs = initialPositionMs
+            lastValidPositionMs = initialPositionMs
+        } else if (currentPositionMs > 0L) {
+            lastValidPositionMs = currentPositionMs
         }
     }
 
@@ -479,7 +627,6 @@ fun ClotubeVideoPlayer(
     var currentBrightness by remember { mutableFloatStateOf(initialBrightness) }
     var brightnessAccumulator by remember { mutableFloatStateOf(initialBrightness) }
 
-    val coroutineScope = rememberCoroutineScope()
     var showGestureOverlay by remember { mutableStateOf(false) }
     var activeGestureMode by remember { mutableStateOf<PlayerGestureMode?>(null) }
     var lastLockedGestureMode by remember { mutableStateOf(PlayerGestureMode.BRIGHTNESS) }
@@ -505,6 +652,8 @@ fun ClotubeVideoPlayer(
 
     // Synchronize LibVLC Events (Handling Buffering & Opening)
     DisposableEffect(mediaPlayer, mediaId) {
+        networkMonitor.register()
+
         val listener = MediaPlayer.EventListener { event ->
             when (event.type) {
                 MediaPlayer.Event.Opening -> {
@@ -518,14 +667,21 @@ fun ClotubeVideoPlayer(
                     }
                 }
                 MediaPlayer.Event.Buffering -> {
-                    // Only set isBuffering = true if event.buffering < 100f && !isPlaying.
-                    // Once event.buffering >= 100f, set isBuffering = false.
-                    // Do NOT flip isPlaying to false during transient buffer events.
+                    // 8-Second Buffer Underrun Stall Watchdog
                     if (event.buffering < 100f) {
-                        if (!isPlaying) {
-                            isBuffering = true
+                        isBuffering = true
+                        if (userIntendedToPlay && stallWatchdogJob == null) {
+                            stallWatchdogJob = coroutineScope.launch {
+                                delay(8000L)
+                                if (isBuffering && networkMonitor.isConnected) {
+                                    Log.w("ClotubePlayer", "Buffer underrun stall watchdog triggered (8s). Soft reloading stream with token refresh...")
+                                    softReloadStream(forceTokenRefresh = true)
+                                }
+                            }
                         }
                     } else {
+                        stallWatchdogJob?.cancel()
+                        stallWatchdogJob = null
                         isBuffering = false
                         isSeeking = false
                         val isCurrentlyResumed = lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
@@ -541,6 +697,8 @@ fun ClotubeVideoPlayer(
                     }
                 }
                 MediaPlayer.Event.Playing -> {
+                    stallWatchdogJob?.cancel()
+                    stallWatchdogJob = null
                     // Safety enforcement: If VLC started playing while backgrounded, pause immediately
                     val isCurrentlyResumed = lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
                     if (!isAppForegrounded || !isCurrentlyResumed) {
@@ -556,26 +714,33 @@ fun ClotubeVideoPlayer(
                         hasStartedOnce = true
                         if (mediaPlayer.time > 0L) {
                             isFirstFrameRendered = true
+                            lastValidPositionMs = mediaPlayer.time
                         }
                     }
                 }
                 MediaPlayer.Event.Paused -> {
                     isPlaying = false
                     isBuffering = false
+                    stallWatchdogJob?.cancel()
+                    stallWatchdogJob = null
                 }
                 MediaPlayer.Event.Stopped -> {
                     isPlaying = false
                     isBuffering = false
+                    stallWatchdogJob?.cancel()
+                    stallWatchdogJob = null
                 }
                 MediaPlayer.Event.TimeChanged -> {
+                    stallWatchdogJob?.cancel()
+                    stallWatchdogJob = null
+                    isBuffering = false
                     if (event.timeChanged > 0L) {
-                        isBuffering = false
+                        lastValidPositionMs = event.timeChanged
                         isPlaying = true
                         hasStartedOnce = true
                     }
                     // Strictly ignore TimeChanged events while user is dragging the slider to eliminate jitter
                     if (!isDragging) {
-                        isBuffering = false
                         isSeeking = false
                         isFirstFrameRendered = true
                         currentPositionMs = event.timeChanged.coerceAtLeast(0L)
@@ -589,17 +754,46 @@ fun ClotubeVideoPlayer(
                         durationMs = event.lengthChanged
                     }
                 }
-                MediaPlayer.Event.EndReached -> {
-                    isPlaying = false
-                    isBuffering = false
-                    isSeeking = false
-                    isPlaybackEnded = true
-                    onPlaybackEnded?.invoke()
+                MediaPlayer.Event.EndReached,
+                MediaPlayer.Event.EncounteredError -> {
+                    val totalDur = if (durationMs > 0L) durationMs else (if (mediaPlayer.length > 0L) mediaPlayer.length else fallbackDurationMs)
+                    val isPrematureEof = totalDur > 0L && lastValidPositionMs > 0L && lastValidPositionMs < (totalDur - 15_000L)
+                    Log.d("ClotubePlayer", "Event ${if (event.type == MediaPlayer.Event.EndReached) "EndReached" else "EncounteredError"}, totalDur=$totalDur, lastValidPositionMs=$lastValidPositionMs, isPrematureEof=$isPrematureEof")
+
+                    if (isPrematureEof) {
+                        // Premature EOF guard: stream dropped prematurely due to socket reset
+                        stallWatchdogJob?.cancel()
+                        stallWatchdogJob = null
+                        isPlaying = false
+                        isBuffering = true
+                        isPlaybackEnded = false
+
+                        if (networkMonitor.isConnected) {
+                            softReloadStream(forceTokenRefresh = true)
+                        } else {
+                            pendingReloadOnReconnect = true
+                            Log.d("ClotubePlayer", "Network lost during premature EOF. Pending reload on reconnect.")
+                        }
+                    } else {
+                        // Genuine playback completion
+                        stallWatchdogJob?.cancel()
+                        stallWatchdogJob = null
+                        isPlaying = false
+                        isBuffering = false
+                        isSeeking = false
+                        isPlaybackEnded = true
+                        onPlaybackEnded?.invoke()
+                    }
                 }
             }
         }
         mediaPlayer.setEventListener(listener)
         onDispose {
+            proactiveTokenRotationJob?.cancel()
+            proactiveTokenRotationJob = null
+            networkMonitor.unregister()
+            stallWatchdogJob?.cancel()
+            stallWatchdogJob = null
             try {
                 mediaPlayer.setEventListener(null)
                 mediaPlayer.detachViews()
@@ -635,13 +829,18 @@ fun ClotubeVideoPlayer(
         while (true) {
             if (!isDragging) {
                 val currentTime = mediaPlayer.time.coerceAtLeast(0L)
-                currentPositionMs = currentTime
+                if (currentTime > 0L) {
+                    currentPositionMs = currentTime
+                    lastValidPositionMs = maxOf(lastValidPositionMs, currentTime)
+                }
                 val len = mediaPlayer.length
                 if (len > 0L) durationMs = len
                 if (mediaPlayer.isPlaying && currentTime > 0L && !isSeeking) {
                     // Failsafe: if video is actively playing frames, dismiss loading spinner & placeholder immediately
                     isFirstFrameRendered = true
                     isBuffering = false
+                    stallWatchdogJob?.cancel()
+                    stallWatchdogJob = null
                 }
             }
             delay(250)
@@ -694,7 +893,24 @@ fun ClotubeVideoPlayer(
     val showFloatingNext = false
 
     fun seekTo(targetTimeMs: Long) {
+        stallWatchdogJob?.cancel()
+        stallWatchdogJob = null
+        lastValidPositionMs = targetTimeMs
         val totalDur = if (durationMs > 0L) durationMs else mediaPlayer.length
+
+        // Reactive token refresh if scrubbing after 50+ minutes of playback
+        val elapsedSinceTokenRefresh = System.currentTimeMillis() - lastTokenRefreshTimeMs
+        val isTokenLikelyExpired = elapsedSinceTokenRefresh >= 50 * 60 * 1000L
+
+        if (isTokenLikelyExpired) {
+            Log.w("ClotubePlayer", "seekTo: More than 50 minutes elapsed since token refresh ($elapsedSinceTokenRefresh ms). Refreshing token and reloading at ${targetTimeMs}ms")
+            val safeTarget = if (totalDur > 0L && targetTimeMs >= totalDur - 5000L) 0L else targetTimeMs.coerceAtLeast(0L)
+            currentPositionMs = safeTarget
+            lastValidPositionMs = safeTarget
+            softReloadStream(forceTokenRefresh = true)
+            return
+        }
+
         val isEofOrEnded = isPlaybackEnded ||
                 (!mediaPlayer.isPlaying && mediaPlayer.time <= 0L && (hasStartedOnce || isFirstFrameRendered)) ||
                 (!mediaPlayer.isPlaying && mediaPlayer.time == -1L) ||
@@ -705,6 +921,7 @@ fun ClotubeVideoPlayer(
             isBuffering = true
             isSeeking = true
             currentPositionMs = safeTarget
+            lastValidPositionMs = safeTarget
             if (onReloadMedia != null) {
                 onReloadMedia.invoke(safeTarget)
             } else {
@@ -716,7 +933,7 @@ fun ClotubeVideoPlayer(
             isSeeking = true
             mediaPlayer.time = targetTimeMs
             currentPositionMs = targetTimeMs
-            if (!mediaPlayer.isPlaying) mediaPlayer.play()
+            if (!mediaPlayer.isPlaying && userIntendedToPlay) mediaPlayer.play()
         }
     }
 
@@ -1161,10 +1378,15 @@ fun ClotubeVideoPlayer(
                             IconButton(
                                 onClick = {
                                     if (mediaPlayer.isPlaying) {
+                                        userIntendedToPlay = false
                                         isPlaying = false
+                                        stallWatchdogJob?.cancel()
+                                        stallWatchdogJob = null
+                                        isBuffering = false
                                         mediaPlayer.pause()
                                         autoHideJob?.cancel() // Keep controls visible while paused
                                     } else {
+                                        userIntendedToPlay = true
                                         val totalDur = if (durationMs > 0L) durationMs else mediaPlayer.length
                                         val isEofOrEnded = isPlaybackEnded ||
                                                 (!mediaPlayer.isPlaying && mediaPlayer.time <= 0L && (hasStartedOnce || isFirstFrameRendered)) ||
@@ -1172,6 +1394,7 @@ fun ClotubeVideoPlayer(
                                         if (isEofOrEnded) {
                                             val startMs = if (totalDur > 0L && currentPositionMs >= totalDur - 5000L) 0L else currentPositionMs.coerceAtLeast(0L)
                                             currentPositionMs = startMs
+                                            lastValidPositionMs = startMs
                                             isPlaybackEnded = false
                                             isBuffering = true
                                             isPlaying = true

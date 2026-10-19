@@ -116,6 +116,8 @@ fun NativeVideoPlayerScreen(
         mediaId = fileId,
         title = movieTitle,
         thumbnailUrl = movie?.thumbnailUrl,
+        activeStreamUrl = "http://127.0.0.1:${com.clotube.app.data.LocalStreamProxy.PORT}/stream?fileId=$fileId",
+        tokenRefreshProvider = viewModel.tokenRefreshProvider,
         modifier = Modifier.fillMaxSize(),
         isInitiallyFullscreen = true, // Movies start directly in landscape fullscreen
         onPlaybackEnded = {

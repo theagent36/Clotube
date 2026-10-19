@@ -14,6 +14,7 @@ import java.io.File
 
 private val Context.downloadsDataStore by preferencesDataStore(name = "clotube_offline_downloads")
 
+@androidx.annotation.Keep
 enum class DownloadStatus {
     NOT_DOWNLOADED,
     QUEUED,
@@ -22,6 +23,7 @@ enum class DownloadStatus {
     FAILED
 }
 
+@androidx.annotation.Keep
 data class OfflineMediaRecord(
     val fileId: String,
     val title: String,

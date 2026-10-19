@@ -3,8 +3,11 @@ package com.clotube.app.viewmodel
 import android.app.Application
 import android.content.Intent
 import android.util.Log
+import androidx.annotation.Keep
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.google.gson.annotations.SerializedName
+import java.io.Serializable
 import com.clotube.app.auth.GoogleAuthRepository
 import com.clotube.app.data.DriveFolderManager
 import com.clotube.app.data.DriveFoldersStatus
@@ -115,25 +118,27 @@ fun VideoItem.toMovie(): Movie = Movie(
     sizeBytes = sizeBytes
 )
 
+@Keep
 data class ContinueWatchingData(
-    val mediaId: String,
-    val seriesId: String = "",
-    val title: String,
-    val subtitle: String,
-    val episodeTitle: String = "",
-    val thumbnailUrl: String,
-    val isMovie: Boolean,
-    val progressPercentage: Int,
-    val currentPositionMs: Long,
-    val durationMs: Long,
+    @SerializedName("mediaId") val mediaId: String = "",
+    @SerializedName("seriesId") val seriesId: String = "",
+    @SerializedName("title") val title: String = "",
+    @SerializedName("subtitle") val subtitle: String = "",
+    @SerializedName("episodeTitle") val episodeTitle: String = "",
+    @SerializedName("thumbnailUrl") val thumbnailUrl: String = "",
+    @SerializedName("isMovie") val isMovie: Boolean = false,
+    @SerializedName("progressPercentage") val progressPercentage: Int = 0,
+    @SerializedName("currentPositionMs") val currentPositionMs: Long = 0L,
+    @SerializedName("durationMs") val durationMs: Long = 0L,
     val rawEpisode: Episode? = null,
     val rawMovie: Movie? = null
-) {
+) : Serializable {
     val episode: Episode? get() = rawEpisode
-    val seriesTitle: String get() = if (!isMovie) title.substringBefore(" • ") else ""
-    val seriesPosterUrl: String get() = thumbnailUrl
+    val seriesTitle: String get() = if (!isMovie) (title ?: "").substringBefore(" • ") else ""
+    val seriesPosterUrl: String get() = thumbnailUrl ?: ""
 }
 
+@Keep
 data class VideoUiState(
     val videos: List<VideoItem> = emptyList(),
     val moviesList: List<VideoItem> = emptyList(),
@@ -184,6 +189,10 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
      * Globally tracked active player instance across docked and fullscreen playback.
      * Enforces immediate pause when the app is backgrounded or minimized.
      */
+    val tokenRefreshProvider by lazy {
+        com.clotube.app.auth.TokenRefreshProvider(getApplication(), tokenRepository, authRepository)
+    }
+
     val vlcPlayerManager = VlcPlayerManager(
         context = application,
         tokenProvider = { getValidAccessToken() }
@@ -191,15 +200,24 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
     val mediaPlayer: MediaPlayer get() = vlcPlayerManager.mediaPlayer
 
     suspend fun getValidAccessToken(forceRefresh: Boolean = false): String = withContext(Dispatchers.IO) {
+        if (forceRefresh) {
+            com.clotube.app.data.LocalStreamProxy.invalidateTokenCache()
+        }
         val token = tokenRepository.getValidAccessToken(forceRefresh)
         if (token.isNotBlank()) {
             _uiState.update { it.copy(accessToken = token) }
             return@withContext token
         }
-        val repoToken = authRepository.getAccessToken().getOrNull()
-            ?: authRepository.refreshAccessToken().getOrNull()
-            ?: getAccessToken()
-        if (!repoToken.isNullOrBlank()) return@withContext repoToken
+        val repoToken = if (forceRefresh) {
+            authRepository.refreshAccessToken().getOrNull()
+        } else {
+            authRepository.getAccessToken().getOrNull()
+                ?: authRepository.refreshAccessToken().getOrNull()
+        } ?: getAccessToken()
+        if (!repoToken.isNullOrBlank()) {
+            _uiState.update { it.copy(accessToken = repoToken) }
+            return@withContext repoToken
+        }
         ""
     }
 
@@ -286,8 +304,8 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         return "http://127.0.0.1:${com.clotube.app.data.LocalStreamProxy.PORT}/stream?fileId=$episodeId"
     }
 
-    suspend fun getFreshGoogleDriveAccessToken(): String {
-        return getValidAccessToken()
+    suspend fun getFreshGoogleDriveAccessToken(forceRefresh: Boolean = false): String {
+        return getValidAccessToken(forceRefresh)
     }
 
     private val _episodeList = MutableStateFlow<List<Episode>>(emptyList())
@@ -613,21 +631,27 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
     ) { lastWatched, allSeries, allMovies ->
         if (lastWatched == null) return@combine null
 
+        val safeFileId = (lastWatched.fileId ?: "").trim()
+        if (safeFileId.isEmpty()) return@combine null
+        val safeTitle = (lastWatched.title ?: "").trim().ifBlank { "Unknown" }
+        val safeSeriesTitle = (lastWatched.seriesTitle ?: "").trim()
+        val safeSeriesId = (lastWatched.seriesId ?: "").trim()
+
         // 1. Check if the last watched item is a Series Episode
         if (lastWatched.isSeries) {
-            val parentSeries = allSeries.firstOrNull { it.id == lastWatched.seriesId }
-                ?: loadCatalogFromDisk(getApplication()).firstOrNull { it.id == lastWatched.seriesId }
+            val parentSeries = allSeries.firstOrNull { it.id == safeSeriesId }
+                ?: loadCatalogFromDisk(getApplication()).firstOrNull { it.id == safeSeriesId }
 
             var matchedEpisode = parentSeries?.seasons
                 ?.flatMap { it.episodes }
-                ?.firstOrNull { it.id == lastWatched.episodeId }
+                ?.firstOrNull { it.id == safeFileId }
 
             if (matchedEpisode == null) {
                 val diskCatalog = loadCatalogFromDisk(getApplication())
-                val diskShow = diskCatalog.firstOrNull { it.id == lastWatched.seriesId }
+                val diskShow = diskCatalog.firstOrNull { it.id == safeSeriesId }
                 matchedEpisode = diskShow?.seasons
                     ?.flatMap { it.episodes }
-                    ?.firstOrNull { it.id == lastWatched.episodeId }
+                    ?.firstOrNull { it.id == safeFileId }
             }
 
             if (matchedEpisode == null && parentSeries != null) {
@@ -638,12 +662,12 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                     tvMazeSeriesId = 0L,
                     seasonNumber = sNum,
                     episodeNumber = eNum,
-                    rawFileName = lastWatched.title
+                    rawFileName = safeTitle
                 )
                 matchedEpisode = Episode(
-                    id = lastWatched.episodeId,
+                    id = safeFileId,
                     seriesTitle = parentSeries.title,
-                    displayTitle = epMeta.officialTitle.ifBlank { lastWatched.title },
+                    displayTitle = epMeta.officialTitle.ifBlank { safeTitle },
                     seasonNumber = sNum,
                     episodeNumber = eNum,
                     thumbnailUrl = epMeta.thumbnailUrl.ifBlank { parentSeries.posterUrl.orEmpty() },
@@ -655,11 +679,11 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             val eNum = matchedEpisode?.episodeNumber ?: lastWatched.episodeNumber.coerceAtLeast(1)
             val sTag = "S" + sNum.toString().padStart(2, '0')
             val eTag = "E" + eNum.toString().padStart(2, '0')
-            val seriesName = parentSeries?.title
-                ?: lastWatched.seriesTitle?.ifBlank { null }
+            val seriesName = parentSeries?.title?.trim()
+                ?: safeSeriesTitle.ifBlank { null }
                 ?: "The Mentalist"
-            val epTitle = matchedEpisode?.displayTitle
-                ?: lastWatched.title
+            val epTitle = matchedEpisode?.displayTitle?.trim()
+                ?: safeTitle
             val totalDuration = (matchedEpisode?.durationMs ?: 0L).takeIf { it > 0L }
                 ?: lastWatched.durationMs
             val progressPct = if (totalDuration > 0) {
@@ -668,9 +692,9 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                 (lastWatched.progressFraction * 100).toInt().coerceIn(0, 100)
             }
 
-            var artwork = matchedEpisode?.thumbnailUrl?.ifBlank { null }
-                ?: lastWatched.thumbnailUrl?.ifBlank { null }
-                ?: lastWatched.backdropUrl?.ifBlank { null }
+            var artwork = matchedEpisode?.thumbnailUrl?.trim()?.ifBlank { null }
+                ?: (lastWatched.thumbnailUrl ?: "").trim().ifBlank { null }
+                ?: (lastWatched.backdropUrl ?: "").trim().ifBlank { null }
                 ?: parentSeries?.posterUrl.orEmpty()
 
             if (artwork.isBlank() || artwork.contains("googleusercontent.com") || artwork.contains("drive.google.com")) {
@@ -687,8 +711,8 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             return@combine ContinueWatchingData(
-                mediaId = lastWatched.episodeId,
-                seriesId = parentSeries?.id ?: lastWatched.seriesId.orEmpty(),
+                mediaId = safeFileId,
+                seriesId = parentSeries?.id ?: safeSeriesId,
                 title = "$seriesName • $sTag:$eTag",
                 subtitle = epTitle,
                 episodeTitle = epTitle,
@@ -698,7 +722,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                 currentPositionMs = lastWatched.positionMs,
                 durationMs = totalDuration,
                 rawEpisode = matchedEpisode?.copy(thumbnailUrl = artwork) ?: Episode(
-                    id = lastWatched.episodeId,
+                    id = safeFileId,
                     seriesTitle = seriesName,
                     displayTitle = epTitle,
                     seasonNumber = sNum,
@@ -712,9 +736,9 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
 
         // 2. Check if the last watched item is a Movie (only when isSeries is false)
         val matchedMovie = allMovies.firstOrNull {
-            it.id == lastWatched.episodeId || it.id == lastWatched.seriesId
+            it.id == safeFileId || (safeSeriesId.isNotEmpty() && it.id == safeSeriesId)
         } ?: _moviesState.value.firstOrNull {
-            it.id == lastWatched.episodeId || it.id == lastWatched.seriesId
+            it.id == safeFileId || (safeSeriesId.isNotEmpty() && it.id == safeSeriesId)
         }?.toMovie()
 
         if (matchedMovie != null) {
@@ -726,11 +750,11 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             return@combine ContinueWatchingData(
-                mediaId = matchedMovie.id,
-                title = matchedMovie.title,
+                mediaId = matchedMovie.id.ifBlank { safeFileId },
+                title = matchedMovie.title.ifBlank { safeTitle.ifBlank { "Movie" } },
                 subtitle = "Movie • Cinema",
                 episodeTitle = "",
-                thumbnailUrl = matchedMovie.thumbnailUrl.orEmpty().ifBlank { lastWatched.thumbnailUrl.orEmpty() },
+                thumbnailUrl = matchedMovie.thumbnailUrl.orEmpty().ifBlank { (lastWatched.thumbnailUrl ?: "").orEmpty() },
                 isMovie = true,
                 progressPercentage = progressPct,
                 currentPositionMs = lastWatched.positionMs,
@@ -742,11 +766,11 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             val totalDuration = lastWatched.durationMs
             val progressPct = (lastWatched.progressFraction * 100).toInt().coerceIn(0, 100)
             return@combine ContinueWatchingData(
-                mediaId = lastWatched.episodeId,
+                mediaId = safeFileId,
                 title = lastWatched.formattedDisplayTitle,
                 subtitle = "Movie",
                 episodeTitle = "",
-                thumbnailUrl = lastWatched.thumbnailUrl.orEmpty(),
+                thumbnailUrl = (lastWatched.thumbnailUrl ?: "").orEmpty(),
                 isMovie = true,
                 progressPercentage = progressPct,
                 currentPositionMs = lastWatched.positionMs,

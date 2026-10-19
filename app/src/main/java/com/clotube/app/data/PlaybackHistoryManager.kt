@@ -12,9 +12,12 @@ import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.google.gson.Gson
+import com.google.gson.annotations.SerializedName
 import com.google.gson.reflect.TypeToken
 import com.clotube.app.model.ContinueWatchingItem
 import com.clotube.app.model.Episode
+import androidx.annotation.Keep
+import java.io.Serializable
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.Flow
@@ -29,46 +32,51 @@ import org.json.JSONObject
 val Context.playbackDataStore: DataStore<Preferences> by preferencesDataStore(name = "clotube_playback_history")
 val Context.playbackHistoryDataStore: DataStore<Preferences> get() = playbackDataStore
 
+@Keep
 data class WatchProgress(
-    val fileId: String,
-    val title: String,
-    val positionMs: Long = 0L,
-    val durationMs: Long = 0L,
-    val progressFraction: Float = if (durationMs > 0L) (positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f) else 0f,
-    val lastWatchedTimestamp: Long = System.currentTimeMillis(),
-    val isSeries: Boolean = false,
-    val seriesId: String? = null,
-    val seasonNumber: Int = 0,
-    val episodeNumber: Int = 0,
-    val seriesTitle: String? = null,
-    val thumbnailUrl: String? = null,
-    val backdropUrl: String? = null,
-    val genre: String? = null
-) {
+    @SerializedName("fileId") val fileId: String = "",
+    @SerializedName("title") val title: String = "",
+    @SerializedName("positionMs") val positionMs: Long = 0L,
+    @SerializedName("durationMs") val durationMs: Long = 0L,
+    @SerializedName("progressFraction") val progressFraction: Float = if (durationMs > 0L) (positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f) else 0f,
+    @SerializedName("lastWatchedTimestamp") val lastWatchedTimestamp: Long = System.currentTimeMillis(),
+    @SerializedName("isSeries") val isSeries: Boolean = false,
+    @SerializedName("seriesId") val seriesId: String? = null,
+    @SerializedName("seasonNumber") val seasonNumber: Int = 0,
+    @SerializedName("episodeNumber") val episodeNumber: Int = 0,
+    @SerializedName("seriesTitle") val seriesTitle: String? = null,
+    @SerializedName("thumbnailUrl") val thumbnailUrl: String? = null,
+    @SerializedName("backdropUrl") val backdropUrl: String? = null,
+    @SerializedName("genre") val genre: String? = null
+) : Serializable {
     val lastUpdatedEpochMs: Long get() = lastWatchedTimestamp
     val episodeId: String get() = fileId
 
     val formattedDisplayTitle: String
-        get() = when {
-            isSeries && !seriesTitle.isNullOrBlank() -> {
-                val epCode = "S${String.format(java.util.Locale.US, "%02d", seasonNumber)}:E${String.format(java.util.Locale.US, "%02d", episodeNumber)}"
-                if (title.isNotBlank() && !title.equals(seriesTitle, ignoreCase = true)) {
-                    "$seriesTitle • $epCode • $title"
-                } else {
-                    "$seriesTitle • $epCode"
+        get() {
+            val safeTitle = title ?: ""
+            val safeSeriesTitle = seriesTitle ?: ""
+            return when {
+                isSeries && safeSeriesTitle.isNotBlank() -> {
+                    val epCode = "S${String.format(java.util.Locale.US, "%02d", seasonNumber)}:E${String.format(java.util.Locale.US, "%02d", episodeNumber)}"
+                    if (safeTitle.isNotBlank() && !safeTitle.equals(safeSeriesTitle, ignoreCase = true)) {
+                        "$safeSeriesTitle • $epCode • $safeTitle"
+                    } else {
+                        "$safeSeriesTitle • $epCode"
+                    }
                 }
+                isSeries -> {
+                    val epCode = "S${String.format(java.util.Locale.US, "%02d", seasonNumber)}:E${String.format(java.util.Locale.US, "%02d", episodeNumber)}"
+                    if (safeTitle.isNotBlank()) "$safeTitle • $epCode" else "Series • $epCode"
+                }
+                else -> safeTitle.ifBlank { "Untitled Video" }
             }
-            isSeries -> {
-                val epCode = "S${String.format(java.util.Locale.US, "%02d", seasonNumber)}:E${String.format(java.util.Locale.US, "%02d", episodeNumber)}"
-                if (title.isNotBlank()) "$title • $epCode" else "Series • $epCode"
-            }
-            else -> title.ifBlank { "Untitled Video" }
         }
 
     fun toJson(): String {
         val json = JSONObject()
-        json.put("fileId", fileId)
-        json.put("title", title)
+        json.put("fileId", fileId ?: "")
+        json.put("title", title ?: "")
         seriesTitle?.let { json.put("seriesTitle", it) }
         json.put("seasonNumber", seasonNumber)
         json.put("episodeNumber", episodeNumber)
@@ -92,9 +100,12 @@ data class WatchProgress(
         fun fromJson(jsonStr: String): WatchProgress? {
             return try {
                 val json = JSONObject(jsonStr)
+                val rawFileId = json.optString("fileId", "").trim()
+                if (rawFileId.isEmpty()) return null
+
                 val thumb = when {
-                    json.has("thumbnailUrl") && !json.isNull("thumbnailUrl") -> json.getString("thumbnailUrl")
-                    json.has("backdropUrl") && !json.isNull("backdropUrl") -> json.getString("backdropUrl")
+                    json.has("thumbnailUrl") && !json.isNull("thumbnailUrl") -> json.optString("thumbnailUrl", "").ifBlank { null }
+                    json.has("backdropUrl") && !json.isNull("backdropUrl") -> json.optString("backdropUrl", "").ifBlank { null }
                     else -> null
                 }
                 val ts = when {
@@ -111,9 +122,9 @@ data class WatchProgress(
                 } else 0f
 
                 WatchProgress(
-                    fileId = json.getString("fileId"),
-                    title = json.optString("title", "Unknown"),
-                    seriesTitle = if (json.has("seriesTitle") && !json.isNull("seriesTitle")) json.getString("seriesTitle") else null,
+                    fileId = rawFileId,
+                    title = json.optString("title", "Unknown").trim().ifBlank { "Unknown" },
+                    seriesTitle = if (json.has("seriesTitle") && !json.isNull("seriesTitle")) json.optString("seriesTitle", "").ifBlank { null } else null,
                     seasonNumber = json.optInt("seasonNumber", 0),
                     episodeNumber = json.optInt("episodeNumber", 0),
                     isSeries = json.optBoolean("isSeries", false),
@@ -123,8 +134,8 @@ data class WatchProgress(
                     lastWatchedTimestamp = ts,
                     thumbnailUrl = thumb,
                     backdropUrl = thumb,
-                    seriesId = if (json.has("seriesId") && !json.isNull("seriesId")) json.getString("seriesId") else null,
-                    genre = if (json.has("genre") && !json.isNull("genre")) json.getString("genre") else null
+                    seriesId = if (json.has("seriesId") && !json.isNull("seriesId")) json.optString("seriesId", "").ifBlank { null } else null,
+                    genre = if (json.has("genre") && !json.isNull("genre")) json.optString("genre", "").ifBlank { null } else null
                 )
             } catch (e: Exception) {
                 null
@@ -133,19 +144,20 @@ data class WatchProgress(
     }
 }
 
+@Keep
 data class SeriesResumeState(
-    val seriesId: String,
-    val lastEpisodeId: String,
-    val seasonNumber: Int,
-    val episodeNumber: Int,
-    val positionMs: Long,
-    val durationMs: Long,
-    val lastWatchedTimestamp: Long
-) {
+    @SerializedName("seriesId") val seriesId: String = "",
+    @SerializedName("lastEpisodeId") val lastEpisodeId: String = "",
+    @SerializedName("seasonNumber") val seasonNumber: Int = 0,
+    @SerializedName("episodeNumber") val episodeNumber: Int = 0,
+    @SerializedName("positionMs") val positionMs: Long = 0L,
+    @SerializedName("durationMs") val durationMs: Long = 0L,
+    @SerializedName("lastWatchedTimestamp") val lastWatchedTimestamp: Long = 0L
+) : Serializable {
     fun toJson(): String {
         val json = JSONObject()
-        json.put("seriesId", seriesId)
-        json.put("lastEpisodeId", lastEpisodeId)
+        json.put("seriesId", seriesId ?: "")
+        json.put("lastEpisodeId", lastEpisodeId ?: "")
         json.put("seasonNumber", seasonNumber)
         json.put("episodeNumber", episodeNumber)
         json.put("positionMs", positionMs)
@@ -158,11 +170,14 @@ data class SeriesResumeState(
         fun fromJson(jsonStr: String): SeriesResumeState? {
             return try {
                 val json = JSONObject(jsonStr)
+                val sId = json.optString("seriesId", "").trim()
+                val epId = json.optString("lastEpisodeId", "").trim()
+                if (sId.isEmpty() || epId.isEmpty()) return null
                 SeriesResumeState(
-                    seriesId = json.getString("seriesId"),
-                    lastEpisodeId = json.getString("lastEpisodeId"),
-                    seasonNumber = json.getInt("seasonNumber"),
-                    episodeNumber = json.getInt("episodeNumber"),
+                    seriesId = sId,
+                    lastEpisodeId = epId,
+                    seasonNumber = json.optInt("seasonNumber", 1),
+                    episodeNumber = json.optInt("episodeNumber", 1),
                     positionMs = json.optLong("positionMs", 0L),
                     durationMs = json.optLong("durationMs", 0L),
                     lastWatchedTimestamp = json.optLong("lastWatchedTimestamp", 0L)
@@ -174,40 +189,45 @@ data class SeriesResumeState(
     }
 }
 
+@Keep
 data class WatchHistoryItem(
-    val fileId: String,
-    val title: String,
-    val seriesTitle: String? = null,
-    val seasonNumber: Int = 0,
-    val episodeNumber: Int = 0,
-    val isSeries: Boolean = false,
-    val seriesId: String? = null,
-    val positionMs: Long = 0L,
-    val durationMs: Long = 0L,
-    val lastWatchedTimestamp: Long = System.currentTimeMillis(),
-    val thumbnailUrl: String? = null
-) {
+    @SerializedName("fileId") val fileId: String = "",
+    @SerializedName("title") val title: String = "",
+    @SerializedName("seriesTitle") val seriesTitle: String? = null,
+    @SerializedName("seasonNumber") val seasonNumber: Int = 0,
+    @SerializedName("episodeNumber") val episodeNumber: Int = 0,
+    @SerializedName("isSeries") val isSeries: Boolean = false,
+    @SerializedName("seriesId") val seriesId: String? = null,
+    @SerializedName("positionMs") val positionMs: Long = 0L,
+    @SerializedName("durationMs") val durationMs: Long = 0L,
+    @SerializedName("lastWatchedTimestamp") val lastWatchedTimestamp: Long = System.currentTimeMillis(),
+    @SerializedName("thumbnailUrl") val thumbnailUrl: String? = null
+) : Serializable {
     val progressFraction: Float
         get() = if (durationMs > 0L) (positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f) else 0f
 
     val lastWatchedEpochMs: Long get() = lastWatchedTimestamp
 
     val formattedDisplayTitle: String
-        get() = when {
-            title.contains("• S") -> title
-            isSeries && !seriesTitle.isNullOrBlank() -> {
-                val epCode = "S${String.format(java.util.Locale.US, "%02d", seasonNumber)}:E${String.format(java.util.Locale.US, "%02d", episodeNumber)}"
-                if (title.isNotBlank() && !title.equals(seriesTitle, ignoreCase = true)) {
-                    "$seriesTitle • $epCode • $title"
-                } else {
-                    "$seriesTitle • $epCode"
+        get() {
+            val safeTitle = title ?: ""
+            val safeSeriesTitle = seriesTitle ?: ""
+            return when {
+                safeTitle.contains("• S") -> safeTitle
+                isSeries && safeSeriesTitle.isNotBlank() -> {
+                    val epCode = "S${String.format(java.util.Locale.US, "%02d", seasonNumber)}:E${String.format(java.util.Locale.US, "%02d", episodeNumber)}"
+                    if (safeTitle.isNotBlank() && !safeTitle.equals(safeSeriesTitle, ignoreCase = true)) {
+                        "$safeSeriesTitle • $epCode • $safeTitle"
+                    } else {
+                        "$safeSeriesTitle • $epCode"
+                    }
                 }
+                isSeries -> {
+                    val epCode = "S${String.format(java.util.Locale.US, "%02d", seasonNumber)}:E${String.format(java.util.Locale.US, "%02d", episodeNumber)}"
+                    if (safeTitle.isNotBlank()) "$safeTitle • $epCode" else "Series • $epCode"
+                }
+                else -> safeTitle.ifBlank { "Untitled Video" }
             }
-            isSeries -> {
-                val epCode = "S${String.format(java.util.Locale.US, "%02d", seasonNumber)}:E${String.format(java.util.Locale.US, "%02d", episodeNumber)}"
-                if (title.isNotBlank()) "$title • $epCode" else "Series • $epCode"
-            }
-            else -> title.ifBlank { "Untitled Video" }
         }
 }
 
@@ -1510,10 +1530,14 @@ class PlaybackHistoryManager(
 
         // Load items from JSON list and ensure finished items have positionMs == durationMs
         list.forEach { item ->
-            val dur = item.durationMs
-            val isFinished = dur > 0L && (item.progressFraction >= 0.95f || item.positionMs >= dur * 0.95f)
-            val pos = if (isFinished) dur else item.positionMs
-            resultMap[item.fileId] = item.copy(positionMs = pos)
+            val safeId = (item.fileId ?: "").trim()
+            if (safeId.isNotEmpty()) {
+                val dur = item.durationMs
+                val isFinished = dur > 0L && (item.progressFraction >= 0.95f || item.positionMs >= dur * 0.95f)
+                val pos = if (isFinished) dur else item.positionMs
+                val safeTitle = (item.title ?: "").trim().ifBlank { "Untitled Video" }
+                resultMap[safeId] = item.copy(fileId = safeId, title = safeTitle, positionMs = pos)
+            }
         }
 
         // Merge with discrete keys to ensure no completed or watched items are dropped
@@ -1762,21 +1786,24 @@ class PlaybackHistoryManager(
                 dataStore.edit { prefs ->
                     prefs[HISTORY_JSON_KEY] = json
                     parsed.forEach { item ->
-                        val watchProgress = WatchProgress(
-                            fileId = item.fileId,
-                            title = item.title,
-                            seriesTitle = item.seriesTitle,
-                            seasonNumber = item.seasonNumber,
-                            episodeNumber = item.episodeNumber,
-                            isSeries = item.isSeries,
-                            positionMs = item.positionMs,
-                            durationMs = item.durationMs,
-                            thumbnailUrl = item.thumbnailUrl,
-                            lastWatchedTimestamp = item.lastWatchedTimestamp,
-                            seriesId = item.seriesId,
-                            backdropUrl = item.thumbnailUrl
-                        )
-                        prefs[stringPreferencesKey("progress_${item.fileId}")] = watchProgress.toJson()
+                        val safeId = (item.fileId ?: "").trim()
+                        if (safeId.isNotEmpty()) {
+                            val watchProgress = WatchProgress(
+                                fileId = safeId,
+                                title = (item.title ?: "").trim().ifBlank { "Untitled Video" },
+                                seriesTitle = item.seriesTitle,
+                                seasonNumber = item.seasonNumber,
+                                episodeNumber = item.episodeNumber,
+                                isSeries = item.isSeries,
+                                positionMs = item.positionMs,
+                                durationMs = item.durationMs,
+                                thumbnailUrl = item.thumbnailUrl,
+                                lastWatchedTimestamp = item.lastWatchedTimestamp,
+                                seriesId = item.seriesId,
+                                backdropUrl = item.thumbnailUrl
+                            )
+                            prefs[stringPreferencesKey("progress_$safeId")] = watchProgress.toJson()
+                        }
                     }
                 }
             }

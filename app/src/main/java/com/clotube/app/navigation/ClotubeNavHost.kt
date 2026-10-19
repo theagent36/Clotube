@@ -1,6 +1,7 @@
 package com.clotube.app.navigation
 
 import android.net.Uri
+import androidx.annotation.Keep
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.EnterTransition
@@ -97,25 +98,29 @@ object NavRoutes {
     const val SETTINGS = "settings"
 
     fun playerRoute(fileId: String, title: String, seriesId: String? = null): String {
-        val encodedTitle = Uri.encode(title)
+        val safeFileId = Uri.encode((fileId ?: "").trim())
+        val safeTitle = (title ?: "").trim().ifBlank { "Video" }
+        val encodedTitle = Uri.encode(safeTitle)
         return if (!seriesId.isNullOrBlank()) {
-            val encodedSeriesId = Uri.encode(seriesId)
-            "player/$fileId/$encodedTitle?seriesId=$encodedSeriesId"
+            val encodedSeriesId = Uri.encode(seriesId.trim())
+            "player/$safeFileId/$encodedTitle?seriesId=$encodedSeriesId"
         } else {
-            "player/$fileId/$encodedTitle?seriesId="
+            "player/$safeFileId/$encodedTitle?seriesId="
         }
     }
 
     fun seriesDetailRoute(seriesId: String, episodeId: String? = null, positionMs: Long = 0L): String {
+        val safeSeriesId = Uri.encode((seriesId ?: "").trim())
         return if (!episodeId.isNullOrBlank()) {
-            val encodedEp = Uri.encode(episodeId)
-            "series/$seriesId?episodeId=$encodedEp&positionMs=$positionMs"
+            val encodedEp = Uri.encode(episodeId.trim())
+            "series/$safeSeriesId?episodeId=$encodedEp&positionMs=$positionMs"
         } else {
-            "series/$seriesId?episodeId=&positionMs=0"
+            "series/$safeSeriesId?episodeId=&positionMs=0"
         }
     }
 }
 
+@Keep
 sealed class Screen(val route: String) {
     object Home : Screen(NavRoutes.HOME)
     object Recent : Screen(NavRoutes.RECENT)
@@ -194,10 +199,15 @@ fun ClotubeNavHost(
                         navController.navigate(NavRoutes.seriesDetailRoute(series.id))
                     },
                     onResumePlayback = { fileId, title, seriesId, positionMs ->
-                        if (!seriesId.isNullOrBlank()) {
-                            navController.navigate(NavRoutes.seriesDetailRoute(seriesId, episodeId = fileId, positionMs = positionMs))
-                        } else {
-                            navController.navigate(NavRoutes.playerRoute(fileId, title))
+                        val safeFileId = (fileId ?: "").trim()
+                        val safeTitle = (title ?: "").trim().ifBlank { "Video" }
+                        val safeSeriesId = seriesId?.trim()?.ifBlank { null }
+                        if (safeFileId.isNotEmpty()) {
+                            if (!safeSeriesId.isNullOrEmpty()) {
+                                navController.navigate(NavRoutes.seriesDetailRoute(safeSeriesId, episodeId = safeFileId, positionMs = positionMs))
+                            } else {
+                                navController.navigate(NavRoutes.playerRoute(safeFileId, safeTitle))
+                            }
                         }
                     },
                     onNavigateToSettings = {
@@ -218,16 +228,20 @@ fun ClotubeNavHost(
                     playbackHistoryManager = videoViewModel.playbackHistoryManager,
                     viewModel = videoViewModel,
                     onResumeItem = { historyItem ->
-                        val sId = if (historyItem.isSeries) {
-                            if (!historyItem.seriesId.isNullOrBlank()) historyItem.seriesId
-                            else videoViewModel.uiState.value.tvSeriesList.find { s -> s.seasons.any { season -> season.episodes.any { ep -> ep.id == historyItem.fileId } } }?.id
-                        } else null
+                        val safeFileId = (historyItem.fileId ?: "").trim()
+                        val safeTitle = (historyItem.title ?: "").trim().ifBlank { "Video" }
+                        if (safeFileId.isNotEmpty()) {
+                            val sId = if (historyItem.isSeries) {
+                                if (!historyItem.seriesId.isNullOrBlank()) historyItem.seriesId?.trim()
+                                else videoViewModel.uiState.value.tvSeriesList.find { s -> s.seasons.any { season -> season.episodes.any { ep -> ep.id == safeFileId } } }?.id?.trim()
+                            } else null
 
-                        val resumePos = if (historyItem.progressFraction >= 0.95f) 0L else historyItem.positionMs
-                        if (!sId.isNullOrBlank()) {
-                            navController.navigate(NavRoutes.seriesDetailRoute(sId, episodeId = historyItem.fileId, positionMs = resumePos))
-                        } else {
-                            navController.navigate(NavRoutes.playerRoute(historyItem.fileId, historyItem.title))
+                            val resumePos = if (historyItem.progressFraction >= 0.95f) 0L else historyItem.positionMs
+                            if (!sId.isNullOrBlank()) {
+                                navController.navigate(NavRoutes.seriesDetailRoute(sId, episodeId = safeFileId, positionMs = resumePos))
+                            } else {
+                                navController.navigate(NavRoutes.playerRoute(safeFileId, safeTitle))
+                            }
                         }
                     }
                 )

@@ -1,33 +1,37 @@
 package com.clotube.app.model
 
+import androidx.annotation.Keep
 import androidx.compose.runtime.Immutable
+import com.google.gson.annotations.SerializedName
+import java.io.Serializable
 import java.util.Locale
 
 /**
  * Episode data model representing an individual TV show episode.
  * Marked with @Immutable to enable Compose compiler skipping during scroll.
  */
+@Keep
 @Immutable
 data class Episode(
-    val id: String, // Google Drive fileId
-    val seasonNumber: Int,
-    val episodeNumber: Int,
-    val episodeTagFormatted: String, // "S01:E01"
-    val displayTitle: String,
-    val durationFormatted: String,
-    val fileSizeFormatted: String,
-    val resolutionBadge: String,
-    val streamUri: String,
-    val thumbnailUrl: String,
-    val watchProgressFraction: Float = 0.0f, // 0.0 to 1.0
-    val overview: String = "",
-    val externalSubtitles: List<ExternalSubtitleTrack> = emptyList(),
-    val width: Int = 0,
-    val height: Int = 0,
-    val fileName: String = "",
-    val seriesTitle: String = "",
-    val sizeBytes: Long = 0L
-) {
+    @SerializedName("id") val id: String, // Google Drive fileId
+    @SerializedName("seasonNumber") val seasonNumber: Int,
+    @SerializedName("episodeNumber") val episodeNumber: Int,
+    @SerializedName("episodeTagFormatted") val episodeTagFormatted: String, // "S01:E01"
+    @SerializedName("displayTitle") val displayTitle: String,
+    @SerializedName("durationFormatted") val durationFormatted: String,
+    @SerializedName("fileSizeFormatted") val fileSizeFormatted: String,
+    @SerializedName("resolutionBadge") val resolutionBadge: String,
+    @SerializedName("streamUri") val streamUri: String,
+    @SerializedName("thumbnailUrl") val thumbnailUrl: String,
+    @SerializedName("watchProgressFraction") val watchProgressFraction: Float = 0.0f, // 0.0 to 1.0
+    @SerializedName("overview") val overview: String = "",
+    @SerializedName("externalSubtitles") val externalSubtitles: List<ExternalSubtitleTrack> = emptyList(),
+    @SerializedName("width") val width: Int = 0,
+    @SerializedName("height") val height: Int = 0,
+    @SerializedName("fileName") val fileName: String = "",
+    @SerializedName("seriesTitle") val seriesTitle: String = "",
+    @SerializedName("sizeBytes") val sizeBytes: Long = 0L
+) : Serializable {
     val title: String get() = displayTitle
     val sizeFormatted: String get() = fileSizeFormatted
     val fileSize: String get() = fileSizeFormatted
@@ -142,13 +146,14 @@ data class Episode(
  * Season model grouping episodes of a specific season.
  * Marked with @Immutable for Compose stability across nested hierarchies.
  */
+@Keep
 @Immutable
 data class Season(
-    val id: String = "", // Google Drive folder ID for this season
-    val seasonNumber: Int,
-    val seasonTitle: String = "Season $seasonNumber", // e.g. "Season 1"
-    val episodes: List<Episode> = emptyList()
-) {
+    @SerializedName("id") val id: String = "", // Google Drive folder ID for this season
+    @SerializedName("seasonNumber") val seasonNumber: Int,
+    @SerializedName("seasonTitle") val seasonTitle: String = "Season $seasonNumber", // e.g. "Season 1"
+    @SerializedName("episodes") val episodes: List<Episode> = emptyList()
+) : Serializable {
     val title: String get() = seasonTitle
 
     constructor(
@@ -166,21 +171,22 @@ data class Season(
  * TvSeries model representing a full multi-season television show.
  * Marked with @Immutable to guarantee recomposition skipping during list scrolling.
  */
+@Keep
 @Immutable
 data class TvSeries(
-    val id: String, // Google Drive folder ID for this show
-    val title: String, // e.g. "The Mentalist"
-    val genreFormatted: String,
-    val totalSeasonsFormatted: String,
-    val seasons: List<Season>,
-    val thumbnailUrl: String,
-    val backdropUrl: String? = null,
-    val posterUrl: String? = null,
-    val synopsis: String = "High-bitrate OTT Series streamed directly from your Google Drive Series folder.",
-    val qualityBadge: String = "Direct Stream • HD",
-    val ratingBadge: String = "TV-14",
-    val watchProgressFraction: Float = 0.0f
-) {
+    @SerializedName("id") val id: String, // Google Drive folder ID for this show
+    @SerializedName("title") val title: String, // e.g. "The Mentalist"
+    @SerializedName("genreFormatted") val genreFormatted: String,
+    @SerializedName("totalSeasonsFormatted") val totalSeasonsFormatted: String,
+    @SerializedName("seasons") val seasons: List<Season>,
+    @SerializedName("thumbnailUrl") val thumbnailUrl: String,
+    @SerializedName("backdropUrl") val backdropUrl: String? = null,
+    @SerializedName("posterUrl") val posterUrl: String? = null,
+    @SerializedName("synopsis") val synopsis: String = "High-bitrate OTT Series streamed directly from your Google Drive Series folder.",
+    @SerializedName("qualityBadge") val qualityBadge: String = "Direct Stream • HD",
+    @SerializedName("ratingBadge") val ratingBadge: String = "TV-14",
+    @SerializedName("watchProgressFraction") val watchProgressFraction: Float = 0.0f
+) : Serializable {
     val genre: String get() = genreFormatted
     val genreBadge: String get() = genreFormatted
     val totalEpisodes: Int get() = seasons.sumOf { it.episodes.size }

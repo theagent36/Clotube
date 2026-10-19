@@ -1,27 +1,31 @@
 package com.clotube.app.model
 
+import androidx.annotation.Keep
 import androidx.compose.runtime.Immutable
 import com.clotube.app.player.DriveMediaSourceFactory
+import com.google.gson.annotations.SerializedName
+import java.io.Serializable
 
 /**
  * Domain model representing a discovered movie file in Google Drive.
  * Marked with @Immutable to guarantee Compose compiler skipping and stability.
  */
+@Keep
 @Immutable
 data class Movie(
-    val id: String,
-    val title: String,
-    val fileName: String,
-    val fileSize: String,
-    val mimeType: String = "video/mp4",
-    val thumbnailUrl: String? = null,
-    val parentFolder: String = "",
-    val durationFormatted: String = "00:00",
-    val resolutionBadge: String = "HD",
-    val genre: String = "Movie • Cinema",
-    val streamUri: String = DriveMediaSourceFactory.buildDriveStreamUri(id).toString(),
-    val sizeBytes: Long = 0L
-) {
+    @SerializedName("id") val id: String,
+    @SerializedName("title") val title: String,
+    @SerializedName("fileName") val fileName: String,
+    @SerializedName("fileSize") val fileSize: String,
+    @SerializedName("mimeType") val mimeType: String = "video/mp4",
+    @SerializedName("thumbnailUrl") val thumbnailUrl: String? = null,
+    @SerializedName("parentFolder") val parentFolder: String = "",
+    @SerializedName("durationFormatted") val durationFormatted: String = "00:00",
+    @SerializedName("resolutionBadge") val resolutionBadge: String = "HD",
+    @SerializedName("genre") val genre: String = "Movie • Cinema",
+    @SerializedName("streamUri") val streamUri: String = DriveMediaSourceFactory.buildDriveStreamUri(id).toString(),
+    @SerializedName("sizeBytes") val sizeBytes: Long = 0L
+) : Serializable {
     val formattedDuration: String get() = durationFormatted
     val resolution: String get() = resolutionBadge
     val durationMs: Long

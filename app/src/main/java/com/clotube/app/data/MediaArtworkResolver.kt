@@ -10,6 +10,7 @@ import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
+@androidx.annotation.Keep
 data class MediaArtwork(
     val backdropUrl: String? = null,
     val posterUrl: String? = null

@@ -20,6 +20,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.launch
 
+@androidx.annotation.Keep
 data class SeriesDetailUiState(
     val series: TvSeries? = null,
     val selectedSeasonIndex: Int = 0,

@@ -2,89 +2,76 @@
 # Clotube R8 / ProGuard Keep Rules
 # ==============================================================
 
-# --------------------------------------------------------------------------
-# 1. LibVLC Native Player Engine & JNI Bindings (CRITICAL)
-# --------------------------------------------------------------------------
--keep class org.videolan.libvlc.** { *; }
--keep interface org.videolan.libvlc.** { *; }
--keepclassmembers class org.videolan.libvlc.** {
-    native <methods>;
-    *;
-}
--dontwarn org.videolan.libvlc.**
+# --- Keep All App Classes & Data Models to Prevent Kotlin Reflection/Gson NPEs ---
+-keep class com.clotube.** { *; }
+-keepclassmembers class com.clotube.** { *; }
+-keep class com.clotube.app.** { *; }
+-keepclassmembers class com.clotube.app.** { *; }
 
-# --------------------------------------------------------------------------
-# 2. AndroidX WorkManager & Background Sync Service
-# --------------------------------------------------------------------------
+# --- Keep @Keep Annotated Classes ---
+-keep @androidx.annotation.Keep class * { *; }
+-keepclassmembers class * {
+    @androidx.annotation.Keep *;
+}
+
+# --- LibVLC Complete Native & JNI Hierarchy (CRITICAL) ---
+-keep class org.videolan.** { *; }
+-keep interface org.videolan.** { *; }
+-keepclassmembers class org.videolan.** { *; }
+-dontwarn org.videolan.**
+
+# --- Google API Client, HTTP Client & Drive REST Models ---
+-keep class com.google.api.** { *; }
+-keep class com.google.apis.** { *; }
+-keep class com.google.http.** { *; }
+-keepclassmembers class * {
+    @com.google.api.client.util.Key <fields>;
+}
+-dontwarn com.google.api.**
+-dontwarn com.google.apis.**
+-dontwarn com.google.common.**
+-dontwarn com.google.android.gms.**
+-dontwarn org.apache.http.**
+-dontwarn java.awt.**
+-dontwarn javax.naming.**
+-dontwarn org.ietf.jgss.**
+
+# --- AndroidX WorkManager & Background Sync Service ---
 -keep class androidx.work.** { *; }
 -keep public class androidx.work.Worker { *; }
 -keep public class androidx.work.CoroutineWorker { *; }
 -keep class * extends androidx.work.Worker { *; }
 -keep class * extends androidx.work.CoroutineWorker { *; }
--keep public class com.clotube.app.data.DriveSyncWorker {
-    public <init>(android.content.Context, androidx.work.WorkerParameters);
-}
--keep public class com.clotube.app.data.ClotubeSyncService { *; }
+-keep class com.clotube.app.workers.** { *; }
+-keep class com.clotube.app.data.ClotubeSyncService { *; }
 -dontwarn androidx.work.**
 
-# --------------------------------------------------------------------------
-# 3. Google Drive REST API & OAuth Keep Rules
-# --------------------------------------------------------------------------
--keep class com.google.api.services.drive.** { *; }
--keep class com.google.api.client.** { *; }
--keep interface com.google.api.client.** { *; }
--keep class com.google.android.gms.auth.** { *; }
--keep class com.google.android.gms.auth.api.** { *; }
--keep class com.google.android.gms.common.** { *; }
--keepclassmembers class * {
-    @com.google.api.client.util.Key <fields>;
+# --- Gson / JSON Serialization & Kotlin Metadata ---
+-keepattributes Signature, InnerClasses, EnclosingMethod, RuntimeVisibleAnnotations, *Annotation*
+-keep class kotlin.Metadata { *; }
+-keepclassmembers class ** {
+    @com.google.gson.annotations.SerializedName <fields>;
 }
--dontwarn com.google.api.client.**
--dontwarn com.google.api.services.drive.**
--dontwarn com.google.common.**
--dontwarn com.google.android.gms.**
--dontwarn javax.naming.**
--dontwarn org.ietf.jgss.**
--dontwarn org.apache.http.**
 
-# --------------------------------------------------------------------------
-# 4. AndroidX DataStore & Preferences
-# --------------------------------------------------------------------------
+# --- AndroidX DataStore & Preferences ---
 -keep class androidx.datastore.** { *; }
 -keep class androidx.datastore.preferences.** { *; }
 -dontwarn androidx.datastore.**
 
-# --------------------------------------------------------------------------
-# 5. Clotube Domain Models & State Objects (Preserves DataStore & JSON fields)
-# --------------------------------------------------------------------------
--keep class com.clotube.app.model.** { *; }
--keepclassmembers class com.clotube.app.model.** { *; }
--keep class com.clotube.app.data.** { *; }
--keepclassmembers class com.clotube.app.data.** { *; }
-
-# Gson serialization rules
--keepattributes *Annotation*
--keepclassmembers class * {
-    @com.google.gson.annotations.SerializedName <fields>;
-}
-
-# --------------------------------------------------------------------------
-# 6. OkHttp, Coil & Network Engine
-# --------------------------------------------------------------------------
--keepattributes Signature
--keepattributes *Annotation*
--keepattributes EnclosingMethod
--keepattributes InnerClasses
+# --- OkHttp, Coil & Network Engine ---
 -keep class okhttp3.** { *; }
 -keep interface okhttp3.** { *; }
 -dontwarn okhttp3.**
 -dontwarn okio.**
+-dontwarn javax.annotation.**
+-dontwarn org.conscrypt.**
+-dontwarn org.bouncycastle.**
+-dontwarn org.openjsse.**
 -keep class coil.** { *; }
 -dontwarn coil.**
 
-# --------------------------------------------------------------------------
-# 7. Kotlin Coroutines & Jetpack Compose
-# --------------------------------------------------------------------------
+# --- Kotlin Coroutines & Jetpack Compose ---
+-dontwarn kotlinx.coroutines.**
 -keepnames class kotlinx.coroutines.internal.MainDispatcherFactory { *; }
 -keepnames class kotlinx.coroutines.CoroutineExceptionHandler { *; }
 -keepclassmembernames class kotlinx.** {

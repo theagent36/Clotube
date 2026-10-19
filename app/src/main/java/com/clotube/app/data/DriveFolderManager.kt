@@ -34,6 +34,7 @@ import java.util.concurrent.TimeUnit
 
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "clotube_drive_prefs")
 
+@androidx.annotation.Keep
 data class DriveFoldersStatus(
     val moviesFolderId: String?,
     val seriesFolderId: String?,
@@ -42,6 +43,7 @@ data class DriveFoldersStatus(
     val needsOnboarding: Boolean
 )
 
+@androidx.annotation.Keep
 data class ShowFolder(
     val id: String,
     val name: String

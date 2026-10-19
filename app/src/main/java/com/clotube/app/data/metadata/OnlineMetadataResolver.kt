@@ -11,6 +11,7 @@ import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
 import java.util.regex.Pattern
 
+@androidx.annotation.Keep
 data class MovieMetadata(
     val officialTitle: String,
     val posterUrl: String = "",
@@ -18,6 +19,7 @@ data class MovieMetadata(
     val genre: String = "Movie • Cinema"
 )
 
+@androidx.annotation.Keep
 data class SeriesMetadata(
     val tvMazeId: Long,
     val officialTitle: String,
@@ -25,6 +27,7 @@ data class SeriesMetadata(
     val genres: String = "TV Series • Drama"
 )
 
+@androidx.annotation.Keep
 data class EpisodeMetadata(
     val officialTitle: String,
     val thumbnailUrl: String = "",

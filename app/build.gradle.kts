@@ -1,3 +1,6 @@
+import java.io.FileInputStream
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -12,8 +15,8 @@ android {
         applicationId = "com.clotube.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 3
-        versionName = "1.0.2"
+        versionCode = 4
+        versionName = "1.0.3"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -21,20 +24,29 @@ android {
         }
 
         ndk {
-            // Include target ABIs for LibVLC native playback
-            abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a", "x86_64"))
+            // Target physical ARM hardware (64-bit and 32-bit), eliminating emulator x86/x86_64 bloat
+            abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a"))
         }
     }
 
     signingConfigs {
         create("release") {
-            // Checks gradle.properties or environment variables for the original keystore
-            val storeFilePath = project.findProperty("CLOTUBE_RELEASE_STORE_FILE")?.toString()
+            // Checks keystore.properties in root project, gradle.properties, or environment variables
+            val keystorePropsFile = rootProject.file("keystore.properties")
+            val keystoreProps = Properties()
+            if (keystorePropsFile.exists()) {
+                keystoreProps.load(FileInputStream(keystorePropsFile))
+            }
+            val storeFilePath = keystoreProps.getProperty("storeFile")
+                ?: project.findProperty("CLOTUBE_RELEASE_STORE_FILE")?.toString()
             if (!storeFilePath.isNullOrBlank() && file(storeFilePath).exists()) {
                 storeFile = file(storeFilePath)
-                storePassword = project.findProperty("CLOTUBE_RELEASE_STORE_PASSWORD")?.toString() ?: ""
-                keyAlias = project.findProperty("CLOTUBE_RELEASE_KEY_ALIAS")?.toString() ?: ""
-                keyPassword = project.findProperty("CLOTUBE_RELEASE_KEY_PASSWORD")?.toString() ?: ""
+                storePassword = keystoreProps.getProperty("storePassword")
+                    ?: project.findProperty("CLOTUBE_RELEASE_STORE_PASSWORD")?.toString() ?: ""
+                keyAlias = keystoreProps.getProperty("keyAlias")
+                    ?: project.findProperty("CLOTUBE_RELEASE_KEY_ALIAS")?.toString() ?: ""
+                keyPassword = keystoreProps.getProperty("keyPassword")
+                    ?: project.findProperty("CLOTUBE_RELEASE_KEY_PASSWORD")?.toString() ?: ""
                 enableV1Signing = true
                 enableV2Signing = true
             }
@@ -45,13 +57,15 @@ android {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            isDebuggable = false
             proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
+                getDefaultProguardFile("proguard-android.txt"),
                 "proguard-rules.pro"
             )
-            // If signing properties are set, use the release config; otherwise allow manual signing via Android Studio
+            // If custom release keystore exists, sign with release; otherwise fallback cleanly to debug signing
+            // so Google Drive OAuth SHA-1 continues working seamlessly out-of-the-box.
             val releaseConfig = signingConfigs.getByName("release")
-            if (releaseConfig.storeFile != null) {
+            if (releaseConfig.storeFile != null && releaseConfig.storeFile!!.exists()) {
                 signingConfig = releaseConfig
             } else {
                 signingConfig = signingConfigs.getByName("debug")
