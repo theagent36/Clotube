@@ -1,12 +1,41 @@
+# Keystores & Signing Secrets
 *.jks
 *.keystore
+*.p12
+*.pem
+*.key
+keystore.properties
+signing.properties
+
+# Google Cloud, Firebase & OAuth Credentials
+google-services.json
+*client_secret*.json
+*credentials*.json
+*service_account*.json
+oauth*.json
+
+# Gradle & Local Configuration
 gradle.properties
 local.properties
-keystore.properties
+
+# Build outputs
 build/
+**/build/
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# IDE & Editor files
 .gradle/
 .idea/
 .kotlin/
 .vscode/
-*.apk
-*.aab
+*.iml
+*.iws
+*.ipr
+.DS_Store
+captures/
+.externalNativeBuild/
+.cxx/
+

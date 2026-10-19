@@ -17,10 +17,11 @@ import org.videolan.libvlc.Media
  */
 @Keep
 fun Media.applyClotubeMediaOptions(startTimeSeconds: Long = 0L) {
-    addOption(":network-caching=5000")
-    addOption(":file-caching=3000")
-    addOption(":live-caching=3000")
-    addOption(":http-reconnect=true")
+    addOption(":network-caching=1500")
+    addOption(":file-caching=1500")
+    addOption(":live-caching=1500")
+    addOption(":clock-jitter=0")
+    addOption(":clock-synchro=0")
     addOption("--no-sub-autodetect-file")
     if (startTimeSeconds > 0L) {
         addOption(":start-time=$startTimeSeconds")
@@ -30,11 +31,12 @@ fun Media.applyClotubeMediaOptions(startTimeSeconds: Long = 0L) {
 /**
  * Lifecycle-aware network monitor tracking active network interfaces and disconnects.
  * Dispatches debounced (1500ms) onNetworkHandover callbacks when the transport switches
- * (e.g., Wi-Fi <-> Mobile Data) or reconnects after signal drop.
+ * (e.g., Wi-Fi <-> Mobile Data) or reconnects after signal drop, only once playback has started.
  */
 @Keep
 class NetworkMonitor(
     context: Context,
+    private val hasRenderedFirstFrame: () -> Boolean = { true },
     private val onNetworkHandover: () -> Unit
 ) {
     companion object {
@@ -51,6 +53,7 @@ class NetworkMonitor(
     private var activeNetwork: Network? = null
     private var wasDisconnected: Boolean = false
     private var isRegistered: Boolean = false
+    private var initialNetworkRecorded: Boolean = false
 
     val isConnected: Boolean
         get() {
@@ -62,20 +65,28 @@ class NetworkMonitor(
 
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
+            if (!initialNetworkRecorded) {
+                activeNetwork = network
+                initialNetworkRecorded = true
+                Log.d(TAG, "Initial network recorded on first onAvailable: $network. Suppressing initial handover.")
+                return
+            }
+
             val previousNetwork = activeNetwork
             val hadDisconnect = wasDisconnected
-
-            val isHandover = (previousNetwork != null && previousNetwork != network) || hadDisconnect
+            val isGenuineChange = (previousNetwork != null && previousNetwork != network) || hadDisconnect
 
             activeNetwork = network
             wasDisconnected = false
 
-            if (isHandover) {
+            if (isGenuineChange && hasRenderedFirstFrame()) {
                 Log.d(TAG, "Network handover/reconnection detected (prev=$previousNetwork, new=$network, hadDisconnect=$hadDisconnect). Debouncing ${DEBOUNCE_DELAY_MS}ms...")
                 debounceRunnable?.let { mainHandler.removeCallbacks(it) }
                 val runnable = Runnable {
-                    Log.i(TAG, "Invoking onNetworkHandover on Main thread")
-                    onNetworkHandover()
+                    if (hasRenderedFirstFrame()) {
+                        Log.i(TAG, "Invoking onNetworkHandover on Main thread")
+                        onNetworkHandover()
+                    }
                 }
                 debounceRunnable = runnable
                 mainHandler.postDelayed(runnable, DEBOUNCE_DELAY_MS)
@@ -95,6 +106,7 @@ class NetworkMonitor(
         if (isRegistered || connectivityManager == null) return
         try {
             activeNetwork = connectivityManager.activeNetwork
+            initialNetworkRecorded = (activeNetwork != null)
             wasDisconnected = (activeNetwork == null)
 
             val request = NetworkRequest.Builder()
@@ -102,7 +114,7 @@ class NetworkMonitor(
                 .build()
             connectivityManager.registerNetworkCallback(request, networkCallback)
             isRegistered = true
-            Log.d(TAG, "NetworkCallback successfully registered")
+            Log.d(TAG, "NetworkCallback successfully registered (initialNetworkRecorded=$initialNetworkRecorded)")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to register NetworkCallback: ${e.message}", e)
         }
@@ -119,6 +131,7 @@ class NetworkMonitor(
             Log.e(TAG, "Failed to unregister NetworkCallback: ${e.message}", e)
         } finally {
             isRegistered = false
+            initialNetworkRecorded = false
         }
     }
 }

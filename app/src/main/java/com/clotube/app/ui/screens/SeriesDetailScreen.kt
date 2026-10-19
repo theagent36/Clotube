@@ -111,38 +111,46 @@ fun SeriesDetailScreen(
         }
     }
 
-    var hasAutoScrolled by remember(series.id) { mutableStateOf(false) }
+    var lastWatchedEpisode by remember(series.id) { mutableStateOf<Episode?>(null) }
+    var hasCheckedLastWatched by remember(series.id) { mutableStateOf(false) }
 
     val activeSeason = series.seasons.firstOrNull { it.seasonNumber == currentSeasonNumber }
         ?: series.seasons.firstOrNull()
 
-    // 3. One-time check for last-watched episode without blocking initial render
+    // 3. One-time check for last-watched episode without blocking initial render or scrolling past headers
     LaunchedEffect(series.id) {
-        if (!hasAutoScrolled) {
+        if (!hasCheckedLastWatched) {
             val lastWatched = viewModel.getLastWatchedEpisode(series)
             if (lastWatched != null) {
+                lastWatchedEpisode = lastWatched
                 if (currentSeasonNumber != lastWatched.seasonNumber) {
                     currentSeasonNumber = lastWatched.seasonNumber
                 }
-
-                snapshotFlow { activeSeason?.seasonNumber }
-                    .collect { seasonNum ->
-                        if (seasonNum == lastWatched.seasonNumber && activeSeason != null) {
-                            val epIndex = activeSeason.episodes.indexOfFirst { it.id == lastWatched.id }
-                            if (epIndex != -1) {
-                                val targetIndex = if (epIndex <= 0) 1 else 1 + epIndex
-                                listState.animateScrollToItem(
-                                    index = targetIndex,
-                                    scrollOffset = 0
-                                )
-                                hasAutoScrolled = true
-                            }
-                        }
-                    }
-            } else {
-                hasAutoScrolled = true
             }
+            hasCheckedLastWatched = true
         }
+    }
+
+    val initialFallbackEpisode = remember(series.id, series.seasons) {
+        series.seasons.firstOrNull { it.episodes.isNotEmpty() }?.episodes?.firstOrNull()
+    }
+    var cachedUpNextEpisode by remember(series.id) {
+        mutableStateOf<Episode?>(initialFallbackEpisode)
+    }
+
+    val upNextEpisode = remember(activeSeason, lastWatchedEpisode, series.seasons, cachedUpNextEpisode) {
+        val candidate = (if (lastWatchedEpisode != null && lastWatchedEpisode?.seasonNumber == activeSeason?.seasonNumber) {
+            lastWatchedEpisode
+        } else {
+            activeSeason?.episodes?.firstOrNull()
+        }) ?: lastWatchedEpisode
+           ?: initialFallbackEpisode
+           ?: cachedUpNextEpisode
+
+        if (candidate != null && candidate != cachedUpNextEpisode) {
+            cachedUpNextEpisode = candidate
+        }
+        candidate ?: cachedUpNextEpisode
     }
 
     val currentEpisodeList = activeSeason?.episodes ?: emptyList()
@@ -305,12 +313,12 @@ fun SeriesDetailScreen(
                 contentPadding = PaddingValues(bottom = 96.dp)
             ) {
 
-            // ITEM 0: Series Metadata & "Up Next" Card
-            item(key = "series_metadata_section") {
+            // ITEM 0: Series Title & Genre Header
+            item(key = "series_title_header") {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 12.dp)
+                        .padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 14.dp)
                 ) {
                     Text(
                         text = series.title,
@@ -355,12 +363,18 @@ fun SeriesDetailScreen(
                             )
                         }
                     }
+                }
+            }
 
-                    Spacer(modifier = Modifier.height(14.dp))
-
-                    // "Up Next" billboard card or skeleton
-                    val nextEpisode = activeSeason?.episodes?.firstOrNull()
-                    if (nextEpisode != null) {
+            // ITEM 1: "Up Next" Watch Card
+            item(key = "up_next_watch_card") {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 16.dp, end = 16.dp, bottom = 12.dp)
+                ) {
+                    val upNextToDisplay = upNextEpisode
+                    if (upNextToDisplay != null) {
                         Surface(
                             shape = RoundedCornerShape(12.dp),
                             color = Color(0xFF111722),
@@ -385,7 +399,7 @@ fun SeriesDetailScreen(
                                                 .padding(horizontal = 6.dp, vertical = 2.dp)
                                         ) {
                                             Text(
-                                                text = "S${nextEpisode.seasonNumber.toString().padStart(2, '0')}:E${nextEpisode.episodeNumber.toString().padStart(2, '0')}",
+                                                text = "S${upNextToDisplay.seasonNumber.toString().padStart(2, '0')}:E${upNextToDisplay.episodeNumber.toString().padStart(2, '0')}",
                                                 color = Color(0xFF00E5FF),
                                                 fontSize = 10.sp,
                                                 fontWeight = FontWeight.Bold
@@ -401,7 +415,7 @@ fun SeriesDetailScreen(
                                     Spacer(modifier = Modifier.height(4.dp))
 
                                     Text(
-                                        text = nextEpisode.displayTitle,
+                                        text = upNextToDisplay.displayTitle,
                                         color = Color.White,
                                         fontSize = 13.sp,
                                         fontWeight = FontWeight.SemiBold,
@@ -411,14 +425,14 @@ fun SeriesDetailScreen(
                                     Spacer(modifier = Modifier.height(2.dp))
 
                                     Text(
-                                        text = "${nextEpisode.formattedDuration} • ${nextEpisode.fileSize}",
+                                        text = "${upNextToDisplay.formattedDuration} • ${upNextToDisplay.fileSize}",
                                         color = Color(0xFF6B7A90),
                                         fontSize = 11.sp
                                     )
                                 }
 
                                 IconButton(
-                                    onClick = { onEpisodeSelected(nextEpisode) },
+                                    onClick = { onEpisodeSelected(upNextToDisplay) },
                                     modifier = Modifier
                                         .size(40.dp)
                                         .clip(androidx.compose.foundation.shape.CircleShape)
@@ -439,8 +453,8 @@ fun SeriesDetailScreen(
                 }
             }
 
-            // STICKY HEADER: Season Selector
-            stickyHeader(key = "sticky_season_selector_bar") {
+            // ITEM 2: Season Selector Row
+            item(key = "season_selector_row") {
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
                     color = Color(0xFF07090E),
@@ -468,9 +482,6 @@ fun SeriesDetailScreen(
                                         isCompleted = isCompleted,
                                         onSelect = {
                                             currentSeasonNumber = season.seasonNumber
-                                            coroutineScope.launch {
-                                                listState.animateScrollToItem(index = 1, scrollOffset = 0)
-                                            }
                                         },
                                         onMarkComplete = {
                                             coroutineScope.launch {
@@ -522,7 +533,7 @@ fun SeriesDetailScreen(
                     }
                 }
             } else {
-                items(activeSeason.episodes, key = { it.id }) { episode ->
+                items(activeSeason.episodes, key = { episode -> "${currentSeasonNumber}_${episode.id}" }) { episode ->
                     EpisodeItemRow(
                         episode = episode,
                         seriesId = series.id,

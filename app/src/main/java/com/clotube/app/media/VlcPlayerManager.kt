@@ -30,16 +30,15 @@ class VlcPlayerManager(
 
     private val libVLC: LibVLC by lazy {
         val options = arrayListOf(
-            "--network-caching=5000",
-            "--file-caching=3000",
-            "--live-caching=3000",
+            "--network-caching=1500",
+            "--file-caching=1500",
+            "--live-caching=1500",
             "--clock-jitter=0",
             "--drop-late-frames",
             "--skip-frames",
             "--avcodec-fast",
             "--avcodec-skiploopfilter=4",
-            "--no-sub-autodetect-file",
-            "--http-reconnect"
+            "--no-sub-autodetect-file"
         )
         LibVLC(context.applicationContext, options)
     }
@@ -58,17 +57,54 @@ class VlcPlayerManager(
     var pendingStartPositionMs: Long = 0L
         private set
 
+    var userSelectedAudioTrackId: Int? = null
+    var userSelectedSpuTrackId: Int? = null
+    var userSelectedPlaybackSpeed: Float = 1.0f
+    var pendingTrackRestore: Boolean = false
+
     init {
         mediaPlayer.setEventListener { event ->
             when (event.type) {
                 MediaPlayer.Event.Playing -> {
                     isPlaybackEnded = false
                 }
+                MediaPlayer.Event.TimeChanged -> {
+                    if (event.timeChanged > 0L && pendingTrackRestore) {
+                        restoreTracksIfNeeded()
+                    }
+                }
                 MediaPlayer.Event.EndReached -> {
                     isPlaybackEnded = true
                 }
             }
         }
+    }
+
+    fun restoreTracksIfNeeded() {
+        if (!pendingTrackRestore) return
+        val availableAudio = mediaPlayer.audioTracks
+        if (availableAudio.isNullOrEmpty()) return
+
+        userSelectedAudioTrackId?.let { targetAudioId ->
+            if (availableAudio.any { it.id == targetAudioId } && mediaPlayer.audioTrack != targetAudioId) {
+                mediaPlayer.audioTrack = targetAudioId
+            }
+        }
+
+        userSelectedSpuTrackId?.let { targetSpuId ->
+            val availableSpu = mediaPlayer.spuTracks
+            if (targetSpuId == -1 || availableSpu?.any { it.id == targetSpuId } == true) {
+                if (mediaPlayer.spuTrack != targetSpuId) {
+                    mediaPlayer.spuTrack = targetSpuId
+                }
+            }
+        }
+
+        if (mediaPlayer.rate != userSelectedPlaybackSpeed) {
+            mediaPlayer.rate = userSelectedPlaybackSpeed
+        }
+
+        pendingTrackRestore = false
     }
 
     fun attachLayout(layout: VLCVideoLayout) {
@@ -110,6 +146,13 @@ class VlcPlayerManager(
         val currentFileId = activeFileId ?: return
         val resumeMs = positionMs.coerceAtLeast(0L)
         Log.d(TAG, "softReload invoked for $currentFileId at ${resumeMs}ms")
+        if (userSelectedAudioTrackId == null && mediaPlayer.audioTrack != -1) {
+            userSelectedAudioTrackId = mediaPlayer.audioTrack
+        }
+        if (userSelectedSpuTrackId == null && mediaPlayer.spuTrack != -1) {
+            userSelectedSpuTrackId = mediaPlayer.spuTrack
+        }
+        pendingTrackRestore = true
         play(currentFileId, activeLocalFile, resumeMs)
     }
 
@@ -119,6 +162,11 @@ class VlcPlayerManager(
         startPositionMs: Long = 0L
     ) {
         pendingSeekJob?.cancel()
+        if (activeFileId != fileId) {
+            userSelectedAudioTrackId = null
+            userSelectedSpuTrackId = null
+            pendingTrackRestore = false
+        }
         activeFileId = fileId
         activeLocalFile = localFile
         isPlaybackEnded = false
@@ -199,14 +247,17 @@ class VlcPlayerManager(
     }
 
     fun setSpeed(speed: Float) {
+        userSelectedPlaybackSpeed = speed
         mediaPlayer.rate = speed
     }
 
     fun setSubtitleTrack(trackId: Int) {
+        userSelectedSpuTrackId = trackId
         mediaPlayer.spuTrack = trackId
     }
 
     fun setAudioTrack(trackId: Int) {
+        userSelectedAudioTrackId = trackId
         mediaPlayer.audioTrack = trackId
     }
 

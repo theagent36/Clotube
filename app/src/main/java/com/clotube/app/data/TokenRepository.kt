@@ -19,11 +19,19 @@ class TokenRepository(private val context: Context) {
 
     @Volatile
     private var lastKnownToken: String = ""
+    @Volatile
+    private var lastTokenFetchTimeMs: Long = 0L
 
     @Volatile
     var recoveryIntentLauncher: ((Intent) -> Unit)? = null
 
     suspend fun getValidAccessToken(forceRefresh: Boolean = false): String = withContext(Dispatchers.IO) {
+        val now = System.currentTimeMillis()
+        if (!forceRefresh && lastKnownToken.isNotBlank() && (now - lastTokenFetchTimeMs < 50 * 60 * 1000L)) {
+            Log.d(TAG, "getValidAccessToken: Returning in-memory cached token (age=${(now - lastTokenFetchTimeMs) / 1000}s)")
+            return@withContext lastKnownToken
+        }
+
         val account = GoogleSignIn.getLastSignedInAccount(context)?.account
         if (account == null) {
             Log.w(TAG, "getValidAccessToken: No signed-in Google account found")
@@ -35,12 +43,14 @@ class TokenRepository(private val context: Context) {
                 GoogleAuthUtil.clearToken(context, lastKnownToken)
             } catch (ignored: Exception) {}
             lastKnownToken = ""
+            lastTokenFetchTimeMs = 0L
         }
 
         // 1. Try full Drive scope
         try {
             val token = GoogleAuthUtil.getToken(context, account, FULL_DRIVE_SCOPE)
             lastKnownToken = token
+            lastTokenFetchTimeMs = now
             return@withContext token
         } catch (e: UserRecoverableAuthException) {
             Log.w(TAG, "User consent required for full Drive scope. Triggering recovery intent launcher...")
@@ -58,6 +68,7 @@ class TokenRepository(private val context: Context) {
         try {
             val token = GoogleAuthUtil.getToken(context, account, COMBINED_SCOPES)
             lastKnownToken = token
+            lastTokenFetchTimeMs = now
             token
         } catch (e: UserRecoverableAuthException) {
             Log.w(TAG, "User consent required for scopes. Triggering recovery intent launcher...")
@@ -72,6 +83,7 @@ class TokenRepository(private val context: Context) {
             try {
                 val readToken = GoogleAuthUtil.getToken(context, account, READ_ONLY_SCOPE)
                 lastKnownToken = readToken
+                lastTokenFetchTimeMs = now
                 readToken
             } catch (e2: Exception) {
                 Log.e(TAG, "Fallback read-only token failed: ${e2.message}")

@@ -56,7 +56,7 @@ object LocalStreamProxy {
 
     private suspend fun getFreshToken(forceRefresh: Boolean = false): String {
         val now = System.currentTimeMillis()
-        if (!forceRefresh && cachedToken.isNotBlank() && (now - tokenLastFetchedMs < 40 * 60 * 1000L)) {
+        if (!forceRefresh && cachedToken.isNotBlank() && (now - tokenLastFetchedMs < 50 * 60 * 1000L)) {
             return cachedToken
         }
         val provider = tokenProvider ?: return ""

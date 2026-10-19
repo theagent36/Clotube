@@ -101,6 +101,26 @@ class TokenRefreshProvider(
     }
 
     /**
+     * Retrieves a valid access token. Reuses the in-memory cached token without clearing
+     * or making a network call unless forceRefresh is true or token is missing.
+     */
+    suspend fun getValidAccessToken(forceRefresh: Boolean = false): String? = withContext(Dispatchers.IO) {
+        if (!forceRefresh) {
+            val cached = lastKnownToken
+            if (!cached.isNullOrBlank()) {
+                return@withContext cached
+            }
+            val tokenRepo = tokenRepository ?: TokenRepository(context.applicationContext)
+            val repoToken = tokenRepo.getValidAccessToken(forceRefresh = false)
+            if (repoToken.isNotBlank()) {
+                lastKnownToken = repoToken
+                return@withContext repoToken
+            }
+        }
+        refreshAccessToken()
+    }
+
+    /**
      * Binds the fresh access token to the active file ID.
      * If an access token is provided, returns the authenticated Drive stream URL;
      * otherwise points to the local HTTP streaming proxy.

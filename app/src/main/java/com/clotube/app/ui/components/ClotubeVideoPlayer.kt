@@ -129,10 +129,12 @@ fun ClotubeVideoPlayer(
         LibVLC(
             context.applicationContext,
             arrayListOf(
-                "--network-caching=5000",
-                "--file-caching=3000",
-                "--live-caching=3000",
-                "--http-reconnect",
+                "--network-caching=1500",
+                "--file-caching=1500",
+                "--live-caching=1500",
+                "--clock-jitter=0",
+                "--clock-synchro=0",
+                "--no-sub-autodetect-file",
                 "--no-drop-late-frames",
                 "--no-skip-frames",
                 "--rtsp-tcp"
@@ -151,7 +153,12 @@ fun ClotubeVideoPlayer(
             try {
                 val streamUrl = viewModel.getStreamUrlForEpisode(episode.id)
                 activeStreamUrl = streamUrl
-                val token = viewModel.getFreshGoogleDriveAccessToken(forceRefresh = forceRefreshToken)
+                val token = if (forceRefreshToken) {
+                    viewModel.getFreshGoogleDriveAccessToken(forceRefresh = true)
+                } else {
+                    viewModel.uiState.value.accessToken?.takeIf { it.isNotBlank() }
+                        ?: viewModel.getFreshGoogleDriveAccessToken(forceRefresh = false)
+                }
 
                 if (streamUrl.isBlank()) {
                     withContext(Dispatchers.Main) {
@@ -297,7 +304,7 @@ fun ClotubeVideoPlayer(
             onNextEpisode?.invoke()
         },
         onReloadMedia = { startPositionMs ->
-            loadAndPlayStream(startPositionMs, forceRefreshToken = true)
+            loadAndPlayStream(startPositionMs, forceRefreshToken = false)
         },
         onPlaybackEnded = {
             val total = mediaPlayer.length.coerceAtLeast(1000L)
@@ -376,6 +383,7 @@ fun ClotubeVideoPlayer(
     var isReconnecting by remember { mutableStateOf(false) }
     var pendingReloadOnReconnect by remember { mutableStateOf(false) }
     var stallWatchdogJob by remember { mutableStateOf<Job?>(null) }
+    var stallRetryCount by remember(mediaId) { mutableIntStateOf(0) }
 
     var currentActiveStreamUrl by remember(mediaId, activeStreamUrl) {
         mutableStateOf(activeStreamUrl)
@@ -388,7 +396,62 @@ fun ClotubeVideoPlayer(
         mutableStateOf<Job?>(null)
     }
 
+    var userSelectedAudioTrackId by remember(mediaId) { mutableStateOf<Int?>(null) }
+    var userSelectedSpuTrackId by remember(mediaId) { mutableStateOf<Int?>(null) }
+    var userSelectedPlaybackSpeed by remember(mediaId) { mutableFloatStateOf(mediaPlayer.rate.takeIf { it > 0f } ?: 1.0f) }
+    var currentSpeed by remember(mediaId) { mutableFloatStateOf(mediaPlayer.rate.takeIf { it > 0f } ?: 1.0f) }
+    var pendingTrackRestore by remember(mediaId) { mutableStateOf(false) }
+
+    fun restoreTracksIfNeeded(player: MediaPlayer) {
+        if (!pendingTrackRestore) return
+
+        // Ensure LibVLC has parsed the elementary stream tables
+        val availableAudio = player.audioTracks
+        if (availableAudio.isNullOrEmpty()) return
+
+        userSelectedAudioTrackId?.let { targetAudioId ->
+            if (availableAudio.any { it.id == targetAudioId } && player.audioTrack != targetAudioId) {
+                player.audioTrack = targetAudioId
+                Log.d("ClotubePlayer", "Restored user audio track: $targetAudioId")
+            }
+        }
+
+        userSelectedSpuTrackId?.let { targetSpuId ->
+            val availableSpu = player.spuTracks
+            if (targetSpuId == -1 || availableSpu?.any { it.id == targetSpuId } == true) {
+                if (player.spuTrack != targetSpuId) {
+                    player.spuTrack = targetSpuId
+                    Log.d("ClotubePlayer", "Restored user subtitle track: $targetSpuId")
+                }
+            }
+        }
+
+        if (player.rate != userSelectedPlaybackSpeed) {
+            player.rate = userSelectedPlaybackSpeed
+            currentSpeed = userSelectedPlaybackSpeed
+            Log.d("ClotubePlayer", "Restored user playback speed: ${userSelectedPlaybackSpeed}x")
+        }
+
+        pendingTrackRestore = false
+    }
+
     val coroutineScope = rememberCoroutineScope()
+
+    // Fast initial in-memory access token priming without blocking launch
+    LaunchedEffect(mediaId) {
+        if (currentAccessToken.isBlank()) {
+            val cached = withContext(Dispatchers.IO) {
+                effectiveTokenRefreshProvider.getValidAccessToken(forceRefresh = false)
+            }
+            if (!cached.isNullOrBlank()) {
+                currentAccessToken = cached
+                lastTokenRefreshTimeMs = System.currentTimeMillis()
+                if (currentActiveStreamUrl.isBlank()) {
+                    currentActiveStreamUrl = effectiveTokenRefreshProvider.buildAuthenticatedStreamUrl(mediaId, cached)
+                }
+            }
+        }
+    }
 
     // Proactive 45-Minute Background Token Rotation
     LaunchedEffect(mediaId) {
@@ -420,12 +483,16 @@ fun ClotubeVideoPlayer(
             try {
                 val now = System.currentTimeMillis()
                 val elapsedSinceRefresh = now - lastTokenRefreshTimeMs
-                val needsTokenRefresh = forceTokenRefresh || elapsedSinceRefresh >= 40 * 60 * 1000L
+                val needsTokenRefresh = currentAccessToken.isBlank() || elapsedSinceRefresh > 50 * 60 * 1000L
 
                 if (needsTokenRefresh) {
                     Log.d("ClotubePlayer", "Executing token refresh in softReloadStream (elapsed=${elapsedSinceRefresh}ms, force=$forceTokenRefresh)")
                     val freshToken = withContext(Dispatchers.IO) {
-                        effectiveTokenRefreshProvider.refreshAccessToken()
+                        if (forceTokenRefresh || elapsedSinceRefresh > 50 * 60 * 1000L) {
+                            effectiveTokenRefreshProvider.refreshAccessToken()
+                        } else {
+                            effectiveTokenRefreshProvider.getValidAccessToken(forceRefresh = false)
+                        }
                     }
                     if (!freshToken.isNullOrBlank()) {
                         currentAccessToken = freshToken
@@ -439,6 +506,15 @@ fun ClotubeVideoPlayer(
                 val resumeMs = lastValidPositionMs.coerceAtLeast(0L)
                 val resumeSec = (resumeMs / 1000L).coerceAtLeast(0L)
                 Log.d("ClotubePlayer", "softReloadStream() at resumeMs=$resumeMs, resumeSec=$resumeSec, userIntendedToPlay=$userIntendedToPlay")
+
+                // Capture active tracks before any stream reload as fallback
+                if (userSelectedAudioTrackId == null && mediaPlayer.audioTrack != -1) {
+                    userSelectedAudioTrackId = mediaPlayer.audioTrack
+                }
+                if (userSelectedSpuTrackId == null && mediaPlayer.spuTrack != -1) {
+                    userSelectedSpuTrackId = mediaPlayer.spuTrack
+                }
+                pendingTrackRestore = true
 
                 if (onReloadMedia != null) {
                     onReloadMedia.invoke(resumeMs)
@@ -480,9 +556,12 @@ fun ClotubeVideoPlayer(
     }
 
     val networkMonitor = remember {
-        NetworkMonitor(context) {
+        NetworkMonitor(
+            context = context,
+            hasRenderedFirstFrame = { isFirstFrameRendered }
+        ) {
             Log.d("ClotubePlayer", "onNetworkHandover callback: pendingReload=$pendingReloadOnReconnect, userIntendedToPlay=$userIntendedToPlay, isEnded=$hasEnded")
-            if (pendingReloadOnReconnect || (userIntendedToPlay && !hasEnded)) {
+            if (isFirstFrameRendered && (pendingReloadOnReconnect || (userIntendedToPlay && !hasEnded))) {
                 pendingReloadOnReconnect = false
                 softReloadStream(forceTokenRefresh = false)
             }
@@ -564,8 +643,12 @@ fun ClotubeVideoPlayer(
         userIntendedToPlay = true
         pendingReloadOnReconnect = false
         lastTokenRefreshTimeMs = System.currentTimeMillis()
+        userSelectedAudioTrackId = null
+        userSelectedSpuTrackId = null
+        pendingTrackRestore = false
         stallWatchdogJob?.cancel()
         stallWatchdogJob = null
+        stallRetryCount = 0
         val len = mediaPlayer.length
         durationMs = if (len > 0L) len else fallbackDurationMs
         if (currentPositionMs == 0L && initialPositionMs > 0L) {
@@ -648,7 +731,6 @@ fun ClotubeVideoPlayer(
     var showSubtitleDialog by remember { mutableStateOf(false) }
     var showAudioTrackDialog by remember { mutableStateOf(false) }
     var showStatsOverlay by remember { mutableStateOf(false) }
-    var currentSpeed by remember { mutableFloatStateOf(mediaPlayer.rate) }
 
     // Synchronize LibVLC Events (Handling Buffering & Opening)
     DisposableEffect(mediaPlayer, mediaId) {
@@ -667,15 +749,16 @@ fun ClotubeVideoPlayer(
                     }
                 }
                 MediaPlayer.Event.Buffering -> {
-                    // 8-Second Buffer Underrun Stall Watchdog
+                    // Buffer Underrun Stall Watchdog (Strictly guarded for mid-stream drops only)
                     if (event.buffering < 100f) {
                         isBuffering = true
-                        if (userIntendedToPlay && stallWatchdogJob == null) {
+                        if (isFirstFrameRendered && lastValidPositionMs > 0L && userIntendedToPlay && stallWatchdogJob == null && stallRetryCount < 1) {
                             stallWatchdogJob = coroutineScope.launch {
-                                delay(8000L)
-                                if (isBuffering && networkMonitor.isConnected) {
-                                    Log.w("ClotubePlayer", "Buffer underrun stall watchdog triggered (8s). Soft reloading stream with token refresh...")
-                                    softReloadStream(forceTokenRefresh = true)
+                                delay(25_000L)
+                                if (isBuffering && networkMonitor.isConnected && isFirstFrameRendered && lastValidPositionMs > 0L) {
+                                    stallRetryCount++
+                                    Log.w("ClotubePlayer", "Buffer underrun stall watchdog triggered (25s freeze). Soft reloading stream...")
+                                    softReloadStream(forceTokenRefresh = false)
                                 }
                             }
                         }
@@ -733,11 +816,16 @@ fun ClotubeVideoPlayer(
                 MediaPlayer.Event.TimeChanged -> {
                     stallWatchdogJob?.cancel()
                     stallWatchdogJob = null
+                    stallRetryCount = 0
                     isBuffering = false
                     if (event.timeChanged > 0L) {
                         lastValidPositionMs = event.timeChanged
                         isPlaying = true
                         hasStartedOnce = true
+                        isFirstFrameRendered = true
+                        if (pendingTrackRestore) {
+                            restoreTracksIfNeeded(mediaPlayer)
+                        }
                     }
                     // Strictly ignore TimeChanged events while user is dragging the slider to eliminate jitter
                     if (!isDragging) {
@@ -769,7 +857,7 @@ fun ClotubeVideoPlayer(
                         isPlaybackEnded = false
 
                         if (networkMonitor.isConnected) {
-                            softReloadStream(forceTokenRefresh = true)
+                            softReloadStream(forceTokenRefresh = false)
                         } else {
                             pendingReloadOnReconnect = true
                             Log.d("ClotubePlayer", "Network lost during premature EOF. Pending reload on reconnect.")
@@ -841,6 +929,7 @@ fun ClotubeVideoPlayer(
                     isBuffering = false
                     stallWatchdogJob?.cancel()
                     stallWatchdogJob = null
+                    stallRetryCount = 0
                 }
             }
             delay(250)
@@ -895,12 +984,13 @@ fun ClotubeVideoPlayer(
     fun seekTo(targetTimeMs: Long) {
         stallWatchdogJob?.cancel()
         stallWatchdogJob = null
+        stallRetryCount = 0
         lastValidPositionMs = targetTimeMs
         val totalDur = if (durationMs > 0L) durationMs else mediaPlayer.length
 
         // Reactive token refresh if scrubbing after 50+ minutes of playback
         val elapsedSinceTokenRefresh = System.currentTimeMillis() - lastTokenRefreshTimeMs
-        val isTokenLikelyExpired = elapsedSinceTokenRefresh >= 50 * 60 * 1000L
+        val isTokenLikelyExpired = elapsedSinceTokenRefresh > 50 * 60 * 1000L
 
         if (isTokenLikelyExpired) {
             Log.w("ClotubePlayer", "seekTo: More than 50 minutes elapsed since token refresh ($elapsedSinceTokenRefresh ms). Refreshing token and reloading at ${targetTimeMs}ms")
@@ -922,6 +1012,16 @@ fun ClotubeVideoPlayer(
             isSeeking = true
             currentPositionMs = safeTarget
             lastValidPositionMs = safeTarget
+
+            // Capture active tracks before EOF reload as fallback
+            if (userSelectedAudioTrackId == null && mediaPlayer.audioTrack != -1) {
+                userSelectedAudioTrackId = mediaPlayer.audioTrack
+            }
+            if (userSelectedSpuTrackId == null && mediaPlayer.spuTrack != -1) {
+                userSelectedSpuTrackId = mediaPlayer.spuTrack
+            }
+            pendingTrackRestore = true
+
             if (onReloadMedia != null) {
                 onReloadMedia.invoke(safeTarget)
             } else {
@@ -1268,7 +1368,9 @@ fun ClotubeVideoPlayer(
                             Icon(Icons.Default.Audiotrack, contentDescription = "Audio", tint = Color.White, modifier = Modifier.size(22.dp))
                         }
 
-                        val hasSubtitlesEnabled = remember(mediaPlayer.spuTrack) { mediaPlayer.spuTrack != -1 }
+                        val hasSubtitlesEnabled = remember(mediaPlayer.spuTrack, userSelectedSpuTrackId) {
+                            (userSelectedSpuTrackId ?: mediaPlayer.spuTrack) != -1
+                        }
                         IconButton(onClick = {
                             resetInactivityTimer()
                             showSubtitleDialog = true
@@ -1675,6 +1777,7 @@ fun ClotubeVideoPlayer(
                                 .clickable {
                                     mediaPlayer.rate = speed
                                     currentSpeed = speed
+                                    userSelectedPlaybackSpeed = speed
                                     showSpeedDialog = false
                                 }
                                 .padding(vertical = 10.dp),
@@ -1700,14 +1803,14 @@ fun ClotubeVideoPlayer(
 
     // Modal: Subtitles / Captions
     if (showSubtitleDialog) {
-        val spuTracks = remember(mediaPlayer) {
+        val spuTracks = remember(mediaPlayer, userSelectedSpuTrackId) {
             val tracks = mediaPlayer.spuTracks ?: emptyArray()
-            val currentId = mediaPlayer.spuTrack
+            val currentId = userSelectedSpuTrackId ?: mediaPlayer.spuTrack
             tracks.filter {
                 it.id != -1 && !it.name.equals("Off", ignoreCase = true) && !it.name.equals("Disable", ignoreCase = true)
             }.map { TrackInfoItem(it.id, it.name, it.id == currentId) }
         }
-        val isAnySubtitleSelected = mediaPlayer.spuTrack != -1
+        val isAnySubtitleSelected = (userSelectedSpuTrackId ?: mediaPlayer.spuTrack) != -1
 
         AlertDialog(
             onDismissRequest = { showSubtitleDialog = false },
@@ -1720,6 +1823,7 @@ fun ClotubeVideoPlayer(
                             .fillMaxWidth()
                             .clickable {
                                 mediaPlayer.spuTrack = -1
+                                userSelectedSpuTrackId = -1
                                 showSubtitleDialog = false
                             }
                             .padding(vertical = 10.dp),
@@ -1743,6 +1847,7 @@ fun ClotubeVideoPlayer(
                                 .fillMaxWidth()
                                 .clickable {
                                     mediaPlayer.spuTrack = track.id
+                                    userSelectedSpuTrackId = track.id
                                     showSubtitleDialog = false
                                 }
                                 .padding(vertical = 10.dp),
@@ -1768,9 +1873,9 @@ fun ClotubeVideoPlayer(
 
     // Modal: Audio Tracks
     if (showAudioTrackDialog) {
-        val audioTracks = remember(mediaPlayer) {
+        val audioTracks = remember(mediaPlayer, userSelectedAudioTrackId) {
             val tracks = mediaPlayer.audioTracks ?: emptyArray()
-            val currentId = mediaPlayer.audioTrack
+            val currentId = userSelectedAudioTrackId ?: mediaPlayer.audioTrack
             tracks.map { TrackInfoItem(it.id, it.name, it.id == currentId) }
         }
 
@@ -1789,6 +1894,7 @@ fun ClotubeVideoPlayer(
                                     .fillMaxWidth()
                                     .clickable {
                                         mediaPlayer.audioTrack = track.id
+                                        userSelectedAudioTrackId = track.id
                                         showAudioTrackDialog = false
                                     }
                                     .padding(vertical = 10.dp),
