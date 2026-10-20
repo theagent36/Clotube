@@ -24,6 +24,7 @@ import java.io.FileOutputStream
 import java.io.InputStream
 import java.util.concurrent.TimeUnit
 
+@androidx.annotation.Keep
 class VideoDownloadWorker(
     private val context: Context,
     workerParams: WorkerParameters
@@ -49,12 +50,12 @@ class VideoDownloadWorker(
         val targetFile = File(moviesDir, "$fileId.mp4")
         val tempFile = File(moviesDir, "$fileId.tmp")
 
-        // Pre-flight check: ensure at least 2.0 GB free
+        // Pre-flight check: ensure at least 2.0 GB free (2147483648L)
         val stat = StatFs(moviesDir.path)
         val availableBytes = stat.availableBlocksLong * stat.blockSizeLong
         if (availableBytes < 2147483648L) {
             repository.setStatus(fileId, title, "", DownloadStatus.FAILED)
-            return@withContext Result.failure(workDataOf("error" to "Insufficient storage space"))
+            return@withContext Result.failure(workDataOf("error" to "Low storage space"))
         }
 
         repository.setStatus(fileId, title, targetFile.absolutePath, DownloadStatus.DOWNLOADING)
@@ -69,15 +70,40 @@ class VideoDownloadWorker(
 
         val downloadUrl = "https://www.googleapis.com/drive/v3/files/$fileId?alt=media&supportsAllDrives=true&acknowledgeAbuse=true"
         val requestBuilder = Request.Builder().url(downloadUrl)
-        if (authToken.isNotBlank()) {
-            requestBuilder.addHeader("Authorization", "Bearer $authToken")
+
+        val activeToken = if (authToken.isNotBlank()) {
+            authToken
+        } else {
+            try {
+                com.clotube.app.auth.GoogleAuthRepository(context).getAccessToken().getOrNull() ?: ""
+            } catch (_: Exception) { "" }
+        }
+
+        if (activeToken.isNotBlank()) {
+            requestBuilder.addHeader("Authorization", "Bearer $activeToken")
         }
 
         try {
-            val response = client.newCall(requestBuilder.build()).execute()
+            var response = client.newCall(requestBuilder.build()).execute()
+            if (response.code == 401) {
+                // Token may have expired, refresh once
+                response.close()
+                val freshToken = try {
+                    com.clotube.app.auth.GoogleAuthRepository(context).refreshAccessToken().getOrNull()
+                } catch (_: Exception) { null }
+
+                if (!freshToken.isNullOrBlank()) {
+                    val retryRequest = Request.Builder()
+                        .url(downloadUrl)
+                        .addHeader("Authorization", "Bearer $freshToken")
+                        .build()
+                    response = client.newCall(retryRequest).execute()
+                }
+            }
+
             if (!response.isSuccessful) {
                 repository.setStatus(fileId, title, "", DownloadStatus.FAILED)
-                return@withContext Result.failure()
+                return@withContext Result.failure(workDataOf("error" to "HTTP error ${response.code}"))
             }
 
             val body = response.body ?: return@withContext Result.failure()
@@ -95,7 +121,7 @@ class VideoDownloadWorker(
                 downloadedBytes += bytesRead
 
                 val now = System.currentTimeMillis()
-                if (now - lastUpdateMs > 750L) { // Throttle updates to UI/Notification
+                if (now - lastUpdateMs > 800L) { // Throttle updates to UI and notification every 800ms
                     lastUpdateMs = now
                     val progressPercent = if (totalBytes > 0L) ((downloadedBytes * 100) / totalBytes).toInt() else 0
                     repository.updateProgress(fileId, downloadedBytes, totalBytes)

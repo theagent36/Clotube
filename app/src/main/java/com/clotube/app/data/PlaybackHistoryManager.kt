@@ -121,20 +121,28 @@ data class WatchProgress(
                     (pos.toFloat() / dur.toFloat()).coerceIn(0f, 1f)
                 } else 0f
 
+                val parsedTitle = json.optString("title", "Unknown").trim().ifBlank { "Unknown" }
+                val parsedSeriesTitle = if (json.has("seriesTitle") && !json.isNull("seriesTitle")) json.optString("seriesTitle", "").ifBlank { null } else null
+                val parsedSNum = json.optInt("seasonNumber", 0)
+                val parsedENum = json.optInt("episodeNumber", 0)
+                val parsedSId = if (json.has("seriesId") && !json.isNull("seriesId")) json.optString("seriesId", "").ifBlank { null } else null
+                val titleHasSeriesPattern = parsedTitle.contains(Regex("""(?i)\b(S\d+[:\s]*E\d+|\d+x\d+|Season\s*\d+|Episode\s*\d+)\b"""))
+                val isSeries = json.optBoolean("isSeries", false) || !parsedSeriesTitle.isNullOrBlank() || parsedSNum > 0 || parsedENum > 0 || !parsedSId.isNullOrBlank() || titleHasSeriesPattern
+
                 WatchProgress(
                     fileId = rawFileId,
-                    title = json.optString("title", "Unknown").trim().ifBlank { "Unknown" },
-                    seriesTitle = if (json.has("seriesTitle") && !json.isNull("seriesTitle")) json.optString("seriesTitle", "").ifBlank { null } else null,
-                    seasonNumber = json.optInt("seasonNumber", 0),
-                    episodeNumber = json.optInt("episodeNumber", 0),
-                    isSeries = json.optBoolean("isSeries", false),
+                    title = parsedTitle,
+                    seriesTitle = parsedSeriesTitle,
+                    seasonNumber = parsedSNum,
+                    episodeNumber = parsedENum,
+                    isSeries = isSeries,
                     positionMs = pos,
                     durationMs = dur,
                     progressFraction = frac,
                     lastWatchedTimestamp = ts,
                     thumbnailUrl = thumb,
                     backdropUrl = thumb,
-                    seriesId = if (json.has("seriesId") && !json.isNull("seriesId")) json.optString("seriesId", "").ifBlank { null } else null,
+                    seriesId = parsedSId,
                     genre = if (json.has("genre") && !json.isNull("genre")) json.optString("genre", "").ifBlank { null } else null
                 )
             } catch (e: Exception) {
@@ -1047,7 +1055,11 @@ class PlaybackHistoryManager(
                 title = title,
                 positionMs = durationMs,
                 durationMs = durationMs,
-                isSeries = false,
+                isSeries = isSeries,
+                seriesId = seriesId,
+                seasonNumber = seasonNumber,
+                episodeNumber = episodeNumber,
+                seriesTitle = seriesTitle,
                 thumbnailUrl = thumbnailUrl,
                 backdropUrl = backdropUrl,
                 genre = genre,
@@ -1067,7 +1079,8 @@ class PlaybackHistoryManager(
                 val sId = prefs[SNAPSHOT_SERIES_ID]
                 val sNum = prefs[SNAPSHOT_SEASON_NUMBER] ?: 0
                 val eNum = prefs[SNAPSHOT_EPISODE_NUMBER] ?: 0
-                val isSeries = prefs[SNAPSHOT_IS_SERIES] ?: (!sTitle.isNullOrBlank() || sNum > 0 || !sId.isNullOrBlank())
+                val titleHasSeriesPattern = title.contains(Regex("""(?i)\b(S\d+[:\s]*E\d+|\d+x\d+|Season\s*\d+|Episode\s*\d+)\b"""))
+                val isSeries = (prefs[SNAPSHOT_IS_SERIES] ?: false) || (!sTitle.isNullOrBlank() || sNum > 0 || !sId.isNullOrBlank() || titleHasSeriesPattern)
                 val thumb = prefs[SNAPSHOT_THUMBNAIL_URL]
                 val pos = prefs[SNAPSHOT_POSITION_MS] ?: 0L
                 val dur = prefs[SNAPSHOT_DURATION_MS] ?: 0L
@@ -1238,7 +1251,8 @@ class PlaybackHistoryManager(
             val sId = prefs[SNAPSHOT_SERIES_ID]
             val sNum = prefs[SNAPSHOT_SEASON_NUMBER] ?: 0
             val eNum = prefs[SNAPSHOT_EPISODE_NUMBER] ?: 0
-            val isSeries = prefs[SNAPSHOT_IS_SERIES] ?: (!sTitle.isNullOrBlank() || sNum > 0 || !sId.isNullOrBlank())
+            val titleHasSeriesPattern = title.contains(Regex("""(?i)\b(S\d+[:\s]*E\d+|\d+x\d+|Season\s*\d+|Episode\s*\d+)\b"""))
+            val isSeries = (prefs[SNAPSHOT_IS_SERIES] ?: false) || (!sTitle.isNullOrBlank() || sNum > 0 || !sId.isNullOrBlank() || titleHasSeriesPattern)
             val thumb = prefs[SNAPSHOT_THUMBNAIL_URL]
             val pos = prefs[SNAPSHOT_POSITION_MS] ?: 0L
             val dur = prefs[SNAPSHOT_DURATION_MS] ?: 0L
@@ -1282,7 +1296,8 @@ class PlaybackHistoryManager(
                 val rawSeriesTitle = allMap[stringPreferencesKey("${fileId}_series_title")] as? String
                 val sTitle = rawSeriesTitle?.let { cleanTitleFormatting(it) }
                 val isSeriesExplicit = (allMap[booleanPreferencesKey("${fileId}_is_series")] as? Boolean) ?: false
-                val isSeries = isSeriesExplicit || sId != null || (sNum != null && sNum > 0) || sTitle != null
+                val titleHasSeriesPattern = title.contains(Regex("""(?i)\b(S\d+[:\s]*E\d+|\d+x\d+|Season\s*\d+|Episode\s*\d+)\b"""))
+                val isSeries = isSeriesExplicit || sId != null || (sNum != null && sNum > 0) || sTitle != null || titleHasSeriesPattern
                 val thumb = allMap[stringPreferencesKey("${fileId}_thumb")] as? String
 
                 if (timestamp > maxTimestamp) {
@@ -1418,6 +1433,27 @@ class PlaybackHistoryManager(
     }
 
     suspend fun getProgressSync(fileId: String): WatchProgress? = getProgress(fileId).firstOrNull()
+
+    suspend fun getSeriesIdForFile(fileId: String): String? = withContext(Dispatchers.IO) {
+        val safeId = fileId.trim()
+        if (safeId.isEmpty()) return@withContext null
+        try {
+            val prefs = dataStore.data.first()
+            val directSId = prefs[stringPreferencesKey("${safeId}_series_id")]?.trim()?.ifBlank { null }
+            if (directSId != null) return@withContext directSId
+            if (prefs[SNAPSHOT_FILE_ID] == safeId) {
+                val snapSId = prefs[SNAPSHOT_SERIES_ID]?.trim()?.ifBlank { null }
+                if (snapSId != null) return@withContext snapSId
+            }
+            val legacyJson = prefs[stringPreferencesKey("progress_$safeId")]
+            if (!legacyJson.isNullOrBlank()) {
+                val parsed = WatchProgress.fromJson(legacyJson)
+                val sId = parsed?.seriesId?.trim()?.ifBlank { null }
+                if (sId != null) return@withContext sId
+            }
+        } catch (_: Exception) {}
+        null
+    }
 
     fun getSeriesResumeState(seriesId: String): Flow<SeriesResumeState?> = dataStore.data.map { prefs ->
         val prefix = "series_resume_${seriesId}"

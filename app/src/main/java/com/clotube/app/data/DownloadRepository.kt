@@ -12,6 +12,12 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import java.io.File
 
+import androidx.work.ExistingWorkPolicy
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkManager
+import androidx.work.workDataOf
+import com.clotube.app.workers.VideoDownloadWorker
+
 private val Context.downloadsDataStore by preferencesDataStore(name = "clotube_offline_downloads")
 
 @androidx.annotation.Keep
@@ -36,6 +42,7 @@ data class OfflineMediaRecord(
         get() = if (totalBytes > 0L) (downloadedBytes.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f) else 0f
 }
 
+@androidx.annotation.Keep
 class DownloadRepository(private val context: Context) {
 
     fun getDownloadRecord(fileId: String): Flow<OfflineMediaRecord?> {
@@ -105,6 +112,31 @@ class DownloadRepository(private val context: Context) {
         }
     }
 
+    suspend fun enqueueDownload(fileId: String, title: String, authToken: String) = withContext(Dispatchers.IO) {
+        setStatus(fileId, title, "", DownloadStatus.QUEUED)
+        val workRequest = OneTimeWorkRequestBuilder<VideoDownloadWorker>()
+            .setInputData(
+                workDataOf(
+                    VideoDownloadWorker.KEY_FILE_ID to fileId,
+                    VideoDownloadWorker.KEY_TITLE to title,
+                    VideoDownloadWorker.KEY_AUTH_TOKEN to authToken
+                )
+            )
+            .addTag("download_$fileId")
+            .build()
+
+        WorkManager.getInstance(context).enqueueUniqueWork(
+            "download_$fileId",
+            ExistingWorkPolicy.REPLACE,
+            workRequest
+        )
+    }
+
+    suspend fun cancelDownload(fileId: String) = withContext(Dispatchers.IO) {
+        WorkManager.getInstance(context).cancelUniqueWork("download_$fileId")
+        deleteDownload(fileId)
+    }
+
     suspend fun deleteDownload(fileId: String) = withContext(Dispatchers.IO) {
         var pathToDelete: String? = null
         context.downloadsDataStore.edit { prefs ->
@@ -118,6 +150,13 @@ class DownloadRepository(private val context: Context) {
         pathToDelete?.let {
             val file = File(it)
             if (file.exists()) file.delete()
+        }
+        val moviesDir = context.getExternalFilesDir(Environment.DIRECTORY_MOVIES)
+        if (moviesDir != null) {
+            val mp4 = File(moviesDir, "$fileId.mp4")
+            if (mp4.exists()) mp4.delete()
+            val tmp = File(moviesDir, "$fileId.tmp")
+            if (tmp.exists()) tmp.delete()
         }
     }
 

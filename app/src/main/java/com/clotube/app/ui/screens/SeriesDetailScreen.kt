@@ -45,6 +45,7 @@ import com.clotube.app.util.triggerNavigationHaptic
 import com.clotube.app.model.Episode
 import com.clotube.app.model.Series
 import com.clotube.app.model.TvSeries
+import com.clotube.app.data.DownloadStatus
 import com.clotube.app.ui.components.ClotubeVideoPlayer
 import com.clotube.app.ui.components.EpisodeItemRow
 import com.clotube.app.ui.components.SeasonTabChip
@@ -57,6 +58,7 @@ fun SeriesDetailScreen(
     series: Series,
     viewModel: VideoViewModel,
     activePlayingEpisode: Episode?,
+    initialPositionMs: Long = 0L,
     onEpisodeSelected: (Episode) -> Unit,
     onBackClick: () -> Unit,
     onClosePlayer: () -> Unit = onBackClick,
@@ -205,6 +207,8 @@ fun SeriesDetailScreen(
                 ClotubeVideoPlayer(
                     episode = activePlayingEpisode,
                     viewModel = viewModel,
+                    seriesId = series.id,
+                    initialPositionMs = initialPositionMs,
                     nextEpisode = nextEpisode,
                     onPreviousEpisode = prevEpisode?.let { ep -> { onEpisodeSelected(ep) } },
                     onNextEpisode = nextEpisode?.let { ep -> { onEpisodeSelected(ep) } },
@@ -534,16 +538,31 @@ fun SeriesDetailScreen(
                 }
             } else {
                 items(activeSeason.episodes, key = { episode -> "${currentSeasonNumber}_${episode.id}" }) { episode ->
+                    val downloadRecord by viewModel.downloadRepository.getDownloadRecord(episode.id).collectAsState(initial = null)
                     EpisodeItemRow(
                         episode = episode,
                         seriesId = series.id,
                         seriesTitle = series.title,
                         isPlayingThis = (activePlayingEpisode?.id == episode.id),
                         onEpisodeClick = { onEpisodeSelected(episode) },
-                        onStartDownload = { /* handle download */ },
-                        onCancelDownload = { /* handle cancel */ },
-                        isDownloading = false,
-                        isDownloaded = false,
+                        onStartDownload = {
+                            coroutineScope.launch {
+                                val token = viewModel.getValidAccessToken()
+                                viewModel.downloadRepository.enqueueDownload(
+                                    fileId = episode.id,
+                                    title = "${series.title} - ${episode.displayTitle}",
+                                    authToken = token
+                                )
+                            }
+                        },
+                        onCancelDownload = {
+                            coroutineScope.launch {
+                                viewModel.downloadRepository.cancelDownload(episode.id)
+                            }
+                        },
+                        downloadRecord = downloadRecord,
+                        isDownloading = downloadRecord?.status == DownloadStatus.DOWNLOADING || downloadRecord?.status == DownloadStatus.QUEUED,
+                        isDownloaded = downloadRecord?.status == DownloadStatus.COMPLETED,
                         viewModel = viewModel,
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
                     )
@@ -573,24 +592,40 @@ fun SeriesDetailScreen(
     val uiState by viewModel.uiState.collectAsState()
     val seriesList by viewModel.seriesList.collectAsState()
 
-    val cachedSeries = remember(seriesId, seriesList, uiState.tvSeriesList) {
-        val diskShow = com.clotube.app.viewmodel.loadCatalogFromDisk(context).find { it.id == seriesId && it.seasons.any { s -> s.episodes.isNotEmpty() } }
-        (initialSeries?.takeIf { it.seasons.any { s -> s.episodes.isNotEmpty() } })
-            ?: seriesList.find { it.id == seriesId && it.seasons.any { s -> s.episodes.isNotEmpty() } }
-            ?: uiState.tvSeriesList.find { it.id == seriesId && it.seasons.any { s -> s.episodes.isNotEmpty() } }
-            ?: viewModel.getSeriesById(seriesId)?.takeIf { it.seasons.any { s -> s.episodes.isNotEmpty() } }
-            ?: diskShow
+    val cachedSeries = remember(seriesId, initialEpisodeId, seriesList, uiState.tvSeriesList) {
+        val diskCatalog = com.clotube.app.viewmodel.loadCatalogFromDisk(context)
+        val byEpId = if (!initialEpisodeId.isNullOrBlank()) {
+            seriesList.find { s -> s.seasons.any { it.episodes.any { ep -> ep.id == initialEpisodeId } } }
+                ?: uiState.tvSeriesList.find { s -> s.seasons.any { it.episodes.any { ep -> ep.id == initialEpisodeId } } }
+                ?: diskCatalog.find { s -> s.seasons.any { it.episodes.any { ep -> ep.id == initialEpisodeId } } }
+        } else null
+
+        byEpId
+            ?: (initialSeries?.takeIf { it.seasons.any { s -> s.episodes.isNotEmpty() } })
+            ?: seriesList.find { it.id == seriesId && seriesId.isNotEmpty() && it.seasons.any { s -> s.episodes.isNotEmpty() } }
+            ?: uiState.tvSeriesList.find { it.id == seriesId && seriesId.isNotEmpty() && it.seasons.any { s -> s.episodes.isNotEmpty() } }
+            ?: (if (seriesId.isNotEmpty()) viewModel.getSeriesById(seriesId)?.takeIf { it.seasons.any { s -> s.episodes.isNotEmpty() } } else null)
+            ?: (if (seriesId.isNotEmpty()) diskCatalog.find { it.id == seriesId && it.seasons.any { s -> s.episodes.isNotEmpty() } } else null)
             ?: initialSeries
-            ?: seriesList.find { it.id == seriesId }
-            ?: uiState.tvSeriesList.find { it.id == seriesId }
-            ?: viewModel.getSeriesById(seriesId)
-            ?: com.clotube.app.viewmodel.loadCatalogFromDisk(context).find { it.id == seriesId }
+            ?: seriesList.find { it.id == seriesId && seriesId.isNotEmpty() }
+            ?: uiState.tvSeriesList.find { it.id == seriesId && seriesId.isNotEmpty() }
+            ?: (if (seriesId.isNotEmpty()) viewModel.getSeriesById(seriesId) else null)
+            ?: (if (seriesId.isNotEmpty()) diskCatalog.find { it.id == seriesId } else null)
+            ?: seriesList.firstOrNull()
+            ?: uiState.tvSeriesList.firstOrNull()
+            ?: diskCatalog.firstOrNull()
     }
 
     var currentSeries by remember(seriesId) { mutableStateOf(cachedSeries) }
 
-    val hasLoadedEpisodes = remember(cachedSeries) {
-        cachedSeries?.seasons?.any { it.episodes.isNotEmpty() } == true
+    LaunchedEffect(cachedSeries) {
+        if (currentSeries == null && cachedSeries != null) {
+            currentSeries = cachedSeries
+        }
+    }
+
+    val hasLoadedEpisodes = remember(cachedSeries, currentSeries) {
+        (currentSeries ?: cachedSeries)?.seasons?.any { it.episodes.isNotEmpty() } == true
     }
 
     var isLoadingEpisodes by remember(seriesId) {
@@ -603,7 +638,7 @@ fun SeriesDetailScreen(
         }
     }
 
-    LaunchedEffect(seriesId) {
+    LaunchedEffect(seriesId, initialEpisodeId) {
         val needsFetch = currentSeries == null ||
             currentSeries?.seasons.isNullOrEmpty() ||
             currentSeries?.seasons?.all { it.episodes.isEmpty() } == true
@@ -614,13 +649,21 @@ fun SeriesDetailScreen(
                 try {
                     val authRepo = com.clotube.app.auth.GoogleAuthRepository(context)
                     val seriesRepo = com.clotube.app.data.SeriesRepository(authRepo)
-                    val freshShow = seriesRepo.getShowDetails(seriesId, currentSeries?.title)
-                    if (freshShow.seasons.any { it.episodes.isNotEmpty() }) {
-                        currentSeries = freshShow
-                        viewModel.updateSeriesInCatalog(freshShow)
-                        com.clotube.app.viewmodel.saveShowToDisk(context, freshShow)
-                    } else if (freshShow.seasons.isNotEmpty()) {
-                        currentSeries = freshShow
+                    val effectiveId = if (seriesId.isNotBlank()) seriesId else {
+                        viewModel.getSeriesIdForEpisode(initialEpisodeId.orEmpty())
+                            ?: viewModel.getDefaultSeriesId()
+                            ?: viewModel.resolveSeriesFolderId()
+                            ?: ""
+                    }
+                    if (effectiveId.isNotBlank()) {
+                        val freshShow = seriesRepo.getShowDetails(effectiveId, currentSeries?.title)
+                        if (freshShow.seasons.any { it.episodes.isNotEmpty() }) {
+                            currentSeries = freshShow
+                            viewModel.updateSeriesInCatalog(freshShow)
+                            com.clotube.app.viewmodel.saveShowToDisk(context, freshShow)
+                        } else if (freshShow.seasons.isNotEmpty()) {
+                            currentSeries = freshShow
+                        }
                     }
                 } catch (e: Exception) {
                     android.util.Log.e("SeriesDetailScreen", "Failed on-demand episode fetch for $seriesId: ${e.message}")
@@ -633,7 +676,43 @@ fun SeriesDetailScreen(
         }
     }
 
-    val targetSeries = currentSeries ?: cachedSeries
+    val fallbackSeries = remember(initialEpisodeId, seriesId, uiState.lastWatchedMedia) {
+        if (!initialEpisodeId.isNullOrBlank()) {
+            val lastWatched = uiState.lastWatchedMedia
+            val sNum = lastWatched?.seasonNumber?.coerceAtLeast(1) ?: 1
+            val eNum = lastWatched?.episodeNumber?.coerceAtLeast(1) ?: 1
+            val sTitle = lastWatched?.seriesTitle?.ifBlank { null } ?: "The Mentalist"
+            val epTitle = lastWatched?.formattedDisplayTitle ?: "Episode $eNum"
+            val durMs = lastWatched?.durationMs ?: 0L
+            val durFormatted = if (durMs > 0L) {
+                String.format(java.util.Locale.US, "%02d:%02d", (durMs / 1000) / 60, (durMs / 1000) % 60)
+            } else ""
+            val fallbackEp = Episode(
+                id = initialEpisodeId,
+                seriesTitle = sTitle,
+                displayTitle = epTitle,
+                seasonNumber = sNum,
+                episodeNumber = eNum,
+                thumbnailUrl = (lastWatched?.thumbnailUrl ?: lastWatched?.backdropUrl).orEmpty(),
+                durationFormatted = durFormatted
+            )
+            TvSeries(
+                id = seriesId.ifBlank { "series_fallback" },
+                title = sTitle,
+                posterUrl = lastWatched?.thumbnailUrl.orEmpty(),
+                backdropUrl = lastWatched?.backdropUrl.orEmpty(),
+                seasons = listOf(
+                    com.clotube.app.model.Season(
+                        id = "season_$sNum",
+                        seasonNumber = sNum,
+                        episodes = listOf(fallbackEp)
+                    )
+                )
+            )
+        } else null
+    }
+
+    val targetSeries = currentSeries ?: cachedSeries ?: fallbackSeries
 
     var activePlayingEpisode by rememberSaveable(seriesId, initialEpisodeId) {
         mutableStateOf<Episode?>(
@@ -643,11 +722,21 @@ fun SeriesDetailScreen(
         )
     }
 
+    LaunchedEffect(targetSeries, initialEpisodeId) {
+        if (activePlayingEpisode == null && !initialEpisodeId.isNullOrBlank() && targetSeries != null) {
+            val found = targetSeries.seasons.flatMap { it.episodes }.find { it.id == initialEpisodeId }
+            if (found != null) {
+                activePlayingEpisode = found
+            }
+        }
+    }
+
     if (targetSeries != null) {
         SeriesDetailScreen(
             series = targetSeries,
             viewModel = viewModel,
             activePlayingEpisode = activePlayingEpisode,
+            initialPositionMs = if (initialEpisodeId == null || activePlayingEpisode?.id == initialEpisodeId) initialPositionMs else 0L,
             onEpisodeSelected = { ep ->
                 activePlayingEpisode = ep
                 onRegisterActivePlayer?.invoke(viewModel.mediaPlayer)

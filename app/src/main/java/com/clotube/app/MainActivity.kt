@@ -110,6 +110,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        videoViewModel.vlcPlayerManager.onAppResume()
+    }
+
     override fun onResume() {
         super.onResume()
         videoViewModel.vlcPlayerManager.onAppResume()

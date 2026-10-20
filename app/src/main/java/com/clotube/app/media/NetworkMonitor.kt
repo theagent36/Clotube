@@ -20,8 +20,7 @@ fun Media.applyClotubeMediaOptions(startTimeSeconds: Long = 0L) {
     addOption(":network-caching=1500")
     addOption(":file-caching=1500")
     addOption(":live-caching=1500")
-    addOption(":clock-jitter=0")
-    addOption(":clock-synchro=0")
+    addOption(":audio-time-stretch")
     addOption("--no-sub-autodetect-file")
     if (startTimeSeconds > 0L) {
         addOption(":start-time=$startTimeSeconds")

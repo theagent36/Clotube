@@ -201,10 +201,21 @@ fun ClotubeNavHost(
                     onResumePlayback = { fileId, title, seriesId, positionMs ->
                         val safeFileId = (fileId ?: "").trim()
                         val safeTitle = (title ?: "").trim().ifBlank { "Video" }
-                        val safeSeriesId = seriesId?.trim()?.ifBlank { null }
                         if (safeFileId.isNotEmpty()) {
-                            if (!safeSeriesId.isNullOrEmpty()) {
-                                navController.navigate(NavRoutes.seriesDetailRoute(safeSeriesId, episodeId = safeFileId, positionMs = positionMs))
+                            val isEpisode = videoViewModel.isEpisode(safeFileId, safeTitle) ||
+                                (seriesId ?: "").isNotBlank() ||
+                                safeTitle.contains(Regex("""S\d+E\d+|Season\s*\d+|Episode\s*\d+""", RegexOption.IGNORE_CASE))
+
+                            val resolvedSeriesId = seriesId?.trim()?.ifBlank { null }
+                                ?: if (isEpisode) {
+                                    videoViewModel.getSeriesIdForEpisode(safeFileId, null) ?: videoViewModel.getDefaultSeriesId()
+                                } else null
+
+                            if (!resolvedSeriesId.isNullOrEmpty() || isEpisode) {
+                                val sId = resolvedSeriesId.orEmpty().ifBlank {
+                                    videoViewModel.getDefaultSeriesId().orEmpty()
+                                }
+                                navController.navigate(NavRoutes.seriesDetailRoute(sId, episodeId = safeFileId, positionMs = positionMs))
                             } else {
                                 navController.navigate(NavRoutes.playerRoute(safeFileId, safeTitle))
                             }
@@ -231,13 +242,26 @@ fun ClotubeNavHost(
                         val safeFileId = (historyItem.fileId ?: "").trim()
                         val safeTitle = (historyItem.title ?: "").trim().ifBlank { "Video" }
                         if (safeFileId.isNotEmpty()) {
-                            val sId = if (historyItem.isSeries) {
-                                if (!historyItem.seriesId.isNullOrBlank()) historyItem.seriesId?.trim()
-                                else videoViewModel.uiState.value.tvSeriesList.find { s -> s.seasons.any { season -> season.episodes.any { ep -> ep.id == safeFileId } } }?.id?.trim()
+                            val isEpisode = historyItem.isSeries ||
+                                videoViewModel.isEpisode(safeFileId, safeTitle) ||
+                                (historyItem.seriesId ?: "").isNotBlank() ||
+                                historyItem.seasonNumber > 0 ||
+                                historyItem.episodeNumber > 0 ||
+                                safeTitle.contains(Regex("""S\d+E\d+|Season\s*\d+|Episode\s*\d+""", RegexOption.IGNORE_CASE))
+
+                            val resolvedSeriesId = if (!historyItem.seriesId.isNullOrBlank()) {
+                                historyItem.seriesId?.trim()
+                            } else if (isEpisode) {
+                                videoViewModel.getSeriesIdForEpisode(safeFileId, historyItem.seriesTitle)
+                                    ?: videoViewModel.getDefaultSeriesId()
+                                    ?: videoViewModel.uiState.value.tvSeriesList.find { s -> s.seasons.any { season -> season.episodes.any { ep -> ep.id == safeFileId } } }?.id?.trim()
                             } else null
 
                             val resumePos = if (historyItem.progressFraction >= 0.95f) 0L else historyItem.positionMs
-                            if (!sId.isNullOrBlank()) {
+                            if (!resolvedSeriesId.isNullOrBlank() || isEpisode) {
+                                val sId = resolvedSeriesId.orEmpty().ifBlank {
+                                    videoViewModel.getDefaultSeriesId().orEmpty()
+                                }
                                 navController.navigate(NavRoutes.seriesDetailRoute(sId, episodeId = safeFileId, positionMs = resumePos))
                             } else {
                                 navController.navigate(NavRoutes.playerRoute(safeFileId, safeTitle))

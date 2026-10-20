@@ -640,14 +640,24 @@ fun HomeScreen(
                                                     val safeTitle = (item.title ?: "").trim().ifBlank { "Untitled Video" }
                                                     val safeSubtitle = (item.subtitle ?: "").trim()
                                                     val safeThumb = (item.backdropUrl ?: item.thumbnailUrl ?: "").trim()
+                                                    val isSeriesItem = item.isSeries ||
+                                                        viewModel.isEpisode(safeMediaId, safeTitle) ||
+                                                        safeSubtitle.contains(Regex("""S\d+E\d+|Season\s*\d+|Episode\s*\d+""", RegexOption.IGNORE_CASE)) ||
+                                                        safeTitle.contains(Regex("""S\d+E\d+|Season\s*\d+|Episode\s*\d+""", RegexOption.IGNORE_CASE)) ||
+                                                        (item.seriesId ?: "").isNotBlank()
+                                                    val resolvedSeriesId = if (!item.seriesId.isNullOrBlank()) {
+                                                        item.seriesId?.trim().orEmpty()
+                                                    } else if (isSeriesItem) {
+                                                        viewModel.getSeriesIdForEpisode(safeMediaId, null) ?: viewModel.getDefaultSeriesId() ?: ""
+                                                    } else ""
                                                     ContinueWatchingData(
                                                         mediaId = safeMediaId,
-                                                        seriesId = (item.seriesId ?: "").trim(),
+                                                        seriesId = resolvedSeriesId,
                                                         title = safeTitle,
                                                         subtitle = safeSubtitle,
                                                         episodeTitle = safeSubtitle,
                                                         thumbnailUrl = safeThumb,
-                                                        isMovie = !item.isSeries,
+                                                        isMovie = !isSeriesItem,
                                                         progressPercentage = (item.progressFraction * 100).toInt().coerceIn(0, 100),
                                                         currentPositionMs = item.positionMs,
                                                         durationMs = item.durationMs,
@@ -661,10 +671,21 @@ fun HomeScreen(
                                                 else {
                                                     val watchedPercent = (wp.progressFraction * 100).toInt().coerceIn(0, 100)
                                                     val safeTitle = (wp.title ?: "").trim()
-                                                    val subtitle = if (wp.isSeries) {
+                                                    val isSeriesWp = wp.isSeries ||
+                                                        viewModel.isEpisode(safeFileId, safeTitle) ||
+                                                        wp.seasonNumber > 0 ||
+                                                        wp.episodeNumber > 0 ||
+                                                        (wp.seriesId ?: "").isNotBlank() ||
+                                                        safeTitle.contains(Regex("""S\d+E\d+|Season\s*\d+|Episode\s*\d+""", RegexOption.IGNORE_CASE))
+                                                    val resolvedSeriesId = if (!wp.seriesId.isNullOrBlank()) {
+                                                        wp.seriesId?.trim().orEmpty()
+                                                    } else if (isSeriesWp) {
+                                                        viewModel.getSeriesIdForEpisode(safeFileId, wp.seriesTitle) ?: viewModel.getDefaultSeriesId() ?: ""
+                                                    } else ""
+                                                    val subtitle = if (isSeriesWp) {
                                                         safeTitle.ifBlank {
-                                                            val sNum = wp.seasonNumber
-                                                            val eNum = wp.episodeNumber
+                                                            val sNum = wp.seasonNumber.coerceAtLeast(1)
+                                                            val eNum = wp.episodeNumber.coerceAtLeast(1)
                                                             "S${String.format(java.util.Locale.US, "%02d", sNum)}:E${String.format(java.util.Locale.US, "%02d", eNum)}"
                                                         }
                                                     } else {
@@ -673,12 +694,12 @@ fun HomeScreen(
                                                     val safeThumb = (wp.backdropUrl ?: wp.thumbnailUrl ?: "").trim()
                                                     ContinueWatchingData(
                                                         mediaId = safeFileId,
-                                                        seriesId = (wp.seriesId ?: "").trim(),
+                                                        seriesId = resolvedSeriesId,
                                                         title = wp.formattedDisplayTitle,
                                                         subtitle = subtitle,
                                                         episodeTitle = safeTitle,
                                                         thumbnailUrl = safeThumb,
-                                                        isMovie = !wp.isSeries,
+                                                        isMovie = !isSeriesWp,
                                                         progressPercentage = watchedPercent,
                                                         currentPositionMs = wp.positionMs,
                                                         durationMs = wp.durationMs,
@@ -698,7 +719,12 @@ fun HomeScreen(
                                                 if (safeMediaId.isNotEmpty()) {
                                                     val safeTitle = (cw.title ?: "").trim().ifBlank { "Video" }
                                                     val pos = cw.currentPositionMs
-                                                    if (cw.isMovie) {
+                                                    val isEpisode = !cw.isMovie ||
+                                                        viewModel.isEpisode(safeMediaId, safeTitle) ||
+                                                        (cw.seriesId ?: "").isNotBlank() ||
+                                                        safeTitle.contains(Regex("""S\d+E\d+|Season\s*\d+|Episode\s*\d+""", RegexOption.IGNORE_CASE))
+
+                                                    if (!isEpisode) {
                                                         if (onResumePlayback != null) {
                                                             onResumePlayback(safeMediaId, safeTitle, null, pos)
                                                         } else {
@@ -711,9 +737,11 @@ fun HomeScreen(
                                                         val sId = if (!cw.seriesId.isNullOrBlank()) {
                                                             cw.seriesId.trim()
                                                         } else {
-                                                            uiState.tvSeriesList.find { s ->
-                                                                s.seasons.any { season -> season.episodes.any { ep -> ep.id == safeMediaId } }
-                                                            }?.id?.trim() ?: ""
+                                                            viewModel.getSeriesIdForEpisode(safeMediaId, cw.seriesTitle)
+                                                                ?: viewModel.getDefaultSeriesId()
+                                                                ?: uiState.tvSeriesList.find { s ->
+                                                                    s.seasons.any { season -> season.episodes.any { ep -> ep.id == safeMediaId } }
+                                                                }?.id?.trim() ?: ""
                                                         }
                                                         val epTitle = (cw.episodeTitle ?: "").trim().ifBlank { safeTitle }
                                                         if (onResumePlayback != null) {
@@ -728,19 +756,27 @@ fun HomeScreen(
                                                 }
                                             },
                                             onDetailsClick = {
-                                                if (!cw.isMovie) {
-                                                    val safeMediaId = (cw.mediaId ?: "").trim()
+                                                val safeMediaId = (cw.mediaId ?: "").trim()
+                                                val safeTitle = (cw.title ?: "").trim().ifBlank { "Video" }
+                                                val isEpisode = !cw.isMovie ||
+                                                    viewModel.isEpisode(safeMediaId, safeTitle) ||
+                                                    (cw.seriesId ?: "").isNotBlank() ||
+                                                    safeTitle.contains(Regex("""S\d+E\d+|Season\s*\d+|Episode\s*\d+""", RegexOption.IGNORE_CASE))
+
+                                                if (isEpisode) {
                                                     val sId = if (!cw.seriesId.isNullOrBlank()) {
                                                         cw.seriesId.trim()
                                                     } else {
-                                                        uiState.tvSeriesList.find { s ->
-                                                            s.seasons.any { season -> season.episodes.any { ep -> ep.id == safeMediaId } }
-                                                        }?.id?.trim() ?: ""
+                                                        viewModel.getSeriesIdForEpisode(safeMediaId, cw.seriesTitle)
+                                                            ?: viewModel.getDefaultSeriesId()
+                                                            ?: uiState.tvSeriesList.find { s ->
+                                                                s.seasons.any { season -> season.episodes.any { ep -> ep.id == safeMediaId } }
+                                                            }?.id?.trim() ?: ""
                                                     }
                                                     val matchedSeries = uiState.tvSeriesList.find { it.id == sId }
                                                         ?: TvSeries(
                                                             id = sId,
-                                                            title = (cw.title ?: "").substringBefore(" • ").trim(),
+                                                            title = (cw.title ?: "").substringBefore(" • ").trim().ifBlank { "TV Series" },
                                                             posterUrl = cw.thumbnailUrl
                                                         )
                                                     onSeriesSelected(matchedSeries)

@@ -178,6 +178,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
     private val driveRepository = DriveRepository(authRepository, folderManager)
     val playbackHistoryManager = com.clotube.app.data.PlaybackHistoryManager(application)
     val catalogCacheManager = CatalogCacheManager(application)
+    val downloadRepository by lazy { com.clotube.app.data.DownloadRepository(application) }
 
     val tokenRepository = com.clotube.app.data.TokenRepository(application)
 
@@ -348,6 +349,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             val dur = mediaPlayer.length
             if (dur > 0L && curPos > 0L) {
                 viewModelScope.launch {
+                    val resolvedSId = getSeriesIdForEpisode(currentEp.id, currentEp.seriesTitle)
                     playbackHistoryManager.saveProgress(
                         fileId = currentEp.id,
                         title = currentEp.title,
@@ -355,6 +357,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                         positionMs = curPos,
                         durationMs = dur,
                         isSeries = true,
+                        seriesId = resolvedSId,
                         seasonNumber = currentEp.seasonNumber,
                         episodeNumber = currentEp.episodeNumber,
                         thumbnailUrl = currentEp.thumbnailUrl.ifBlank { null }
@@ -395,6 +398,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             val dur = mediaPlayer.length
             if (dur > 0L && curPos > 0L) {
                 viewModelScope.launch {
+                    val resolvedSId = getSeriesIdForEpisode(currentEp.id, currentEp.seriesTitle)
                     playbackHistoryManager.saveProgress(
                         fileId = currentEp.id,
                         title = currentEp.title,
@@ -402,6 +406,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                         positionMs = curPos,
                         durationMs = dur,
                         isSeries = true,
+                        seriesId = resolvedSId,
                         seasonNumber = currentEp.seasonNumber,
                         episodeNumber = currentEp.episodeNumber,
                         thumbnailUrl = currentEp.thumbnailUrl.ifBlank { null }
@@ -459,7 +464,8 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         seasonNumber: Int = 0,
         episodeNumber: Int = 0,
         isSeries: Boolean = false,
-        thumbnailUrl: String? = null
+        thumbnailUrl: String? = null,
+        seriesId: String? = null
     ) {
         if (fileId.isBlank() || durationMs <= 0L) return
         val resolvedMovie = if (title == null) getMovieById(fileId) else null
@@ -469,7 +475,8 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         val finalSeriesTitle = seriesTitle ?: resolvedEpisode?.seriesTitle
         val finalSeasonNum = if (seasonNumber > 0) seasonNumber else resolvedEpisode?.seasonNumber ?: 0
         val finalEpisodeNum = if (episodeNumber > 0) episodeNumber else resolvedEpisode?.episodeNumber ?: 0
-        val finalIsSeries = isSeries || resolvedEpisode != null
+        val resolvedSeriesId = seriesId?.trim()?.ifBlank { null } ?: getSeriesIdForEpisode(fileId, finalSeriesTitle)
+        val finalIsSeries = isSeries || resolvedEpisode != null || !resolvedSeriesId.isNullOrBlank() || finalSeasonNum > 0 || isEpisode(fileId, finalTitle)
         val finalThumbnailUrl = thumbnailUrl ?: resolvedEpisode?.thumbnailUrl ?: resolvedMovie?.thumbnailUrl
 
         CoroutineScope(Dispatchers.IO + NonCancellable).launch {
@@ -481,6 +488,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                     seasonNumber = finalSeasonNum,
                     episodeNumber = finalEpisodeNum,
                     isSeries = finalIsSeries,
+                    seriesId = resolvedSeriesId,
                     positionMs = positionMs,
                     durationMs = durationMs,
                     thumbnailUrl = finalThumbnailUrl
@@ -492,12 +500,13 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                     seasonNumber = finalSeasonNum,
                     episodeNumber = finalEpisodeNum,
                     isSeries = finalIsSeries,
+                    seriesId = resolvedSeriesId,
                     positionMs = positionMs,
                     durationMs = durationMs,
                     thumbnailUrl = finalThumbnailUrl,
                     immediateCloudSync = true
                 )
-                Log.d("VideoViewModel", "Immediate progress committed for $fileId at $positionMs / $durationMs")
+                Log.d("VideoViewModel", "Immediate progress committed for $fileId at $positionMs / $durationMs (isSeries=$finalIsSeries, seriesId=$resolvedSeriesId)")
             } catch (e: Exception) {
                 Log.e("VideoViewModel", "Failed to commit immediate progress: ${e.message}", e)
             }
@@ -575,6 +584,75 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         return _seriesList.value.find { it.id == seriesId }
     }
 
+    fun isEpisode(fileId: String, title: String? = null): Boolean {
+        val safeId = fileId.trim()
+        if (safeId.isEmpty()) return false
+
+        // 1. Direct match in memory series catalogs
+        if (_seriesState.value.any { s -> s.seasons.any { season -> season.episodes.any { it.id == safeId } } }) return true
+        if (_uiState.value.tvSeriesList.any { s -> s.seasons.any { season -> season.episodes.any { it.id == safeId } } }) return true
+
+        // 2. Direct match in disk catalog
+        if (loadCatalogFromDisk(getApplication()).any { s -> s.seasons.any { season -> season.episodes.any { it.id == safeId } } }) return true
+
+        // 3. Match in current playing episode list
+        if (_episodeList.value.any { it.id == safeId }) return true
+
+        // 4. Regex check on title or clean episode title
+        val checkTitle = (title ?: _episodeList.value.find { it.id == safeId }?.title)?.trim().orEmpty()
+        if (checkTitle.isNotEmpty()) {
+            if (Regex("""(?i)\b(S\d+[:\s]*E\d+|\d+x\d+|Season\s*\d+|Episode\s*\d+)\b""").containsMatchIn(checkTitle)) return true
+        }
+
+        // 5. Exclude if unequivocally registered as Movie
+        if (_moviesState.value.any { it.id == safeId } || _uiState.value.moviesList.any { it.id == safeId }) return false
+
+        return false
+    }
+
+    fun getSeriesIdForEpisode(fileId: String, seriesTitle: String? = null): String? {
+        val safeId = fileId.trim()
+        val safeTitle = seriesTitle?.trim()?.ifBlank { null }
+
+        // 1. Check in-memory series catalogs by episode ID
+        val memoryMatch = _seriesState.value.firstOrNull { s -> s.seasons.any { season -> season.episodes.any { it.id == safeId } } }
+            ?: _uiState.value.tvSeriesList.firstOrNull { s -> s.seasons.any { season -> season.episodes.any { it.id == safeId } } }
+        if (memoryMatch != null) return memoryMatch.id
+
+        // 2. Check disk catalog by episode ID
+        val diskCatalog = loadCatalogFromDisk(getApplication())
+        val diskMatch = diskCatalog.firstOrNull { s -> s.seasons.any { season -> season.episodes.any { it.id == safeId } } }
+        if (diskMatch != null) return diskMatch.id
+
+        // 3. Match by series title if provided
+        if (safeTitle != null) {
+            val titleMatch = _seriesState.value.firstOrNull { it.title.equals(safeTitle, ignoreCase = true) }
+                ?: _uiState.value.tvSeriesList.firstOrNull { it.title.equals(safeTitle, ignoreCase = true) }
+                ?: diskCatalog.firstOrNull { it.title.equals(safeTitle, ignoreCase = true) }
+            if (titleMatch != null) return titleMatch.id
+        }
+
+        // 4. Check snapshot or history preference
+        val snap = _uiState.value.lastWatchedMedia
+        if (snap != null && snap.fileId == safeId && !snap.seriesId.isNullOrBlank()) {
+            return snap.seriesId.trim()
+        }
+
+        // 5. Default fallback to first series in catalog
+        return getDefaultSeriesId()
+    }
+
+    fun getDefaultSeriesId(): String? {
+        return _seriesState.value.firstOrNull()?.id?.ifBlank { null }
+            ?: _uiState.value.tvSeriesList.firstOrNull()?.id?.ifBlank { null }
+            ?: loadCatalogFromDisk(getApplication()).firstOrNull()?.id?.ifBlank { null }
+            ?: runCatching {
+                kotlinx.coroutines.runBlocking(Dispatchers.IO) {
+                    folderManager.getSeriesFolderId()?.ifBlank { null }
+                }
+            }.getOrNull()
+    }
+
     // On every successful online sync:
     fun onOnlineCatalogFetched(seriesList: List<TvSeries>) {
         _seriesState.value = seriesList
@@ -637,10 +715,20 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         val safeSeriesTitle = (lastWatched.seriesTitle ?: "").trim()
         val safeSeriesId = (lastWatched.seriesId ?: "").trim()
 
+        val isEpisodeMatched = isEpisode(safeFileId, safeTitle) || isEpisode(safeFileId, safeSeriesTitle)
+        val hasEpisodePattern = safeTitle.contains(Regex("""S\d+E\d+|Season\s*\d+|Episode\s*\d+""", RegexOption.IGNORE_CASE))
+        val isActuallySeries = lastWatched.isSeries || isEpisodeMatched || hasEpisodePattern || safeSeriesId.isNotEmpty() || safeSeriesTitle.isNotEmpty() || lastWatched.seasonNumber > 0 || lastWatched.episodeNumber > 0
+
         // 1. Check if the last watched item is a Series Episode
-        if (lastWatched.isSeries) {
-            val parentSeries = allSeries.firstOrNull { it.id == safeSeriesId }
-                ?: loadCatalogFromDisk(getApplication()).firstOrNull { it.id == safeSeriesId }
+        if (isActuallySeries) {
+            val parentSeries = allSeries.firstOrNull { it.id == safeSeriesId && safeSeriesId.isNotEmpty() }
+                ?: loadCatalogFromDisk(getApplication()).firstOrNull { it.id == safeSeriesId && safeSeriesId.isNotEmpty() }
+                ?: (if (safeSeriesTitle.isNotEmpty()) allSeries.firstOrNull { it.title.equals(safeSeriesTitle, ignoreCase = true) } else null)
+                ?: (if (safeSeriesTitle.isNotEmpty()) loadCatalogFromDisk(getApplication()).firstOrNull { it.title.equals(safeSeriesTitle, ignoreCase = true) } else null)
+                ?: allSeries.firstOrNull { series -> series.seasons.any { s -> s.episodes.any { it.id == safeFileId } } }
+                ?: loadCatalogFromDisk(getApplication()).firstOrNull { series -> series.seasons.any { s -> s.episodes.any { it.id == safeFileId } } }
+                ?: allSeries.firstOrNull()
+                ?: loadCatalogFromDisk(getApplication()).firstOrNull()
 
             var matchedEpisode = parentSeries?.seasons
                 ?.flatMap { it.episodes }
@@ -648,11 +736,17 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
 
             if (matchedEpisode == null) {
                 val diskCatalog = loadCatalogFromDisk(getApplication())
-                val diskShow = diskCatalog.firstOrNull { it.id == safeSeriesId }
+                val diskShow = diskCatalog.firstOrNull { it.id == safeSeriesId && safeSeriesId.isNotEmpty() } ?: diskCatalog.firstOrNull()
                 matchedEpisode = diskShow?.seasons
                     ?.flatMap { it.episodes }
                     ?.firstOrNull { it.id == safeFileId }
             }
+
+            val resolvedSeriesId = parentSeries?.id?.ifBlank { null }
+                ?: safeSeriesId.ifBlank { null }
+                ?: getSeriesIdForEpisode(safeFileId, safeSeriesTitle)?.ifBlank { null }
+                ?: getDefaultSeriesId()?.ifBlank { null }
+                ?: ""
 
             if (matchedEpisode == null && parentSeries != null) {
                 val sNum = lastWatched.seasonNumber.coerceAtLeast(1)
@@ -679,10 +773,11 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             val eNum = matchedEpisode?.episodeNumber ?: lastWatched.episodeNumber.coerceAtLeast(1)
             val sTag = "S" + sNum.toString().padStart(2, '0')
             val eTag = "E" + eNum.toString().padStart(2, '0')
-            val seriesName = parentSeries?.title?.trim()
+            val seriesName = parentSeries?.title?.trim()?.ifBlank { null }
                 ?: safeSeriesTitle.ifBlank { null }
+                ?: (if (safeTitle.contains("The Mentalist", ignoreCase = true)) "The Mentalist" else null)
                 ?: "The Mentalist"
-            val epTitle = matchedEpisode?.displayTitle?.trim()
+            val epTitle = matchedEpisode?.displayTitle?.trim()?.ifBlank { null }
                 ?: safeTitle
             val totalDuration = (matchedEpisode?.durationMs ?: 0L).takeIf { it > 0L }
                 ?: lastWatched.durationMs
@@ -712,7 +807,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
 
             return@combine ContinueWatchingData(
                 mediaId = safeFileId,
-                seriesId = parentSeries?.id ?: safeSeriesId,
+                seriesId = resolvedSeriesId,
                 title = "$seriesName • $sTag:$eTag",
                 subtitle = epTitle,
                 episodeTitle = epTitle,
@@ -734,7 +829,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
 
-        // 2. Check if the last watched item is a Movie (only when isSeries is false)
+        // 2. Check if the last watched item is a Movie (only when isActuallySeries is false)
         val matchedMovie = allMovies.firstOrNull {
             it.id == safeFileId || (safeSeriesId.isNotEmpty() && it.id == safeSeriesId)
         } ?: _moviesState.value.firstOrNull {
@@ -762,7 +857,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                 rawEpisode = null,
                 rawMovie = matchedMovie
             )
-        } else if (!lastWatched.isSeries) {
+        } else if (!isActuallySeries) {
             val totalDuration = lastWatched.durationMs
             val progressPct = (lastWatched.progressFraction * 100).toInt().coerceIn(0, 100)
             return@combine ContinueWatchingData(

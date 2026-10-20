@@ -15,8 +15,8 @@ android {
         applicationId = "com.clotube.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 5
-        versionName = "2.0"
+        versionCode = 6
+        versionName = "2.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -151,6 +151,7 @@ dependencies {
 
     // LibVLC Native Player Engine
     implementation("org.videolan.android:libvlc-all:3.6.0")
+    implementation("androidx.media:media:1.7.0")
 
     // Network & Image Loading
     implementation("com.squareup.okhttp3:okhttp:4.12.0")

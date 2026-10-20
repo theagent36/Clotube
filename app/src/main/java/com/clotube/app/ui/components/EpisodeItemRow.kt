@@ -7,6 +7,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.FileDownload
 import androidx.compose.material.icons.rounded.PlayArrow
@@ -17,12 +18,16 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
+import com.clotube.app.data.DownloadRepository
+import com.clotube.app.data.DownloadStatus
+import com.clotube.app.data.OfflineMediaRecord
 import com.clotube.app.data.PlaybackHistoryManager
 import com.clotube.app.model.Episode
 import com.clotube.app.util.triggerClickHaptic
@@ -38,13 +43,29 @@ fun EpisodeItemRow(
     onEpisodeClick: () -> Unit,
     onStartDownload: () -> Unit,
     onCancelDownload: () -> Unit,
-    isDownloading: Boolean,
-    isDownloaded: Boolean,
+    isDownloading: Boolean = false,
+    isDownloaded: Boolean = false,
+    downloadRecord: OfflineMediaRecord? = null,
     playbackHistoryManager: PlaybackHistoryManager?,
     modifier: Modifier = Modifier
 ) {
     val view = LocalView.current
+    val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
+
+    val downloadRepo = remember(context) { DownloadRepository(context) }
+    val recordState by downloadRepo.getDownloadRecord(episode.id).collectAsState(initial = null)
+    val effectiveRecord = downloadRecord ?: recordState
+
+    val status = effectiveRecord?.status ?: when {
+        isDownloaded -> DownloadStatus.COMPLETED
+        isDownloading -> DownloadStatus.DOWNLOADING
+        else -> DownloadStatus.NOT_DOWNLOADED
+    }
+
+    val isActionCancelOrDelete = status == DownloadStatus.COMPLETED ||
+            status == DownloadStatus.DOWNLOADING ||
+            status == DownloadStatus.QUEUED
 
     // Infinite transition for pulsing "NOW PLAYING" indicator
     val infiniteTransition = rememberInfiniteTransition(label = "now_playing_pulse")
@@ -287,16 +308,43 @@ fun EpisodeItemRow(
                         .background(Color(0xFF181F2C))
                         .clickable {
                             view.triggerClickHaptic()
-                            if (isDownloading) onCancelDownload() else onStartDownload()
+                            if (isActionCancelOrDelete) onCancelDownload() else onStartDownload()
                         },
                     contentAlignment = Alignment.Center
                 ) {
-                    Icon(
-                        imageVector = Icons.Rounded.FileDownload,
-                        contentDescription = "Download",
-                        tint = if (isDownloaded) Color(0xFF00E5FF) else Color(0xFF4C5D75),
-                        modifier = Modifier.size(16.dp)
-                    )
+                    when (status) {
+                        DownloadStatus.COMPLETED -> {
+                            Icon(
+                                imageVector = Icons.Default.CheckCircle,
+                                contentDescription = "Downloaded",
+                                tint = Color(0xFF00E5FF),
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                        DownloadStatus.DOWNLOADING -> {
+                            CircularProgressIndicator(
+                                progress = { effectiveRecord?.progressFraction ?: 0f },
+                                modifier = Modifier.size(18.dp),
+                                color = Color(0xFF00E5FF),
+                                strokeWidth = 2.dp
+                            )
+                        }
+                        DownloadStatus.QUEUED -> {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                color = Color(0xFF8E99A8),
+                                strokeWidth = 2.dp
+                            )
+                        }
+                        else -> {
+                            Icon(
+                                imageVector = Icons.Rounded.FileDownload,
+                                contentDescription = "Download",
+                                tint = Color(0xFF4C5D75),
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -312,8 +360,9 @@ fun EpisodeItemRow(
     onEpisodeClick: () -> Unit,
     onStartDownload: () -> Unit,
     onCancelDownload: () -> Unit,
-    isDownloading: Boolean,
-    isDownloaded: Boolean,
+    isDownloading: Boolean = false,
+    isDownloaded: Boolean = false,
+    downloadRecord: OfflineMediaRecord? = null,
     viewModel: VideoViewModel,
     modifier: Modifier = Modifier
 ) = EpisodeItemRow(
@@ -326,6 +375,7 @@ fun EpisodeItemRow(
     onCancelDownload = onCancelDownload,
     isDownloading = isDownloading,
     isDownloaded = isDownloaded,
+    downloadRecord = downloadRecord,
     playbackHistoryManager = viewModel.playbackHistoryManager,
     modifier = modifier
 )

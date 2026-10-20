@@ -30,12 +30,13 @@ class VlcPlayerManager(
 
     private val libVLC: LibVLC by lazy {
         val options = arrayListOf(
+            "--aout=audiotrack",
+            "--audio-time-stretch",
             "--network-caching=1500",
             "--file-caching=1500",
             "--live-caching=1500",
-            "--clock-jitter=0",
-            "--drop-late-frames",
-            "--skip-frames",
+            "--no-drop-late-frames",
+            "--no-skip-frames",
             "--avcodec-fast",
             "--avcodec-skiploopfilter=4",
             "--no-sub-autodetect-file"
@@ -200,30 +201,9 @@ class VlcPlayerManager(
             Log.d(TAG, "Prepared LibVLC for $fileId in paused state because app is backgrounded")
         }
 
-        // CRITICAL FIX: Ensure seek is preserved and applied during buffering on cold restart
-        if (startPositionMs > 1000L) {
-            pendingStartPositionMs = startPositionMs
-            pendingSeekJob = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
-                val startWait = System.currentTimeMillis()
-                while (pendingStartPositionMs > 1000L && System.currentTimeMillis() - startWait < 15000L) {
-                    kotlinx.coroutines.delay(50L)
-                    val len = mediaPlayer.length
-                    val isPlaying = mediaPlayer.isPlaying
-                    val isSeekable = mediaPlayer.isSeekable
-                    if (len > 0L || (isPlaying && isSeekable)) {
-                        val target = pendingStartPositionMs
-                        pendingStartPositionMs = 0L
-                        val maxSafeBoundaryMs = if (len > 0L) (len - 3000L).coerceAtLeast(0L) else target
-                        val clamped = if (maxSafeBoundaryMs > 0L) target.coerceIn(0L, maxSafeBoundaryMs) else target
-                        mediaPlayer.time = clamped
-                        Log.d(TAG, "Preserved seek applied during buffering: ${clamped}ms")
-                        break
-                    }
-                }
-            }
-        } else {
-            pendingStartPositionMs = 0L
-        }
+        // Native container seek is handled via :start-time=$startSecond in applyClotubeMediaOptions.
+        // Secondary seeking during playback start causes LibVLC buffer flush and pause.
+        pendingStartPositionMs = 0L
     }
 
     fun seekTo(positionMs: Long) {
