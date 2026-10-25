@@ -15,8 +15,8 @@ android {
         applicationId = "com.clotube.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 6
-        versionName = "2.1"
+        versionCode = 8
+        versionName = "2.4"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -24,31 +24,36 @@ android {
         }
 
         ndk {
-            // Target physical ARM hardware (64-bit and 32-bit), eliminating emulator x86/x86_64 bloat
-            abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a"))
+            abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a", "x86_64"))
         }
     }
 
     signingConfigs {
         create("release") {
-            // Checks keystore.properties in root project, gradle.properties, or environment variables
+            enableV1Signing = true
+            enableV2Signing = true
+
+            // Checks keystore.properties, gradle.properties, or environment variables for the developer's original keystore
             val keystorePropsFile = rootProject.file("keystore.properties")
             val keystoreProps = Properties()
             if (keystorePropsFile.exists()) {
                 keystoreProps.load(FileInputStream(keystorePropsFile))
             }
             val storeFilePath = keystoreProps.getProperty("storeFile")
+                ?: project.findProperty("CLOTUBE_KEYSTORE_FILE")?.toString()
                 ?: project.findProperty("CLOTUBE_RELEASE_STORE_FILE")?.toString()
+
             if (!storeFilePath.isNullOrBlank() && file(storeFilePath).exists()) {
                 storeFile = file(storeFilePath)
                 storePassword = keystoreProps.getProperty("storePassword")
+                    ?: project.findProperty("CLOTUBE_KEYSTORE_PASSWORD")?.toString()
                     ?: project.findProperty("CLOTUBE_RELEASE_STORE_PASSWORD")?.toString() ?: ""
                 keyAlias = keystoreProps.getProperty("keyAlias")
+                    ?: project.findProperty("CLOTUBE_KEY_ALIAS")?.toString()
                     ?: project.findProperty("CLOTUBE_RELEASE_KEY_ALIAS")?.toString() ?: ""
                 keyPassword = keystoreProps.getProperty("keyPassword")
+                    ?: project.findProperty("CLOTUBE_KEY_PASSWORD")?.toString()
                     ?: project.findProperty("CLOTUBE_RELEASE_KEY_PASSWORD")?.toString() ?: ""
-                enableV1Signing = true
-                enableV2Signing = true
             }
         }
     }
@@ -59,13 +64,13 @@ android {
             isShrinkResources = true
             isDebuggable = false
             proguardFiles(
-                getDefaultProguardFile("proguard-android.txt"),
+                getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            // If custom release keystore exists, sign with release; otherwise fallback cleanly to debug signing
-            // so Google Drive OAuth SHA-1 continues working seamlessly out-of-the-box.
-            val releaseConfig = signingConfigs.getByName("release")
-            if (releaseConfig.storeFile != null && releaseConfig.storeFile!!.exists()) {
+
+            // Safely bind to release signing if configured; otherwise allow manual Android Studio signing wizard
+            val releaseConfig = signingConfigs.findByName("release")
+            if (releaseConfig != null && releaseConfig.storeFile != null && releaseConfig.storeFile!!.exists()) {
                 signingConfig = releaseConfig
             } else {
                 signingConfig = signingConfigs.getByName("debug")

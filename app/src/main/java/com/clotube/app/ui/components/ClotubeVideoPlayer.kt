@@ -66,6 +66,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import coil.compose.AsyncImage
 import com.clotube.app.auth.TokenRefreshProvider
 import com.clotube.app.media.BluetoothAudioKeepAlive
+import com.clotube.app.media.ClotubeAudioFocusManager
 import com.clotube.app.media.ClotubeMediaSessionManager
 import com.clotube.app.media.NetworkMonitor
 import com.clotube.app.media.applyClotubeMediaOptions
@@ -170,6 +171,22 @@ fun ClotubeVideoPlayer(
         MediaPlayer(libVLCInstance)
     }
 
+    val audioFocusManager = remember(context) {
+        ClotubeAudioFocusManager(
+            context = context,
+            onPausePlayback = {
+                if (mediaPlayer.isPlaying) {
+                    try { mediaPlayer.pause() } catch (_: Exception) {}
+                }
+            },
+            onResumePlayback = {
+                if (isScreenVisible() && !mediaPlayer.isPlaying) {
+                    try { mediaPlayer.play() } catch (_: Exception) {}
+                }
+            }
+        )
+    }
+
     var activeStreamUrl by remember(episode.id) { mutableStateOf("") }
 
     fun loadAndPlayStream(startPositionMs: Long = 0L, forceRefreshToken: Boolean = false) {
@@ -223,6 +240,7 @@ fun ClotubeVideoPlayer(
                     media.release()
 
                     if (isScreenVisible()) {
+                        audioFocusManager.requestAudioFocus()
                         mediaPlayer.play()
                     } else {
                         mediaPlayer.pause()
@@ -239,6 +257,7 @@ fun ClotubeVideoPlayer(
     // MediaTek Hardware Decoder & Crash Prevention (Strict Order: detachViews -> stop -> release)
     DisposableEffect(episode.id) {
         onDispose {
+            audioFocusManager.abandonAudioFocus()
             try {
                 val current = mediaPlayer.time
                 val total = mediaPlayer.length
@@ -340,6 +359,7 @@ fun ClotubeVideoPlayer(
         tokenRefreshProvider = viewModel.tokenRefreshProvider,
         modifier = modifier,
         isInitiallyFullscreen = false,
+        audioFocusManager = audioFocusManager,
         onPreviousEpisode = onPreviousEpisode,
         onNextEpisode = onNextEpisode,
         nextEpisode = nextEpisode,
@@ -379,6 +399,7 @@ fun ClotubeVideoPlayer(
     modifier: Modifier = Modifier,
     isInitiallyFullscreen: Boolean = false,
     isFullscreen: Boolean = isInitiallyFullscreen,
+    audioFocusManager: ClotubeAudioFocusManager? = null,
     onPreviousEpisode: (() -> Unit)? = null,
     onNextEpisode: (() -> Unit)? = null,
     nextEpisode: Episode? = null,
@@ -401,43 +422,6 @@ fun ClotubeVideoPlayer(
     val density = LocalDensity.current
     val coroutineScope = rememberCoroutineScope()
 
-    val audioFocusRequest = remember(audioManager) {
-        val audioAttributes = AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_MEDIA)
-            .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
-            .build()
-
-        AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-            .setAudioAttributes(audioAttributes)
-            .setAcceptsDelayedFocusGain(true)
-            .setOnAudioFocusChangeListener { focusChange ->
-                when (focusChange) {
-                    AudioManager.AUDIOFOCUS_LOSS,
-                    AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
-                        if (mediaPlayer.isPlaying) {
-                            try {
-                                mediaPlayer.pause()
-                            } catch (_: Exception) {}
-                        }
-                    }
-                    else -> Unit
-                }
-            }
-            .build()
-    }
-
-    fun requestPlaybackAudioFocus() {
-        try {
-            audioManager.requestAudioFocus(audioFocusRequest)
-        } catch (_: Exception) {}
-    }
-
-    fun abandonPlaybackAudioFocus() {
-        try {
-            audioManager.abandonAudioFocusRequest(audioFocusRequest)
-        } catch (_: Exception) {}
-    }
-
     val bluetoothAudioKeepAlive = remember {
         BluetoothAudioKeepAlive(coroutineScope)
     }
@@ -446,6 +430,85 @@ fun ClotubeVideoPlayer(
         bluetoothAudioKeepAlive.start()
         onDispose {
             bluetoothAudioKeepAlive.release()
+        }
+    }
+
+    var sessionManagerRef by remember { mutableStateOf<ClotubeMediaSessionManager?>(null) }
+
+    val effectiveAudioFocusManager = audioFocusManager ?: remember(context) {
+        ClotubeAudioFocusManager(
+            context = context,
+            onPausePlayback = {
+                bluetoothAudioKeepAlive.stop()
+                mediaPlayer.let { player ->
+                    if (player.isPlaying) {
+                        try {
+                            player.pause()
+                        } catch (_: Exception) {}
+                        sessionManagerRef?.updatePlaybackState(isPlaying = false, currentPositionMs = player.time)
+                    }
+                }
+            },
+            onResumePlayback = {
+                // Only resume if app is still foregrounded and visible on screen
+                if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+                    mediaPlayer.let { player ->
+                        if (!player.isPlaying) {
+                            bluetoothAudioKeepAlive.start()
+                            try {
+                                player.play()
+                            } catch (_: Exception) {}
+                            sessionManagerRef?.updatePlaybackState(isPlaying = true, currentPositionMs = player.time)
+                        }
+                    }
+                }
+            }
+        )
+    }
+
+    DisposableEffect(effectiveAudioFocusManager, mediaPlayer, bluetoothAudioKeepAlive, lifecycleOwner) {
+        effectiveAudioFocusManager.setPlaybackCallbacks(
+            onPause = {
+                bluetoothAudioKeepAlive.stop()
+                mediaPlayer.let { player ->
+                    if (player.isPlaying) {
+                        try {
+                            player.pause()
+                        } catch (_: Exception) {}
+                        sessionManagerRef?.updatePlaybackState(isPlaying = false, currentPositionMs = player.time)
+                    }
+                }
+            },
+            onResume = {
+                // Only resume if app is still foregrounded and visible on screen
+                if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+                    mediaPlayer.let { player ->
+                        if (!player.isPlaying) {
+                            bluetoothAudioKeepAlive.start()
+                            try {
+                                player.play()
+                            } catch (_: Exception) {}
+                            sessionManagerRef?.updatePlaybackState(isPlaying = true, currentPositionMs = player.time)
+                        }
+                    }
+                }
+            }
+        )
+        onDispose {}
+    }
+
+    fun requestPlaybackAudioFocus(): Boolean {
+        return effectiveAudioFocusManager.requestAudioFocus()
+    }
+
+    fun abandonPlaybackAudioFocus() {
+        effectiveAudioFocusManager.abandonAudioFocus()
+    }
+
+    DisposableEffect(mediaId) {
+        onDispose {
+            effectiveAudioFocusManager.cancelPendingResume()
+            abandonPlaybackAudioFocus()
         }
     }
 
@@ -500,8 +563,12 @@ fun ClotubeVideoPlayer(
     }
 
     DisposableEffect(sessionManager) {
+        sessionManagerRef = sessionManager
         sessionManager.initialize()
         onDispose {
+            if (sessionManagerRef == sessionManager) {
+                sessionManagerRef = null
+            }
             sessionManager.release()
         }
     }
@@ -688,6 +755,7 @@ fun ClotubeVideoPlayer(
                         media.release()
 
                         if (userIntendedToPlay && isScreenVisible()) {
+                            requestPlaybackAudioFocus()
                             mediaPlayer.play()
                         } else {
                             mediaPlayer.pause()
@@ -712,6 +780,7 @@ fun ClotubeVideoPlayer(
                             media.release()
 
                             if (userIntendedToPlay && isScreenVisible()) {
+                                requestPlaybackAudioFocus()
                                 mediaPlayer.play()
                             } else {
                                 mediaPlayer.pause()
@@ -759,6 +828,7 @@ fun ClotubeVideoPlayer(
                     }
                     lastValidPositionMs = mediaPlayer.time.coerceAtLeast(0L)
                     isPlaying = false
+                    bluetoothAudioKeepAlive.stop()
                 }
                 Lifecycle.Event.ON_STOP -> {
                     isAppForegrounded = false
@@ -773,6 +843,7 @@ fun ClotubeVideoPlayer(
                     lastValidPositionMs = mediaPlayer.time.coerceAtLeast(0L)
                     isPlaying = false
                     sessionManager.updatePlaybackState(isPlaying = false, currentPositionMs = mediaPlayer.time)
+                    effectiveAudioFocusManager.cancelPendingResume()
                     abandonPlaybackAudioFocus()
                     bluetoothAudioKeepAlive.stop()
                     if (isViewsAttached) {
@@ -813,6 +884,7 @@ fun ClotubeVideoPlayer(
                     isAppForegrounded = false
                     stallWatchdogJob?.cancel()
                     stallWatchdogJob = null
+                    effectiveAudioFocusManager.cancelPendingResume()
                     abandonPlaybackAudioFocus()
                     bluetoothAudioKeepAlive.release()
                     if (isViewsAttached) {
@@ -834,6 +906,7 @@ fun ClotubeVideoPlayer(
 
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
+            effectiveAudioFocusManager.cancelPendingResume()
             abandonPlaybackAudioFocus()
             bluetoothAudioKeepAlive.release()
             if (isViewsAttached) {
@@ -1280,6 +1353,7 @@ fun ClotubeVideoPlayer(
                 onReloadMedia.invoke(safeTarget)
             } else {
                 mediaPlayer.time = safeTarget
+                requestPlaybackAudioFocus()
                 mediaPlayer.play()
             }
         } else {
@@ -1287,7 +1361,10 @@ fun ClotubeVideoPlayer(
             isSeeking = true
             mediaPlayer.time = targetTimeMs
             currentPositionMs = targetTimeMs
-            if (!mediaPlayer.isPlaying && userIntendedToPlay) mediaPlayer.play()
+            if (!mediaPlayer.isPlaying && userIntendedToPlay) {
+                requestPlaybackAudioFocus()
+                mediaPlayer.play()
+            }
         }
     }
 
@@ -1794,6 +1871,7 @@ fun ClotubeVideoPlayer(
                                             }
                                         } else {
                                             isPlaying = true
+                                            requestPlaybackAudioFocus()
                                             mediaPlayer.play()
                                         }
                                         resetInactivityTimer()

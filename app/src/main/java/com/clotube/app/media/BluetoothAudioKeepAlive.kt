@@ -68,9 +68,9 @@ class BluetoothAudioKeepAlive(
 
             try {
                 track.setVolume(0.0f)
-            } catch (_: Exception) {}
+            } catch (_: Throwable) {}
 
-            if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+            if (track.state == AudioTrack.STATE_INITIALIZED && track.playState != AudioTrack.PLAYSTATE_PLAYING) {
                 track.play()
             }
             audioTrack = track
@@ -79,7 +79,9 @@ class BluetoothAudioKeepAlive(
             feedingJob = coroutineScope.launch(Dispatchers.IO) {
                 while (isActive && isRunning.get()) {
                     val currentTrack = audioTrack ?: break
-                    if (currentTrack.playState == AudioTrack.PLAYSTATE_PLAYING) {
+                    if (currentTrack.state == AudioTrack.STATE_INITIALIZED &&
+                        currentTrack.playState == AudioTrack.PLAYSTATE_PLAYING
+                    ) {
                         val written = try {
                             currentTrack.write(
                                 silenceBuffer,
@@ -87,7 +89,8 @@ class BluetoothAudioKeepAlive(
                                 silenceBuffer.size,
                                 AudioTrack.WRITE_NON_BLOCKING
                             )
-                        } catch (_: Exception) {
+                        } catch (t: Throwable) {
+                            Log.e(TAG, "AudioTrack write exception during telecom/audio handover: ${t.message}")
                             -1
                         }
 
@@ -100,8 +103,8 @@ class BluetoothAudioKeepAlive(
                 }
             }
             Log.d(TAG, "BluetoothAudioKeepAlive started successfully")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to start BluetoothAudioKeepAlive: ${e.message}", e)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Failed to start BluetoothAudioKeepAlive: ${t.message}", t)
             isRunning.set(false)
         }
     }
@@ -112,10 +115,15 @@ class BluetoothAudioKeepAlive(
         feedingJob?.cancel()
         feedingJob = null
         try {
-            audioTrack?.pause()
-            audioTrack?.flush()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error pausing AudioTrack: ${e.message}")
+            val track = audioTrack
+            if (track != null && track.state == AudioTrack.STATE_INITIALIZED) {
+                if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
+                    track.pause()
+                }
+                track.flush()
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "Error pausing AudioTrack: ${t.message}")
         }
     }
 
@@ -125,12 +133,15 @@ class BluetoothAudioKeepAlive(
         feedingJob?.cancel()
         feedingJob = null
         try {
-            audioTrack?.stop()
-        } catch (_: Exception) {}
+            val track = audioTrack
+            if (track != null && track.state == AudioTrack.STATE_INITIALIZED) {
+                track.stop()
+            }
+        } catch (_: Throwable) {}
         try {
             audioTrack?.release()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error releasing AudioTrack: ${e.message}")
+        } catch (t: Throwable) {
+            Log.e(TAG, "Error releasing AudioTrack: ${t.message}")
         }
         audioTrack = null
         Log.d(TAG, "BluetoothAudioKeepAlive released")
