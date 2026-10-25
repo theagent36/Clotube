@@ -57,6 +57,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.zIndex
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -513,6 +514,7 @@ fun ClotubeVideoPlayer(
     }
 
     var userIntendedToPlay by remember(mediaId) { mutableStateOf(true) }
+    var queueDebouncedSeekRef by remember { mutableStateOf<((Long) -> Unit)?>(null) }
 
     val sessionManager = remember(mediaId, onNextEpisode, onPreviousEpisode, mediaPlayer) {
         ClotubeMediaSessionManager(
@@ -549,14 +551,18 @@ fun ClotubeVideoPlayer(
             actionNext = onNextEpisode,
             actionPrevious = onPreviousEpisode,
             actionFastForward = {
-                mediaPlayer.let { player ->
-                    val maxLen = if (player.length > 0) player.length else Long.MAX_VALUE
-                    player.time = (player.time + 10_000L).coerceAtMost(maxLen)
+                queueDebouncedSeekRef?.invoke(10_000L) ?: run {
+                    mediaPlayer.let { player ->
+                        val maxLen = if (player.length > 0) player.length else Long.MAX_VALUE
+                        player.time = (player.time + 10_000L).coerceAtMost(maxLen)
+                    }
                 }
             },
             actionRewind = {
-                mediaPlayer.let { player ->
-                    player.time = (player.time - 10_000L).coerceAtLeast(0L)
+                queueDebouncedSeekRef?.invoke(-10_000L) ?: run {
+                    mediaPlayer.let { player ->
+                        player.time = (player.time - 10_000L).coerceAtLeast(0L)
+                    }
                 }
             }
         )
@@ -590,6 +596,9 @@ fun ClotubeVideoPlayer(
     var isPlaying by remember { mutableStateOf(mediaPlayer.isPlaying) }
     var isBuffering by remember { mutableStateOf(true) }
     var isSeeking by remember { mutableStateOf(false) }
+    var accumulatedSeekTargetMs by remember { mutableLongStateOf(-1L) }
+    var seekDebounceJob by remember { mutableStateOf<Job?>(null) }
+    var seekWatchdogJob by remember { mutableStateOf<Job?>(null) }
     var hasEnded by remember(mediaId) { mutableStateOf(false) }
     var isFirstFrameRendered by remember(mediaId) { mutableStateOf(false) }
     var vlcVideoLayoutRef by remember { mutableStateOf<VLCVideoLayout?>(null) }
@@ -601,6 +610,16 @@ fun ClotubeVideoPlayer(
         val curTime = mediaPlayer.time
         mutableLongStateOf(if (curTime > 0L) curTime else initialPositionMs)
     }
+    var currentPositionMs by remember(mediaId) {
+        val curTime = mediaPlayer.time
+        mutableLongStateOf(if (curTime > 0L) curTime else initialPositionMs)
+    }
+    var durationMs by remember(mediaId) {
+        val len = mediaPlayer.length
+        mutableLongStateOf(if (len > 0L) len else fallbackDurationMs)
+    }
+    var isPlaybackEnded by remember(mediaId) { mutableStateOf(false) }
+    var hasStartedOnce by remember(mediaId) { mutableStateOf(false) }
     var isReconnecting by remember { mutableStateOf(false) }
     var pendingReloadOnReconnect by remember { mutableStateOf(false) }
     var stallWatchdogJob by remember { mutableStateOf<Job?>(null) }
@@ -796,6 +815,12 @@ fun ClotubeVideoPlayer(
         }
     }
 
+    fun softReloadAtPosition(targetMs: Long) {
+        lastValidPositionMs = targetMs.coerceAtLeast(0L)
+        currentPositionMs = targetMs.coerceAtLeast(0L)
+        softReloadStream(forceTokenRefresh = false)
+    }
+
     val networkMonitor = remember {
         NetworkMonitor(
             context = context,
@@ -820,6 +845,10 @@ fun ClotubeVideoPlayer(
                     isAppForegrounded = false
                     stallWatchdogJob?.cancel()
                     stallWatchdogJob = null
+                    seekDebounceJob?.cancel()
+                    seekDebounceJob = null
+                    seekWatchdogJob?.cancel()
+                    seekWatchdogJob = null
                     isBuffering = false
                     if (mediaPlayer.isPlaying) {
                         try {
@@ -834,6 +863,10 @@ fun ClotubeVideoPlayer(
                     isAppForegrounded = false
                     stallWatchdogJob?.cancel()
                     stallWatchdogJob = null
+                    seekDebounceJob?.cancel()
+                    seekDebounceJob = null
+                    seekWatchdogJob?.cancel()
+                    seekWatchdogJob = null
                     isBuffering = false
                     if (mediaPlayer.isPlaying) {
                         try {
@@ -884,6 +917,10 @@ fun ClotubeVideoPlayer(
                     isAppForegrounded = false
                     stallWatchdogJob?.cancel()
                     stallWatchdogJob = null
+                    seekDebounceJob?.cancel()
+                    seekDebounceJob = null
+                    seekWatchdogJob?.cancel()
+                    seekWatchdogJob = null
                     effectiveAudioFocusManager.cancelPendingResume()
                     abandonPlaybackAudioFocus()
                     bluetoothAudioKeepAlive.release()
@@ -909,6 +946,10 @@ fun ClotubeVideoPlayer(
             effectiveAudioFocusManager.cancelPendingResume()
             abandonPlaybackAudioFocus()
             bluetoothAudioKeepAlive.release()
+            seekDebounceJob?.cancel()
+            seekDebounceJob = null
+            seekWatchdogJob?.cancel()
+            seekWatchdogJob = null
             if (isViewsAttached) {
                 try {
                     mediaPlayer.detachViews()
@@ -929,22 +970,15 @@ fun ClotubeVideoPlayer(
         onIsPlayingChanged?.invoke(isPlaying)
     }
 
-    var currentPositionMs by remember(mediaId) {
-        val curTime = mediaPlayer.time
-        mutableLongStateOf(if (curTime > 0L) curTime else initialPositionMs)
-    }
-    var durationMs by remember(mediaId) {
-        val len = mediaPlayer.length
-        mutableLongStateOf(if (len > 0L) len else fallbackDurationMs)
-    }
-
-    var isPlaybackEnded by remember(mediaId) { mutableStateOf(false) }
-    var hasStartedOnce by remember(mediaId) { mutableStateOf(false) }
-
     // Reset loading state whenever mediaId changes
     LaunchedEffect(mediaId) {
         isBuffering = true
         isSeeking = false
+        accumulatedSeekTargetMs = -1L
+        seekDebounceJob?.cancel()
+        seekDebounceJob = null
+        seekWatchdogJob?.cancel()
+        seekWatchdogJob = null
         isPlaybackEnded = false
         hasStartedOnce = false
         isFirstFrameRendered = false
@@ -967,15 +1001,6 @@ fun ClotubeVideoPlayer(
         }
     }
 
-    // Safety fallback to prevent UI lockup if stream stalls
-    LaunchedEffect(isSeeking) {
-        if (isSeeking) {
-            delay(3500L)
-            isSeeking = false
-            isBuffering = false
-        }
-    }
-
     // Measured track width for pixel-perfect thumb and preview alignment
     var trackWidthPx by remember { mutableFloatStateOf(0f) }
 
@@ -983,14 +1008,18 @@ fun ClotubeVideoPlayer(
     var isDragging by remember { mutableStateOf(false) }
     var dragFraction by remember { mutableFloatStateOf(0f) }
 
+    val effectiveCurrentPositionMs = if (accumulatedSeekTargetMs >= 0L) accumulatedSeekTargetMs else currentPositionMs
+
     val actualFraction = if (durationMs > 0L) {
-        (currentPositionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
+        (effectiveCurrentPositionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
     } else 0f
 
     val displayFraction = if (isDragging) dragFraction else actualFraction
     val displayedCurrentTimeMs = if (isDragging) {
         (dragFraction * durationMs).toLong()
-    } else currentPositionMs
+    } else {
+        effectiveCurrentPositionMs
+    }
 
     val isScrubbing = isDragging
     val scrubFraction = dragFraction
@@ -1074,7 +1103,10 @@ fun ClotubeVideoPlayer(
                         stallWatchdogJob?.cancel()
                         stallWatchdogJob = null
                         isBuffering = false
-                        isSeeking = false
+                        if (accumulatedSeekTargetMs < 0L) {
+                            isSeeking = false
+                            seekWatchdogJob?.cancel()
+                        }
                         if (!isScreenVisible()) {
                             try {
                                 mediaPlayer.pause()
@@ -1095,6 +1127,10 @@ fun ClotubeVideoPlayer(
                 MediaPlayer.Event.Playing -> {
                     stallWatchdogJob?.cancel()
                     stallWatchdogJob = null
+                    if (accumulatedSeekTargetMs < 0L) {
+                        isSeeking = false
+                        seekWatchdogJob?.cancel()
+                    }
                     // Safety enforcement: If VLC started playing while backgrounded, pause immediately
                     if (!isScreenVisible()) {
                         try {
@@ -1106,7 +1142,6 @@ fun ClotubeVideoPlayer(
                         requestPlaybackAudioFocus()
                         isPlaying = true
                         isBuffering = false
-                        isSeeking = false
                         isPlaybackEnded = false
                         hasStartedOnce = true
                         if (mediaPlayer.time > 0L) {
@@ -1144,9 +1179,12 @@ fun ClotubeVideoPlayer(
                             restoreTracksIfNeeded(mediaPlayer)
                         }
                     }
-                    // Strictly ignore TimeChanged events while user is dragging the slider to eliminate jitter
-                    if (!isDragging) {
+                    if (isSeeking && (accumulatedSeekTargetMs < 0L)) {
                         isSeeking = false
+                        seekWatchdogJob?.cancel()
+                    }
+                    // Strictly ignore TimeChanged events while user is dragging the slider or accumulating seek to eliminate jitter
+                    if (!isDragging && accumulatedSeekTargetMs < 0L) {
                         isFirstFrameRendered = true
                         currentPositionMs = event.timeChanged.coerceAtLeast(0L)
                     }
@@ -1186,6 +1224,8 @@ fun ClotubeVideoPlayer(
                         isPlaying = false
                         isBuffering = false
                         isSeeking = false
+                        seekWatchdogJob?.cancel()
+                        seekWatchdogJob = null
                         isPlaybackEnded = true
                         sessionManager.updatePlaybackState(isPlaying = false, currentPositionMs = mediaPlayer.time)
                         onPlaybackEnded?.invoke()
@@ -1200,6 +1240,10 @@ fun ClotubeVideoPlayer(
             networkMonitor.unregister()
             stallWatchdogJob?.cancel()
             stallWatchdogJob = null
+            seekDebounceJob?.cancel()
+            seekDebounceJob = null
+            seekWatchdogJob?.cancel()
+            seekWatchdogJob = null
             try {
                 mediaPlayer.setEventListener(null)
                 if (isViewsAttached) {
@@ -1240,9 +1284,9 @@ fun ClotubeVideoPlayer(
     }
 
     // Polling Timeline Loop
-    LaunchedEffect(mediaPlayer, isDragging) {
+    LaunchedEffect(mediaPlayer, isDragging, accumulatedSeekTargetMs) {
         while (true) {
-            if (!isDragging) {
+            if (!isDragging && accumulatedSeekTargetMs < 0L && !isSeeking) {
                 val currentTime = mediaPlayer.time.coerceAtLeast(0L)
                 if (currentTime > 0L) {
                     currentPositionMs = currentTime
@@ -1250,7 +1294,7 @@ fun ClotubeVideoPlayer(
                 }
                 val len = mediaPlayer.length
                 if (len > 0L) durationMs = len
-                if (mediaPlayer.isPlaying && currentTime > 0L && !isSeeking) {
+                if (mediaPlayer.isPlaying && currentTime > 0L) {
                     // Failsafe: if video is actively playing frames, dismiss loading spinner & placeholder immediately
                     isFirstFrameRendered = true
                     isBuffering = false
@@ -1308,7 +1352,74 @@ fun ClotubeVideoPlayer(
     val remainingMs = (durationMs - currentPositionMs).coerceAtLeast(0L)
     val showFloatingNext = false
 
+    // Unified Seek Dispatcher with 350ms Debounce & 4.5s Stall Watchdog
+    fun queueDebouncedSeek(deltaMs: Long) {
+        mediaPlayer.let { player ->
+            val totalDuration = if (player.length > 0L) {
+                player.length
+            } else if (durationMs > 0L) {
+                durationMs
+            } else {
+                fallbackDurationMs
+            }
+            val currentBase = if (accumulatedSeekTargetMs >= 0L) {
+                accumulatedSeekTargetMs
+            } else if (player.time >= 0L) {
+                player.time
+            } else {
+                currentPositionMs
+            }
+            val newTarget = (currentBase + deltaMs).coerceIn(0L, totalDuration.coerceAtLeast(0L))
+
+            accumulatedSeekTargetMs = newTarget
+            currentPositionMs = newTarget
+            lastValidPositionMs = newTarget
+            isSeeking = true
+            isBuffering = true
+
+            // Cancel previous timer; start 350ms window
+            seekDebounceJob?.cancel()
+            seekDebounceJob = coroutineScope.launch {
+                delay(350) // Wait for user to finish rapid tapping
+
+                val finalTarget = accumulatedSeekTargetMs
+                accumulatedSeekTargetMs = -1L
+
+                if (finalTarget >= 0L) {
+                    try {
+                        player.time = finalTarget
+                        currentPositionMs = finalTarget
+                        lastValidPositionMs = finalTarget
+                        if (!player.isPlaying && userIntendedToPlay) {
+                            requestPlaybackAudioFocus()
+                            player.play()
+                        }
+                    } catch (e: Exception) {
+                        Log.e("ClotubePlayer", "Error dispatching seek: ${e.message}")
+                    }
+                }
+
+                // Arm a 4.5s watchdog in case Google Drive socket stalls
+                seekWatchdogJob?.cancel()
+                seekWatchdogJob = coroutineScope.launch {
+                    delay(4500)
+                    if (isSeeking && !player.isPlaying) {
+                        Log.w("ClotubePlayer", "Seek stalled, executing soft-recovery reload at $finalTarget ms")
+                        softReloadAtPosition(finalTarget)
+                    }
+                }
+            }
+        }
+    }
+
+    queueDebouncedSeekRef = ::queueDebouncedSeek
+
     fun seekTo(targetTimeMs: Long) {
+        seekDebounceJob?.cancel()
+        seekDebounceJob = null
+        accumulatedSeekTargetMs = -1L
+        seekWatchdogJob?.cancel()
+        seekWatchdogJob = null
         stallWatchdogJob?.cancel()
         stallWatchdogJob = null
         stallRetryCount = 0
@@ -1609,24 +1720,6 @@ fun ClotubeVideoPlayer(
             )
         }
 
-        // 6. Floating Next Episode Auto-Play Card
-        if (nextEpisode != null) {
-            NextEpisodeCountdownCard(
-                currentPositionMs = if (isScrubbing) displayPositionMs else currentPositionMs,
-                durationMs = durationMs,
-                isPlaying = isPlaying,
-                nextEpisode = nextEpisode,
-                onPlayNext = { ep ->
-                    onPlayNextEpisode?.invoke(ep) ?: onNextEpisode?.invoke()
-                },
-                modifier = Modifier
-                    .align(Alignment.BottomEnd)
-                    .then(if (currentFullscreen) Modifier.navigationBarsPadding() else Modifier)
-                    .padding(end = 16.dp, bottom = if (currentFullscreen) 80.dp else 16.dp),
-                isScrubbing = isScrubbing
-            )
-        }
-
         // 7. HUD Controls Tap Revealer when hidden
         if (!areControlsVisible) {
             Box(
@@ -1815,8 +1908,7 @@ fun ClotubeVideoPlayer(
                     IconButton(
                         onClick = {
                             resetInactivityTimer()
-                            val newTime = (mediaPlayer.time - 10000L).coerceAtLeast(0L)
-                            seekTo(newTime)
+                            queueDebouncedSeek(-10_000L)
                         },
                         modifier = Modifier.size(44.dp)
                     ) {
@@ -1892,9 +1984,7 @@ fun ClotubeVideoPlayer(
                     IconButton(
                         onClick = {
                             resetInactivityTimer()
-                            val totalDuration = if (durationMs > 0) durationMs else mediaPlayer.length
-                            val newTime = (mediaPlayer.time + 10000L).coerceAtMost(totalDuration)
-                            seekTo(newTime)
+                            queueDebouncedSeek(10_000L)
                         },
                         modifier = Modifier.size(44.dp)
                     ) {
@@ -2123,6 +2213,25 @@ fun ClotubeVideoPlayer(
                     }
                 }
             }
+        }
+
+        // 6. Floating Next Episode Auto-Play Card (Absolute Highest Z-Index)
+        if (nextEpisode != null) {
+            NextEpisodeCountdownCard(
+                currentPositionMs = if (isScrubbing) displayPositionMs else currentPositionMs,
+                durationMs = durationMs,
+                isPlaying = isPlaying,
+                nextEpisode = nextEpisode,
+                onPlayNext = { ep ->
+                    onPlayNextEpisode?.invoke(ep) ?: onNextEpisode?.invoke()
+                },
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .zIndex(100f)
+                    .then(if (currentFullscreen) Modifier.navigationBarsPadding() else Modifier)
+                    .padding(end = 16.dp, bottom = if (currentFullscreen) 80.dp else 16.dp),
+                isScrubbing = isScrubbing
+            )
         }
     }
 

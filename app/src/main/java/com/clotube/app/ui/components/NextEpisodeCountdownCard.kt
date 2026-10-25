@@ -10,6 +10,7 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -20,6 +21,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.wrapContentWidth
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
@@ -30,11 +32,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -52,10 +52,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import com.clotube.app.model.Episode
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
+
+private const val COUNTDOWN_TOTAL_MS = 10_000L
 
 @Composable
 fun NextEpisodeCountdownCard(
@@ -70,102 +71,48 @@ fun NextEpisodeCountdownCard(
     if (nextEpisode == null || durationMs <= 0L) return
 
     val remainingMs = (durationMs - currentPositionMs).coerceAtLeast(0L)
-    val coroutineScope = rememberCoroutineScope()
+    val shouldTriggerWindow = remainingMs in 1L..30_000L && !isScrubbing
 
     var isDismissed by remember(nextEpisode.id) { mutableStateOf(false) }
-    var countdownRemainingSeconds by remember(nextEpisode.id) { mutableIntStateOf(30) }
-    var countdownRemainingMs by remember(nextEpisode.id) { mutableLongStateOf(30_000L) }
+    var countdownRemainingMs by remember(nextEpisode.id) { mutableLongStateOf(COUNTDOWN_TOTAL_MS) }
     var isCountdownActive by remember(nextEpisode.id) { mutableStateOf(false) }
-    var isPromptVisible by remember(nextEpisode.id) { mutableStateOf(false) }
-    var countdownJob by remember(nextEpisode.id) { mutableStateOf<Job?>(null) }
 
-    fun cancelCountdownAndReset(fullReset: Boolean = false) {
-        countdownJob?.cancel()
-        countdownJob = null
-        isCountdownActive = false
-        isPromptVisible = false
-        countdownRemainingSeconds = 30
-        countdownRemainingMs = 30_000L
-        if (fullReset) {
-            isDismissed = false
-        }
-    }
-
-    // Cancel countdown and dismiss prompt on backward seek or scrubbing
-    LaunchedEffect(currentPositionMs, durationMs, isScrubbing) {
-        if (durationMs > 0L) {
-            val remaining = (durationMs - currentPositionMs).coerceAtLeast(0L)
-            if (isScrubbing || remaining > 30_000L) {
-                // If user is scrubbing or remaining duration > 30s:
-                // Immediately cancel active countdown Job, hide prompt, reset timer to 30
-                cancelCountdownAndReset(fullReset = remaining > 30_000L)
-            } else if (remaining in 1L..30_000L && !isDismissed && !isScrubbing && isPlaying) {
-                if (!isCountdownActive && countdownJob == null) {
-                    isCountdownActive = true
-                    isPromptVisible = true
-                    val currentSec = ((remaining + 999L) / 1000L).toInt().coerceIn(1, 30)
-                    countdownRemainingSeconds = currentSec
-                    countdownRemainingMs = remaining.coerceAtMost(30_000L)
-                    countdownJob = coroutineScope.launch {
-                        while (countdownRemainingMs > 0L) {
-                            delay(100L)
-                            countdownRemainingMs = (countdownRemainingMs - 100L).coerceAtLeast(0L)
-                            countdownRemainingSeconds = ((countdownRemainingMs + 999L) / 1000L).toInt().coerceIn(1, 30)
-                        }
-                        if (countdownRemainingMs <= 0L && !isScrubbing && !isDismissed) {
-                            isCountdownActive = false
-                            isPromptVisible = false
-                            onPlayNext(nextEpisode)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Handle pause / play toggle
-    LaunchedEffect(isPlaying) {
-        if (!isPlaying) {
-            countdownJob?.cancel()
-            countdownJob = null
+    LaunchedEffect(shouldTriggerWindow, isDismissed) {
+        if (shouldTriggerWindow && !isDismissed) {
+            isCountdownActive = true
+        } else if (!shouldTriggerWindow) {
+            countdownRemainingMs = COUNTDOWN_TOTAL_MS
             isCountdownActive = false
-        } else if (isPlaying && !isScrubbing && !isDismissed && remainingMs in 1L..30_000L) {
-            if (!isCountdownActive && countdownJob == null) {
-                isCountdownActive = true
-                isPromptVisible = true
-                val currentSec = ((remainingMs + 999L) / 1000L).toInt().coerceIn(1, 30)
-                countdownRemainingSeconds = currentSec
-                countdownRemainingMs = remainingMs.coerceAtMost(30_000L)
-                countdownJob = coroutineScope.launch {
-                    while (countdownRemainingMs > 0L) {
-                        delay(100L)
-                        countdownRemainingMs = (countdownRemainingMs - 100L).coerceAtLeast(0L)
-                        countdownRemainingSeconds = ((countdownRemainingMs + 999L) / 1000L).toInt().coerceIn(1, 30)
-                    }
-                    if (countdownRemainingMs <= 0L && !isScrubbing && !isDismissed) {
-                        isCountdownActive = false
-                        isPromptVisible = false
-                        onPlayNext(nextEpisode)
-                    }
-                }
+        }
+    }
+
+    LaunchedEffect(isCountdownActive, isPlaying, isDismissed) {
+        if (isCountdownActive && isPlaying && !isDismissed) {
+            while (countdownRemainingMs > 0L && isPlaying && !isDismissed) {
+                delay(100L)
+                countdownRemainingMs = (countdownRemainingMs - 100L).coerceAtLeast(0L)
+            }
+            if (countdownRemainingMs <= 0L && !isDismissed) {
+                isCountdownActive = false
+                onPlayNext(nextEpisode)
             }
         }
     }
 
-    val progressFraction = (countdownRemainingMs.toFloat() / 30_000f).coerceIn(0f, 1f)
+    val progressFraction = (countdownRemainingMs.toFloat() / COUNTDOWN_TOTAL_MS.toFloat()).coerceIn(0f, 1f)
     val animatedProgress by animateFloatAsState(
         targetValue = progressFraction,
         animationSpec = tween(durationMillis = 100, easing = LinearEasing),
         label = "countdownBorderProgress"
     )
 
-    val isVisible = isPromptVisible && !isScrubbing && !isDismissed && isCountdownActive && (remainingMs in 1L..30_000L)
+    val isVisible = shouldTriggerWindow && !isDismissed
 
     AnimatedVisibility(
         visible = isVisible,
         enter = fadeIn() + slideInVertically { it / 2 },
         exit = fadeOut() + slideOutVertically { it / 2 },
-        modifier = modifier
+        modifier = modifier.zIndex(100f)
     ) {
         val cornerRadius = 16.dp
         val strokeWidth = 1.8.dp
@@ -175,7 +122,7 @@ fun NextEpisodeCountdownCard(
         Box(
             modifier = Modifier
                 .wrapContentWidth()
-                .widthIn(max = 235.dp)
+                .widthIn(max = 260.dp)
                 .clip(RoundedCornerShape(cornerRadius))
                 .background(Color(0xFF0C1019).copy(alpha = 0.95f))
                 .drawWithCache {
@@ -199,14 +146,12 @@ fun NextEpisodeCountdownCard(
                     onDrawWithContent {
                         drawContent()
 
-                        // 1. Inactive dark border outline
                         drawPath(
                             path = roundedRectPath,
                             color = inactiveBorder,
                             style = Stroke(width = strokeWidthPx)
                         )
 
-                        // 2. Active cyan draining border countdown
                         if (animatedProgress > 0f) {
                             segmentPath.reset()
                             pathMeasure.getSegment(
@@ -223,37 +168,43 @@ fun NextEpisodeCountdownCard(
                         }
                     }
                 }
-                .clickable {
-                    onPlayNext(nextEpisode)
-                }
-                .padding(start = 10.dp, end = 6.dp, top = 6.dp, bottom = 6.dp)
+                .padding(start = 10.dp, end = 4.dp, top = 4.dp, bottom = 4.dp)
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // MINIMAL PLAY ICON (NO BULKY CIRCLE)
-                Icon(
-                    imageVector = Icons.Rounded.PlayArrow,
-                    contentDescription = "Play Next",
-                    tint = activeCyan,
-                    modifier = Modifier.size(20.dp)
-                )
-
-                Spacer(Modifier.width(8.dp))
-
-                // EPISODE DETAILS
-                Column(
-                    modifier = Modifier.weight(1f, fill = false)
+                // Main Clickable Area (Triggers Immediate Play Next)
+                Row(
+                    modifier = Modifier
+                        .weight(1f, fill = false)
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null
+                        ) {
+                            isCountdownActive = false
+                            onPlayNext(nextEpisode)
+                        }
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            text = "Next Episode",
-                            color = Color.White,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                        val secondsLeft = ((countdownRemainingMs + 999L) / 1000L).coerceIn(1L, 30L)
-                        if (secondsLeft in 1..30) {
+                    Icon(
+                        imageVector = Icons.Rounded.PlayArrow,
+                        contentDescription = "Play Next",
+                        tint = activeCyan,
+                        modifier = Modifier.size(20.dp)
+                    )
+
+                    Spacer(Modifier.width(8.dp))
+
+                    Column {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = "Next Episode",
+                                color = Color.White,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            val secondsLeft = ((countdownRemainingMs + 999L) / 1000L).coerceIn(1L, 10L)
                             Text(
                                 text = " • in ${secondsLeft}s",
                                 color = activeCyan,
@@ -261,36 +212,38 @@ fun NextEpisodeCountdownCard(
                                 fontWeight = FontWeight.SemiBold
                             )
                         }
+
+                        Spacer(Modifier.height(1.dp))
+
+                        val seasonFormatted = String.format(java.util.Locale.US, "%02d", nextEpisode.seasonNumber)
+                        val episodeFormatted = String.format(java.util.Locale.US, "%02d", nextEpisode.episodeNumber)
+                        Text(
+                            text = "S$seasonFormatted:E$episodeFormatted • ${nextEpisode.displayTitle}",
+                            color = Color(0xFF7E8D9F),
+                            fontSize = 10.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
                     }
-
-                    Spacer(Modifier.height(1.dp))
-
-                    val seasonFormatted = String.format(java.util.Locale.US, "%02d", nextEpisode.seasonNumber)
-                    val episodeFormatted = String.format(java.util.Locale.US, "%02d", nextEpisode.episodeNumber)
-                    Text(
-                        text = "S$seasonFormatted:E$episodeFormatted • ${nextEpisode.displayTitle}",
-                        color = Color(0xFF7E8D9F),
-                        fontSize = 10.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
                 }
 
-                Spacer(Modifier.width(4.dp))
+                Spacer(Modifier.width(6.dp))
 
-                // COMPACT DISMISS BUTTON
+                // Independent Dismiss Button with Generous Hit-Target
                 IconButton(
                     onClick = {
                         isDismissed = true
-                        cancelCountdownAndReset(fullReset = false)
+                        isCountdownActive = false
                     },
-                    modifier = Modifier.size(24.dp)
+                    modifier = Modifier
+                        .size(36.dp)
+                        .clip(CircleShape)
                 ) {
                     Icon(
                         imageVector = Icons.Default.Close,
                         contentDescription = "Dismiss",
-                        tint = Color(0xFF5A687D),
-                        modifier = Modifier.size(15.dp)
+                        tint = Color(0xFF7E8D9F),
+                        modifier = Modifier.size(16.dp)
                     )
                 }
             }
