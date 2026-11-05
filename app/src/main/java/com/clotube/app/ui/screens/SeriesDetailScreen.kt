@@ -31,6 +31,13 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material3.*
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.material3.pulltorefresh.PullToRefreshDefaults
+import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -49,10 +56,11 @@ import com.clotube.app.data.DownloadStatus
 import com.clotube.app.ui.components.ClotubeVideoPlayer
 import com.clotube.app.ui.components.EpisodeItemRow
 import com.clotube.app.ui.components.SeasonTabChip
+import com.clotube.app.ui.components.shimmerEffect
 import com.clotube.app.viewmodel.VideoViewModel
 import kotlinx.coroutines.launch
 
-@OptIn(ExperimentalFoundationApi::class)
+@OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
 @Composable
 fun SeriesDetailScreen(
     series: Series,
@@ -141,13 +149,10 @@ fun SeriesDetailScreen(
     }
 
     val upNextEpisode = remember(activeSeason, lastWatchedEpisode, series.seasons, cachedUpNextEpisode) {
-        val candidate = (if (lastWatchedEpisode != null && lastWatchedEpisode?.seasonNumber == activeSeason?.seasonNumber) {
-            lastWatchedEpisode
-        } else {
-            activeSeason?.episodes?.firstOrNull()
-        }) ?: lastWatchedEpisode
-           ?: initialFallbackEpisode
-           ?: cachedUpNextEpisode
+        val candidate = lastWatchedEpisode
+            ?: activeSeason?.episodes?.firstOrNull()
+            ?: initialFallbackEpisode
+            ?: cachedUpNextEpisode
 
         if (candidate != null && candidate != cachedUpNextEpisode) {
             cachedUpNextEpisode = candidate
@@ -240,7 +245,7 @@ fun SeriesDetailScreen(
 
                     IconButton(
                         onClick = {
-                            val targetEpisode = activeSeason?.episodes?.firstOrNull()
+                            val targetEpisode = upNextEpisode ?: lastWatchedEpisode ?: activeSeason?.episodes?.firstOrNull()
                             if (targetEpisode != null) {
                                 onEpisodeSelected(targetEpisode)
                             }
@@ -309,13 +314,56 @@ fun SeriesDetailScreen(
         // 2. SCROLLABLE CONTENT WITH PINNED SEASON HEADER
         // ========================================================
         if (!isLandscape || activePlayingEpisode == null) {
-            LazyColumn(
-                state = listState,
+            var isSeriesRefreshing by remember { mutableStateOf(false) }
+            val seriesPullRefreshState = rememberPullToRefreshState()
+            val seriesHaptic = LocalHapticFeedback.current
+
+            // Dual-stage haptics: trigger on threshold snap + confirmation on pull release
+            LaunchedEffect(seriesPullRefreshState) {
+                var hasTriggeredThreshold = false
+                snapshotFlow { seriesPullRefreshState.distanceFraction }
+                    .map { it >= 1.0f }
+                    .distinctUntilChanged()
+                    .collect { isPastThreshold ->
+                        if (isPastThreshold && !hasTriggeredThreshold) {
+                            seriesHaptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            hasTriggeredThreshold = true
+                        } else if (!isPastThreshold) {
+                            hasTriggeredThreshold = false
+                        }
+                    }
+            }
+
+            PullToRefreshBox(
+                isRefreshing = isSeriesRefreshing,
+                state = seriesPullRefreshState,
+                onRefresh = {
+                    seriesHaptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                    coroutineScope.launch {
+                        isSeriesRefreshing = true
+                        viewModel.refreshAppFreshBoot()
+                        viewModel.refreshSingleSeries(series.id, series.title)
+                        isSeriesRefreshing = false
+                    }
+                },
+                indicator = {
+                    PullToRefreshDefaults.Indicator(
+                        state = seriesPullRefreshState,
+                        isRefreshing = isSeriesRefreshing,
+                        color = Color(0xFF00E5FF), // Clotube Cyan Accent
+                        containerColor = Color(0xFF161B26), // Dark Acrylic Bubble
+                        modifier = Modifier.align(Alignment.TopCenter)
+                    )
+                },
                 modifier = Modifier
                     .fillMaxWidth()
-                    .weight(1f),
-                contentPadding = PaddingValues(bottom = 96.dp)
+                    .weight(1f)
             ) {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(bottom = 96.dp)
+                ) {
 
             // ITEM 0: Series Title & Genre Header
             item(key = "series_title_header") {
@@ -539,6 +587,15 @@ fun SeriesDetailScreen(
             } else {
                 items(activeSeason.episodes, key = { episode -> "${currentSeasonNumber}_${episode.id}" }) { episode ->
                     val downloadRecord by viewModel.downloadRepository.getDownloadRecord(episode.id).collectAsState(initial = null)
+                    val userEmail = viewModel.uiState.collectAsState().value.userEmail.orEmpty()
+                    val isWatchedLocal = remember(userEmail, episode.id) {
+                        if (userEmail.isNotBlank()) {
+                            com.clotube.app.data.AndroidWatchHistoryManager.isEpisodeWatched(context, userEmail, episode.id)
+                        } else false
+                    }
+                    val isWatchedFlow by viewModel.playbackHistoryManager.isEpisodeWatched(episode.id).collectAsState(initial = false)
+                    val isWatched = isWatchedLocal || isWatchedFlow
+
                     EpisodeItemRow(
                         episode = episode,
                         seriesId = series.id,
@@ -560,17 +617,26 @@ fun SeriesDetailScreen(
                                 viewModel.downloadRepository.cancelDownload(episode.id)
                             }
                         },
+                        onToggleWatched = {
+                            if (isWatched) {
+                                viewModel.markEpisodeUnwatched(series, episode)
+                            } else {
+                                viewModel.markEpisodeWatched(series, episode)
+                            }
+                        },
                         downloadRecord = downloadRecord,
                         isDownloading = downloadRecord?.status == DownloadStatus.DOWNLOADING || downloadRecord?.status == DownloadStatus.QUEUED,
                         isDownloaded = downloadRecord?.status == DownloadStatus.COMPLETED,
-                        viewModel = viewModel,
+                        isWatched = isWatched,
+                        playbackHistoryManager = viewModel.playbackHistoryManager,
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
                     )
                 }
             }
-        }
+            }
         }
     }
+}
 }
 
 /**
@@ -736,8 +802,9 @@ fun SeriesDetailScreen(
             series = targetSeries,
             viewModel = viewModel,
             activePlayingEpisode = activePlayingEpisode,
-            initialPositionMs = if (initialEpisodeId == null || activePlayingEpisode?.id == initialEpisodeId) initialPositionMs else 0L,
+            initialPositionMs = if (initialEpisodeId != null && activePlayingEpisode?.id == initialEpisodeId) initialPositionMs else 0L,
             onEpisodeSelected = { ep ->
+                viewModel.selectEpisode(ep)
                 activePlayingEpisode = ep
                 onRegisterActivePlayer?.invoke(viewModel.mediaPlayer)
             },

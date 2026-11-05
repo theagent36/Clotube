@@ -71,6 +71,14 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.material3.pulltorefresh.PullToRefreshDefaults
+import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -128,6 +136,7 @@ import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.ui.graphics.vector.ImageVector
 import com.clotube.app.viewmodel.ContinueWatchingData
+import com.clotube.app.viewmodel.ContinueWatchingDisplayData
 import com.clotube.app.model.Episode
 import com.clotube.app.model.Movie
 import com.clotube.app.model.Series
@@ -220,6 +229,8 @@ fun HomeScreen(
     onNavigateToSettings: () -> Unit = { viewModel.selectTab(NavigationTab.SETTINGS) }
 ) {
     val uiState by viewModel.uiState.collectAsState()
+    val resolvedCwItem by viewModel.resolvedContinueWatching.collectAsState()
+    val continueWatchingDisplayData by viewModel.continueWatchingDisplayState.collectAsState()
     val continueWatchingData by viewModel.continueWatchingState.collectAsState()
     val continueWatchingItem by viewModel.continueWatchingItem.collectAsState()
     val lastWatchedDirect by viewModel.playbackHistoryManager.getLastWatchedMedia().collectAsState(initial = null)
@@ -508,7 +519,43 @@ fun HomeScreen(
                     }
                 )
 
-                Box(
+                val isRefreshing by viewModel.isRefreshing.collectAsState()
+                val pullRefreshState = rememberPullToRefreshState()
+                val haptic = LocalHapticFeedback.current
+
+                // STABLE HAPTIC THRESHOLD SNAP: Fires when the user pulls past the activation point
+                LaunchedEffect(pullRefreshState) {
+                    var hasTriggeredThreshold = false
+                    snapshotFlow { pullRefreshState.distanceFraction }
+                        .map { it >= 1.0f }
+                        .distinctUntilChanged()
+                        .collect { isPastThreshold ->
+                            if (isPastThreshold && !hasTriggeredThreshold) {
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                hasTriggeredThreshold = true
+                            } else if (!isPastThreshold) {
+                                hasTriggeredThreshold = false
+                            }
+                        }
+                }
+
+                PullToRefreshBox(
+                    isRefreshing = isRefreshing,
+                    state = pullRefreshState,
+                    onRefresh = {
+                        // Release confirmation pulse
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        viewModel.refreshAppFreshBoot()
+                    },
+                    indicator = {
+                        PullToRefreshDefaults.Indicator(
+                            state = pullRefreshState,
+                            isRefreshing = isRefreshing,
+                            color = Color(0xFF00E5FF), // Clotube Cyan Accent
+                            containerColor = Color(0xFF161B26), // Dark Acrylic Bubble
+                            modifier = Modifier.align(Alignment.TopCenter)
+                        )
+                    },
                     modifier = Modifier
                         .fillMaxWidth()
                         .weight(1f)
@@ -631,159 +678,43 @@ fun HomeScreen(
                                     val heroSeries = uiState.heroSeries
                                     val lastWatched = lastWatchedDirect ?: uiState.lastWatchedMedia
 
-                                    val activeContinueWatching = continueWatchingData
-                                        ?: remember(continueWatchingItem, lastWatched) {
-                                            continueWatchingItem?.let { item ->
-                                                val safeMediaId = (item.mediaId ?: "").trim()
-                                                if (safeMediaId.isEmpty()) null
-                                                else {
-                                                    val safeTitle = (item.title ?: "").trim().ifBlank { "Untitled Video" }
-                                                    val safeSubtitle = (item.subtitle ?: "").trim()
-                                                    val safeThumb = (item.backdropUrl ?: item.thumbnailUrl ?: "").trim()
-                                                    val isSeriesItem = item.isSeries ||
-                                                        viewModel.isEpisode(safeMediaId, safeTitle) ||
-                                                        safeSubtitle.contains(Regex("""S\d+E\d+|Season\s*\d+|Episode\s*\d+""", RegexOption.IGNORE_CASE)) ||
-                                                        safeTitle.contains(Regex("""S\d+E\d+|Season\s*\d+|Episode\s*\d+""", RegexOption.IGNORE_CASE)) ||
-                                                        (item.seriesId ?: "").isNotBlank()
-                                                    val resolvedSeriesId = if (!item.seriesId.isNullOrBlank()) {
-                                                        item.seriesId?.trim().orEmpty()
-                                                    } else if (isSeriesItem) {
-                                                        viewModel.getSeriesIdForEpisode(safeMediaId, null) ?: viewModel.getDefaultSeriesId() ?: ""
-                                                    } else ""
-                                                    ContinueWatchingData(
-                                                        mediaId = safeMediaId,
-                                                        seriesId = resolvedSeriesId,
-                                                        title = safeTitle,
-                                                        subtitle = safeSubtitle,
-                                                        episodeTitle = safeSubtitle,
-                                                        thumbnailUrl = safeThumb,
-                                                        isMovie = !isSeriesItem,
-                                                        progressPercentage = (item.progressFraction * 100).toInt().coerceIn(0, 100),
-                                                        currentPositionMs = item.positionMs,
-                                                        durationMs = item.durationMs,
-                                                        rawEpisode = null,
-                                                        rawMovie = null
-                                                    )
-                                                }
-                                            } ?: lastWatched?.takeIf { it.positionMs >= 1000L || it.progressFraction > 0f }?.let { wp ->
-                                                val safeFileId = (wp.fileId ?: "").trim()
-                                                if (safeFileId.isEmpty()) null
-                                                else {
-                                                    val watchedPercent = (wp.progressFraction * 100).toInt().coerceIn(0, 100)
-                                                    val safeTitle = (wp.title ?: "").trim()
-                                                    val isSeriesWp = wp.isSeries ||
-                                                        viewModel.isEpisode(safeFileId, safeTitle) ||
-                                                        wp.seasonNumber > 0 ||
-                                                        wp.episodeNumber > 0 ||
-                                                        (wp.seriesId ?: "").isNotBlank() ||
-                                                        safeTitle.contains(Regex("""S\d+E\d+|Season\s*\d+|Episode\s*\d+""", RegexOption.IGNORE_CASE))
-                                                    val resolvedSeriesId = if (!wp.seriesId.isNullOrBlank()) {
-                                                        wp.seriesId?.trim().orEmpty()
-                                                    } else if (isSeriesWp) {
-                                                        viewModel.getSeriesIdForEpisode(safeFileId, wp.seriesTitle) ?: viewModel.getDefaultSeriesId() ?: ""
-                                                    } else ""
-                                                    val subtitle = if (isSeriesWp) {
-                                                        safeTitle.ifBlank {
-                                                            val sNum = wp.seasonNumber.coerceAtLeast(1)
-                                                            val eNum = wp.episodeNumber.coerceAtLeast(1)
-                                                            "S${String.format(java.util.Locale.US, "%02d", sNum)}:E${String.format(java.util.Locale.US, "%02d", eNum)}"
-                                                        }
-                                                    } else {
-                                                        "Movie"
-                                                    }
-                                                    val safeThumb = (wp.backdropUrl ?: wp.thumbnailUrl ?: "").trim()
-                                                    ContinueWatchingData(
-                                                        mediaId = safeFileId,
-                                                        seriesId = resolvedSeriesId,
-                                                        title = wp.formattedDisplayTitle,
-                                                        subtitle = subtitle,
-                                                        episodeTitle = safeTitle,
-                                                        thumbnailUrl = safeThumb,
-                                                        isMovie = !isSeriesWp,
-                                                        progressPercentage = watchedPercent,
-                                                        currentPositionMs = wp.positionMs,
-                                                        durationMs = wp.durationMs,
-                                                        rawEpisode = null,
-                                                        rawMovie = null
-                                                    )
-                                                }
-                                            }
-                                        }
 
-                                    if (activeContinueWatching != null) {
-                                        val cw = activeContinueWatching
+
+                                    val cwItem = resolvedCwItem ?: continueWatchingItem ?: continueWatchingItem
+                                    if (cwItem != null) {
                                         ContinueWatchingCard(
-                                            data = cw,
+                                            item = cwItem,
                                             onResumeClick = {
-                                                val safeMediaId = (cw.mediaId ?: "").trim()
-                                                if (safeMediaId.isNotEmpty()) {
-                                                    val safeTitle = (cw.title ?: "").trim().ifBlank { "Video" }
-                                                    val pos = cw.currentPositionMs
-                                                    val isEpisode = !cw.isMovie ||
-                                                        viewModel.isEpisode(safeMediaId, safeTitle) ||
-                                                        (cw.seriesId ?: "").isNotBlank() ||
-                                                        safeTitle.contains(Regex("""S\d+E\d+|Season\s*\d+|Episode\s*\d+""", RegexOption.IGNORE_CASE))
-
-                                                    if (!isEpisode) {
-                                                        if (onResumePlayback != null) {
-                                                            onResumePlayback(safeMediaId, safeTitle, null, pos)
-                                                        } else {
-                                                            val movie = viewModel.getMovieById(safeMediaId) ?: cw.rawMovie?.toVideoItem()
-                                                            if (movie != null) {
-                                                                onVideoSelected(movie)
-                                                            }
-                                                        }
+                                                if (cwItem.isSeries && !cwItem.seriesId.isNullOrBlank()) {
+                                                    if (onResumePlayback != null) {
+                                                        onResumePlayback(cwItem.mediaId, cwItem.episodeTitle, cwItem.seriesId, cwItem.currentPositionMs)
                                                     } else {
-                                                        val sId = if (!cw.seriesId.isNullOrBlank()) {
-                                                            cw.seriesId.trim()
-                                                        } else {
-                                                            viewModel.getSeriesIdForEpisode(safeMediaId, cw.seriesTitle)
-                                                                ?: viewModel.getDefaultSeriesId()
-                                                                ?: uiState.tvSeriesList.find { s ->
-                                                                    s.seasons.any { season -> season.episodes.any { ep -> ep.id == safeMediaId } }
-                                                                }?.id?.trim() ?: ""
+                                                        val matchedSeries = uiState.tvSeriesList.find { it.id == cwItem.seriesId }
+                                                        if (matchedSeries != null) {
+                                                            onSeriesSelected(matchedSeries)
                                                         }
-                                                        val epTitle = (cw.episodeTitle ?: "").trim().ifBlank { safeTitle }
-                                                        if (onResumePlayback != null) {
-                                                            onResumePlayback(safeMediaId, epTitle, sId.ifBlank { null }, pos)
-                                                        } else {
-                                                            val matchedSeries = uiState.tvSeriesList.find { it.id == sId }
-                                                            if (matchedSeries != null) {
-                                                                onSeriesSelected(matchedSeries)
-                                                            }
+                                                    }
+                                                } else {
+                                                    if (onResumePlayback != null) {
+                                                        onResumePlayback(cwItem.mediaId, cwItem.episodeTitle, null, cwItem.currentPositionMs)
+                                                    } else {
+                                                        val movie = viewModel.getMovieById(cwItem.mediaId)
+                                                        if (movie != null) {
+                                                            onVideoSelected(movie)
                                                         }
                                                     }
                                                 }
                                             },
                                             onDetailsClick = {
-                                                val safeMediaId = (cw.mediaId ?: "").trim()
-                                                val safeTitle = (cw.title ?: "").trim().ifBlank { "Video" }
-                                                val isEpisode = !cw.isMovie ||
-                                                    viewModel.isEpisode(safeMediaId, safeTitle) ||
-                                                    (cw.seriesId ?: "").isNotBlank() ||
-                                                    safeTitle.contains(Regex("""S\d+E\d+|Season\s*\d+|Episode\s*\d+""", RegexOption.IGNORE_CASE))
-
-                                                if (isEpisode) {
-                                                    val sId = if (!cw.seriesId.isNullOrBlank()) {
-                                                        cw.seriesId.trim()
-                                                    } else {
-                                                        viewModel.getSeriesIdForEpisode(safeMediaId, cw.seriesTitle)
-                                                            ?: viewModel.getDefaultSeriesId()
-                                                            ?: uiState.tvSeriesList.find { s ->
-                                                                s.seasons.any { season -> season.episodes.any { ep -> ep.id == safeMediaId } }
-                                                            }?.id?.trim() ?: ""
+                                                if (cwItem.isSeries && !cwItem.seriesId.isNullOrBlank()) {
+                                                    val matchedSeries = uiState.tvSeriesList.find { it.id == cwItem.seriesId }
+                                                    if (matchedSeries != null) {
+                                                        onSeriesSelected(matchedSeries)
                                                     }
-                                                    val matchedSeries = uiState.tvSeriesList.find { it.id == sId }
-                                                        ?: TvSeries(
-                                                            id = sId,
-                                                            title = (cw.title ?: "").substringBefore(" • ").trim().ifBlank { "TV Series" },
-                                                            posterUrl = cw.thumbnailUrl
-                                                        )
-                                                    onSeriesSelected(matchedSeries)
                                                 }
                                             },
                                             onDismiss = {
-                                                viewModel.clearContinueWatching()
+                                                viewModel.dismissContinueWatching(cwItem.mediaId)
                                             },
                                             modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
                                         )
@@ -1942,217 +1873,227 @@ fun CatalogEmptyView(message: String) {
 
 @Composable
 fun ContinueWatchingCard(
-    data: ContinueWatchingData,
+    item: ContinueWatchingItem,
     onResumeClick: () -> Unit,
-    onDetailsClick: () -> Unit,
-    onDismiss: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    onDetailsClick: (() -> Unit)? = null,
+    onDismiss: (() -> Unit)? = null
 ) {
-    Surface(
+    Card(
         modifier = modifier
             .fillMaxWidth()
-            .aspectRatio(16f / 9f)
+            .height(210.dp)
             .clip(RoundedCornerShape(16.dp))
-            .clickable { onResumeClick() },
-        shape = RoundedCornerShape(16.dp),
-        color = Color(0xFF101622),
-        border = BorderStroke(1.dp, Color(0xFF1E2838))
+            .clickable {
+                if (onDetailsClick != null) onDetailsClick() else onResumeClick()
+            },
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF0F141E))
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
+            // High-Resolution Episode Screenshot
+            AsyncImage(
+                model = ImageRequest.Builder(LocalContext.current)
+                    .data(item.thumbnailUrl)
+                    .crossfade(300)
+                    .build(),
+                contentDescription = item.episodeTitle,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
 
-            // 1. Full-Bleed Artwork (Movie Poster or TV Episode Still)
-            val thumbUrl = (data.thumbnailUrl ?: "").trim()
-            if (thumbUrl.isNotBlank()) {
-                val context = LocalContext.current
-                val safeKey = (data.mediaId ?: "").trim()
-                val imageRequest = remember(safeKey, thumbUrl) {
-                    ImageRequest.Builder(context)
-                        .data(thumbUrl)
-                        .memoryCacheKey(safeKey)
-                        .diskCacheKey(safeKey)
-                        .memoryCachePolicy(CachePolicy.ENABLED)
-                        .diskCachePolicy(CachePolicy.ENABLED)
-                        .crossfade(true)
-                        .build()
-                }
-                AsyncImage(
-                    model = imageRequest,
-                    contentDescription = (data.title ?: "").ifBlank { "Artwork" },
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxSize()
-                )
-            }
-
-            // 2. Balanced Scrim: Allows artwork to shine at the top, ensures text legibility at bottom
+            // Dark Scrim Gradient for text legibility
             Box(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(
                         Brush.verticalGradient(
-                            colorStops = arrayOf(
-                                0.0f to Color(0x66000000),
-                                0.30f to Color(0x20000000),
-                                0.65f to Color(0xD9070A0F),
-                                1.0f to Color(0xFC070A0F)
-                            )
+                            0.0f to Color(0x33000000),
+                            0.45f to Color(0x66000000),
+                            0.80f to Color(0xF2070A0F),
+                            1.0f to Color(0xFA070A0F)
                         )
                     )
             )
 
-            // 3. Top Badges: "CONTINUE WATCHING" Pill + Dismiss 'X'
-            Row(
+            // Content Overlay
+            Column(
                 modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .fillMaxWidth()
-                    .padding(horizontal = 14.dp, vertical = 10.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+                    .fillMaxSize()
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.SpaceBetween
             ) {
-                Surface(
-                    shape = RoundedCornerShape(6.dp),
-                    color = Color(0xCC0E1A2B),
-                    border = BorderStroke(1.dp, Color(0xFF00E5FF).copy(alpha = 0.5f))
+                // Top Row: CONTINUE WATCHING Tag + Dismiss 'X' Button
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(5.dp)
+                    Box(
+                        modifier = Modifier
+                            .background(Color(0xCC0E1A2B), RoundedCornerShape(6.dp))
+                            .border(BorderStroke(1.dp, Color(0xFF00E5FF).copy(alpha = 0.5f)), RoundedCornerShape(6.dp))
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
                     ) {
-                        Icon(
-                            imageVector = Icons.Rounded.History,
-                            contentDescription = null,
-                            tint = Color(0xFF00E5FF),
-                            modifier = Modifier.size(13.dp)
-                        )
                         Text(
-                            text = if (data.isMovie) "RESUME MOVIE" else "CONTINUE WATCHING",
+                            text = "CONTINUE WATCHING",
                             color = Color(0xFF00E5FF),
                             fontSize = 10.sp,
                             fontWeight = FontWeight.Bold,
                             letterSpacing = 0.5.sp
                         )
                     }
-                }
 
-                IconButton(
-                    onClick = onDismiss,
-                    modifier = Modifier
-                        .size(28.dp)
-                        .clip(CircleShape)
-                        .background(Color(0x80000000))
-                ) {
-                    Icon(
-                        imageVector = Icons.Rounded.Close,
-                        contentDescription = "Dismiss",
-                        tint = Color(0xFFB0BEC5),
-                        modifier = Modifier.size(16.dp)
-                    )
-                }
-            }
-
-            // 4. Bottom Info: Title, Subtitle, Progress Bar & Action Buttons
-            Column(
-                modifier = Modifier
-                    .align(Alignment.BottomStart)
-                    .fillMaxWidth()
-                    .padding(horizontal = 14.dp, vertical = 12.dp)
-            ) {
-                // Title
-                Text(
-                    text = (data.title ?: "").ifBlank { "Untitled Video" },
-                    color = Color.White,
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.Bold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-
-                Spacer(modifier = Modifier.height(2.dp))
-
-                // Progress Info & Subtitle
-                val posFormatted = formatMsToTime(data.currentPositionMs)
-                val durFormatted = formatMsToTime(data.durationMs)
-                val safeSub = (data.subtitle ?: "").trim()
-                val subText = if (safeSub.contains("% watched")) {
-                    safeSub
-                } else if (safeSub.isNotBlank()) {
-                    "$safeSub • ${data.progressPercentage}% watched • $posFormatted / $durFormatted"
-                } else {
-                    "${data.progressPercentage}% watched • $posFormatted / $durFormatted"
-                }
-
-                Text(
-                    text = subText,
-                    color = Color(0xFF90A4AE),
-                    fontSize = 11.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                // Cyan Progress Bar
-                LinearProgressIndicator(
-                    progress = { (data.progressPercentage / 100f).coerceIn(0f, 1f) },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(3.5.dp)
-                        .clip(RoundedCornerShape(2.dp)),
-                    color = Color(0xFF00E5FF),
-                    trackColor = Color(0xFF222E3D)
-                )
-
-                Spacer(modifier = Modifier.height(10.dp))
-
-                // Actions: Resume & Details
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Button(
-                        onClick = onResumeClick,
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1976D2)),
-                        shape = RoundedCornerShape(20.dp),
-                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp),
-                        modifier = Modifier.height(34.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.PlayArrow,
-                            contentDescription = "Resume",
-                            tint = Color.White,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        val buttonText = if (data.progressPercentage >= 95) "Watch Again" else "Resume"
-                        Text(
-                            text = buttonText,
-                            color = Color.White,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-
-                    if (!data.isMovie) {
-                        OutlinedButton(
-                            onClick = onDetailsClick,
-                            shape = RoundedCornerShape(20.dp),
-                            border = BorderStroke(1.dp, Color(0xFF2A384C)),
-                            colors = ButtonDefaults.outlinedButtonColors(containerColor = Color(0x66131A26)),
-                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
-                            modifier = Modifier.height(34.dp)
+                    // Dismiss Button
+                    if (onDismiss != null) {
+                        IconButton(
+                            onClick = onDismiss,
+                            modifier = Modifier
+                                .size(28.dp)
+                                .clip(CircleShape)
+                                .background(Color(0x66000000))
                         ) {
-                            Text(
-                                text = "Details",
-                                color = Color(0xFFCFD8DC),
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Medium
+                            Icon(
+                                imageVector = Icons.Rounded.Close,
+                                contentDescription = "Dismiss",
+                                tint = Color.White.copy(alpha = 0.8f),
+                                modifier = Modifier.size(16.dp)
                             )
                         }
                     }
                 }
+
+                // Bottom Row: Show Name, Clean S05:E01 Title, Progress, and Play Button
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.Bottom
+                ) {
+                    Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                        Text(
+                            text = item.seriesTitle,
+                            color = Color(0xFF00E5FF),
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+
+                        Spacer(modifier = Modifier.height(2.dp))
+
+                        // CLEAN EPISODE TITLE (e.g., "S05:E01 • The Crimson Ticket")
+                        Text(
+                            text = item.displaySubtitle,
+                            color = Color.White,
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+
+                        Spacer(modifier = Modifier.height(3.dp))
+
+                        val posFormatted = formatMsToTime(item.currentPositionMs)
+                        val durFormatted = formatMsToTime(item.durationMs)
+                        Text(
+                            text = "${(item.progressFraction * 100).toInt()}% watched • $posFormatted / $durFormatted",
+                            color = Color(0xFF90A4AE),
+                            fontSize = 11.sp
+                        )
+                    }
+
+                    // Circular Cyan Action Button
+                    Box(
+                        modifier = Modifier
+                            .size(46.dp)
+                            .clip(CircleShape)
+                            .background(Color(0xFF00E5FF))
+                            .clickable { onResumeClick() },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.PlayArrow,
+                            contentDescription = "Resume",
+                            tint = Color(0xFF07090E),
+                            modifier = Modifier.size(28.dp)
+                        )
+                    }
+                }
+            }
+
+            // Accurate Blue/Cyan Progress Line at bottom
+            if (item.progressFraction > 0f) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(3.5.dp)
+                        .align(Alignment.BottomCenter)
+                        .background(Color(0x33FFFFFF))
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth(item.progressFraction.coerceIn(0.02f, 1f))
+                            .fillMaxHeight()
+                            .background(Color(0xFF00E5FF))
+                    )
+                }
             }
         }
     }
+}
+
+@Composable
+fun ContinueWatchingCard(
+    data: ContinueWatchingDisplayData,
+    onResumeClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    onDetailsClick: (() -> Unit)? = null,
+    onDismiss: (() -> Unit)? = null
+) {
+    val epCode = "S${data.seasonNumber.toString().padStart(2, '0')}:E${data.episodeNumber.toString().padStart(2, '0')}"
+    val cleanTitle = data.episodeTitle
+        .replace(Regex("(?i)\\bcompleted\\b"), "")
+        .replace(Regex("(?i)\\bcomplete\\b"), "")
+        .replace(Regex("(?i)^.*?S0*\\d+[:\\s._-]*E0*\\d+[:\\s-]*"), "")
+        .replace(Regex("(?i)^${Regex.escape(data.seriesTitle)}[:\\s-]*"), "")
+        .trim(' ', '-', '•', ':')
+        .ifBlank { "Episode ${data.episodeNumber}" }
+    val item = ContinueWatchingItem(
+        mediaId = data.mediaId,
+        seriesId = data.seriesId,
+        isSeries = data.seriesId.isNotBlank() || data.seasonNumber > 0,
+        seriesTitle = data.seriesTitle,
+        seasonNumber = data.seasonNumber,
+        episodeNumber = data.episodeNumber,
+        episodeTitle = cleanTitle,
+        displaySubtitle = "$epCode • $cleanTitle",
+        thumbnailUrl = data.displayThumbnailUrl,
+        progressFraction = data.progressFraction,
+        currentPositionMs = data.currentPositionMs,
+        durationMs = data.durationMs,
+        lastWatchedTimestamp = System.currentTimeMillis()
+    )
+    ContinueWatchingCard(
+        item = item,
+        onResumeClick = onResumeClick,
+        modifier = modifier,
+        onDetailsClick = onDetailsClick,
+        onDismiss = onDismiss
+    )
+}
+
+@Composable
+fun ContinueWatchingCard(
+    data: ContinueWatchingData,
+    onResumeClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    onDetailsClick: (() -> Unit)? = null,
+    onDismiss: (() -> Unit)? = null
+) {
+    ContinueWatchingCard(
+        data = data.toContinueWatchingDisplayData(),
+        onResumeClick = onResumeClick,
+        modifier = modifier,
+        onDetailsClick = onDetailsClick,
+        onDismiss = onDismiss
+    )
 }
 
 @Composable
@@ -2163,30 +2104,23 @@ fun ContinueWatchingCard(
     modifier: Modifier = Modifier,
     backdropUrl: String = ""
 ) {
-    val sNum = episode.seasonNumber
-    val eNum = episode.episodeNumber
-    val sTag = "S" + sNum.toString().padStart(2, '0')
-    val eTag = "E" + eNum.toString().padStart(2, '0')
-    val seriesTitle = (episode.seriesTitle ?: "").ifBlank { "Series" }
-    val epTitle = (episode.displayTitle ?: "").ifBlank { "Episode" }
-    val thumb = (episode.thumbnailUrl ?: "").ifBlank { backdropUrl.orEmpty() }
-    val data = ContinueWatchingData(
-        mediaId = (episode.id ?: "").trim(),
-        title = "$seriesTitle • $sTag:$eTag",
-        subtitle = epTitle,
-        episodeTitle = epTitle,
-        thumbnailUrl = thumb,
-        isMovie = false,
-        progressPercentage = (episode.watchProgressFraction * 100).toInt().coerceIn(0, 100),
+    val seriesTitle = episode.seriesTitle.ifBlank { "Series" }
+    val thumb = episode.thumbnailUrl.ifBlank { backdropUrl }
+    val displayData = ContinueWatchingDisplayData(
+        mediaId = episode.id,
+        seriesId = "",
+        seriesTitle = seriesTitle,
+        seasonNumber = episode.seasonNumber,
+        episodeNumber = episode.episodeNumber,
+        episodeTitle = episode.displayTitle,
+        displayThumbnailUrl = thumb,
+        progressFraction = episode.watchProgressFraction,
         currentPositionMs = (episode.watchProgressFraction * episode.durationMs).toLong(),
-        durationMs = episode.durationMs,
-        rawEpisode = episode,
-        rawMovie = null
+        durationMs = episode.durationMs
     )
     ContinueWatchingCard(
-        data = data,
+        data = displayData,
         onResumeClick = onPlayClick,
-        onDetailsClick = onPlayClick,
         onDismiss = onDismiss,
         modifier = modifier
     )
@@ -2216,6 +2150,8 @@ fun HomeScreen(
     val series by viewModel.seriesList.collectAsState()
     val continueWatchingEpisode by viewModel.lastWatchedEpisodeState.collectAsState()
     val continueWatchingData by viewModel.continueWatchingState.collectAsState()
+    val continueWatchingItem by viewModel.continueWatchingItem.collectAsState()
+    val resolvedCwItem by viewModel.resolvedContinueWatching.collectAsState()
 
     Box(
         modifier = modifier
@@ -2348,7 +2284,41 @@ fun HomeScreen(
             // ========================================================
             // 3. CATALOG CONTENT SWITCHER
             // ========================================================
-            Box(
+            val isSecondOverloadRefreshing by viewModel.isRefreshing.collectAsState()
+            val secondPullRefreshState = rememberPullToRefreshState()
+            val secondHaptic = LocalHapticFeedback.current
+
+            LaunchedEffect(secondPullRefreshState) {
+                var hasTriggeredThreshold = false
+                snapshotFlow { secondPullRefreshState.distanceFraction }
+                    .map { it >= 1.0f }
+                    .distinctUntilChanged()
+                    .collect { isPastThreshold ->
+                        if (isPastThreshold && !hasTriggeredThreshold) {
+                            secondHaptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            hasTriggeredThreshold = true
+                        } else if (!isPastThreshold) {
+                            hasTriggeredThreshold = false
+                        }
+                    }
+            }
+
+            PullToRefreshBox(
+                isRefreshing = isSecondOverloadRefreshing,
+                state = secondPullRefreshState,
+                onRefresh = {
+                    secondHaptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                    viewModel.refreshAppFreshBoot()
+                },
+                indicator = {
+                    PullToRefreshDefaults.Indicator(
+                        state = secondPullRefreshState,
+                        isRefreshing = isSecondOverloadRefreshing,
+                        color = Color(0xFF00E5FF),
+                        containerColor = Color(0xFF161B26),
+                        modifier = Modifier.align(Alignment.TopCenter)
+                    )
+                },
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f)
@@ -2360,7 +2330,40 @@ fun HomeScreen(
                             modifier = Modifier.fillMaxSize(),
                             contentPadding = PaddingValues(bottom = 110.dp)
                         ) {
-                            if (continueWatchingData != null) {
+                            val cwItem = resolvedCwItem ?: continueWatchingItem
+                            if (cwItem != null) {
+                                val safeCwId = cwItem.mediaId.trim()
+                                if (safeCwId.isNotEmpty()) {
+                                    item(key = "continue_watching_card") {
+                                        ContinueWatchingCard(
+                                            item = cwItem,
+                                            onResumeClick = {
+                                                if (cwItem.isSeries) {
+                                                    val ep = series.flatMap { it.seasons }.flatMap { it.episodes }.find { it.id == safeCwId }
+                                                    if (ep != null) {
+                                                        onContinueWatchingClick(ep)
+                                                    } else {
+                                                        val matchedSeries = series.find { it.id == cwItem.seriesId }
+                                                        if (matchedSeries != null) onSeriesClick(matchedSeries)
+                                                    }
+                                                } else {
+                                                    val matched = movies.find { it.id == safeCwId }
+                                                    if (matched != null) onMovieClick(matched)
+                                                }
+                                            },
+                                            onDetailsClick = {
+                                                if (cwItem.isSeries) {
+                                                    val matchedSeries = series.find { it.id == cwItem.seriesId }
+                                                        ?: series.find { s -> s.seasons.any { it.episodes.any { ep -> ep.id == safeCwId } } }
+                                                    if (matchedSeries != null) onSeriesClick(matchedSeries)
+                                                }
+                                            },
+                                            onDismiss = { viewModel.dismissContinueWatching(cwItem.mediaId) },
+                                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                                        )
+                                    }
+                                }
+                            } else if (continueWatchingData != null) {
                                 val cw = continueWatchingData!!
                                 val safeCwId = (cw.mediaId ?: "").trim()
                                 if (safeCwId.isNotEmpty()) {

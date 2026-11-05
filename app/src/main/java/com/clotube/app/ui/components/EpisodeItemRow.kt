@@ -43,15 +43,29 @@ fun EpisodeItemRow(
     onEpisodeClick: () -> Unit,
     onStartDownload: () -> Unit,
     onCancelDownload: () -> Unit,
+    isWatched: Boolean = false,
     isDownloading: Boolean = false,
     isDownloaded: Boolean = false,
     downloadRecord: OfflineMediaRecord? = null,
-    playbackHistoryManager: PlaybackHistoryManager?,
+    playbackHistoryManager: PlaybackHistoryManager? = null,
+    onToggleWatched: (() -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     val view = LocalView.current
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
+
+    val userEmail = remember { com.google.android.gms.auth.api.signin.GoogleSignIn.getLastSignedInAccount(context)?.email.orEmpty() }
+    val isWatchedExplicit = remember(userEmail, episode.id) {
+        if (userEmail.isNotBlank()) {
+            com.clotube.app.data.AndroidWatchHistoryManager.isEpisodeWatched(context, userEmail, episode.id)
+        } else false
+    }
+    val isWatchedFromFlow by (playbackHistoryManager?.isEpisodeWatched(episode.id)
+        ?: remember(episode.id) { kotlinx.coroutines.flow.flowOf(false) })
+        .collectAsState(initial = false)
+
+    val effectiveWatched = isWatched || isWatchedExplicit || isWatchedFromFlow
 
     val downloadRepo = remember(context) { DownloadRepository(context) }
     val recordState by downloadRepo.getDownloadRecord(episode.id).collectAsState(initial = null)
@@ -271,31 +285,31 @@ fun EpisodeItemRow(
                 horizontalArrangement = Arrangement.spacedBy(4.dp)
             ) {
                 // Completed indicator
-                val isWatched by (playbackHistoryManager?.isEpisodeWatched(episode.id)
-                    ?: remember(episode.id) { kotlinx.coroutines.flow.flowOf(false) })
-                    .collectAsState(initial = false)
-
                 Box(
                     modifier = Modifier
                         .size(32.dp)
                         .clip(RoundedCornerShape(8.dp))
-                        .background(if (isWatched) Color(0xFF16322A) else Color(0xFF181F2C))
+                        .background(if (effectiveWatched) Color(0xFF16322A) else Color(0xFF181F2C))
                         .clickable {
                             view.triggerClickHaptic()
-                            coroutineScope.launch {
-                                playbackHistoryManager?.toggleEpisodeWatched(
-                                    episode = episode,
-                                    seriesId = seriesId,
-                                    seriesTitle = seriesTitle
-                                )
+                            if (onToggleWatched != null) {
+                                onToggleWatched()
+                            } else {
+                                coroutineScope.launch {
+                                    playbackHistoryManager?.toggleEpisodeWatched(
+                                        episode = episode,
+                                        seriesId = seriesId,
+                                        seriesTitle = seriesTitle
+                                    )
+                                }
                             }
                         },
                     contentAlignment = Alignment.Center
                 ) {
                     Icon(
                         imageVector = Icons.Rounded.Check,
-                        contentDescription = "Mark as Watched",
-                        tint = if (isWatched) Color(0xFF00E676) else Color(0xFF4C5D75),
+                        contentDescription = if (effectiveWatched) "Mark as Unwatched" else "Mark as Watched",
+                        tint = if (effectiveWatched) Color(0xFF00E676) else Color(0xFF4C5D75),
                         modifier = Modifier.size(16.dp)
                     )
                 }
@@ -363,6 +377,7 @@ fun EpisodeItemRow(
     isDownloading: Boolean = false,
     isDownloaded: Boolean = false,
     downloadRecord: OfflineMediaRecord? = null,
+    onToggleWatched: (() -> Unit)? = null,
     viewModel: VideoViewModel,
     modifier: Modifier = Modifier
 ) = EpisodeItemRow(
@@ -373,10 +388,16 @@ fun EpisodeItemRow(
     onEpisodeClick = onEpisodeClick,
     onStartDownload = onStartDownload,
     onCancelDownload = onCancelDownload,
+    isWatched = com.clotube.app.data.AndroidWatchHistoryManager.isEpisodeWatched(
+        androidx.compose.ui.platform.LocalContext.current,
+        viewModel.uiState.value.userEmail.orEmpty(),
+        episode.id
+    ),
     isDownloading = isDownloading,
     isDownloaded = isDownloaded,
     downloadRecord = downloadRecord,
     playbackHistoryManager = viewModel.playbackHistoryManager,
+    onToggleWatched = onToggleWatched,
     modifier = modifier
 )
 

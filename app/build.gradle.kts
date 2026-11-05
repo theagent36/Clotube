@@ -15,8 +15,8 @@ android {
         applicationId = "com.clotube.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 8
-        versionName = "2.4"
+        versionCode = 11
+        versionName = "2.7"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -29,6 +29,10 @@ android {
     }
 
     signingConfigs {
+        getByName("debug") {
+            enableV1Signing = true
+            enableV2Signing = true
+        }
         create("release") {
             enableV1Signing = true
             enableV2Signing = true
@@ -39,6 +43,7 @@ android {
             if (keystorePropsFile.exists()) {
                 keystoreProps.load(FileInputStream(keystorePropsFile))
             }
+
             val storeFilePath = keystoreProps.getProperty("storeFile")
                 ?: project.findProperty("CLOTUBE_KEYSTORE_FILE")?.toString()
                 ?: project.findProperty("CLOTUBE_RELEASE_STORE_FILE")?.toString()
@@ -119,9 +124,6 @@ android {
         }
         jniLibs {
             useLegacyPackaging = true
-            pickFirsts += listOf("lib/*/*.so")
-            // Prevent R8 from stripping debug symbols needed by LibVLC native decoders
-            keepDebugSymbols += listOf("lib/*/*.so")
         }
     }
 

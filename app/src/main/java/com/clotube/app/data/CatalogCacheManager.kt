@@ -2,6 +2,7 @@ package com.clotube.app.data
 
 import android.content.Context
 import androidx.annotation.Keep
+import com.clotube.app.model.Movie
 import com.clotube.app.model.TvSeries
 import com.clotube.app.model.VideoItem
 import com.google.gson.Gson
@@ -73,6 +74,11 @@ class CatalogCacheManager(private val context: Context) {
         } catch (e: Exception) {
             e.printStackTrace()
         }
+    }
+
+    @JvmName("saveCatalogDomainMovies")
+    suspend fun saveCatalog(movies: List<Movie>, series: List<TvSeries>) = withContext(Dispatchers.IO) {
+        saveCatalog(movies.map { it.toVideoItem() }, series)
     }
 
     /**

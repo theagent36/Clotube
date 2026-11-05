@@ -36,6 +36,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.clotube.app.R
+import com.clotube.app.ui.components.ClotubeGlyph
 
 /**
  * Minimalist, unified centered authentication landing screen matching the Dark Cinema theme (#07090E).
@@ -58,12 +59,10 @@ fun ConnectDriveScreen(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
-            // App Logo: Full original graphic with borders and framing intact
-            Image(
-                painter = painterResource(id = R.drawable.ic_clotube),
-                contentDescription = "Clotube Icon",
-                contentScale = ContentScale.Fit,
-                modifier = Modifier.size(110.dp)
+            // Seamless Clotube Brand Glyph with soft radial blend
+            ClotubeGlyph(
+                modifier = Modifier.size(110.dp),
+                contentDescription = "Clotube Icon"
             )
 
             Spacer(modifier = Modifier.height(16.dp))

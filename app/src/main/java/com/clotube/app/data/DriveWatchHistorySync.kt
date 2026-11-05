@@ -77,11 +77,11 @@ class DriveWatchHistorySync(private val context: Context) {
 
         if (elapsed >= MIN_INTERVAL_MS) {
             debouncedJob?.cancel()
-            debouncedJob = syncScope.launch {
+            debouncedJob = syncScope.launch(NonCancellable + Dispatchers.IO) {
                 executeDirectUpload(dataStore)
             }
         } else if (debouncedJob == null || !debouncedJob!!.isActive) {
-            debouncedJob = syncScope.launch {
+            debouncedJob = syncScope.launch(NonCancellable + Dispatchers.IO) {
                 delay(MIN_INTERVAL_MS - elapsed)
                 executeDirectUpload(dataStore)
             }
@@ -96,10 +96,14 @@ class DriveWatchHistorySync(private val context: Context) {
         }
     }
 
+    fun pushHistoryAsync(dataStore: DataStore<Preferences>? = null, force: Boolean = false) {
+        backupImmediately(dataStore)
+    }
+
     /**
      * Permanently deletes clotube_watch_history.json from Google Drive.
      */
-    suspend fun deleteRemoteHistoryFile(): Boolean = withContext(Dispatchers.IO) {
+    suspend fun deleteRemoteHistoryFile(): Boolean = withContext(NonCancellable + Dispatchers.IO) {
         debouncedJob?.cancel()
         syncMutex.withLock {
             try {
@@ -142,10 +146,137 @@ class DriveWatchHistorySync(private val context: Context) {
     }
 
     /**
-     * Direct suspend upload method used by both the UI app and DriveSyncWorker.
-     * Returns true if the upload was successful.
+     * Resolves companion timestamp key accurately matching Desktop schema.
      */
-    suspend fun executeDirectUpload(dataStoreOverride: DataStore<Preferences>? = null): Boolean = withContext(Dispatchers.IO) {
+    fun resolveTimestampKey(key: String): String {
+        return if (key.startsWith("series_resume_")) {
+            val suffix = when {
+                key.endsWith("_series_title") -> "_series_title"
+                key.endsWith("_episode_id") -> "_episode_id"
+                key.endsWith("_episode_title") -> "_episode_title"
+                key.endsWith("_season_num") -> "_season_num"
+                key.endsWith("_episode_num") -> "_episode_num"
+                key.endsWith("_pos_ms") -> "_pos_ms"
+                key.endsWith("_dur_ms") -> "_dur_ms"
+                key.endsWith("_fraction") -> "_fraction"
+                key.endsWith("_thumb") -> "_thumb"
+                key.endsWith("_timestamp") -> "_timestamp"
+                else -> ""
+            }
+            if (suffix.isNotEmpty()) {
+                val seriesId = key.removePrefix("series_resume_").removeSuffix(suffix)
+                "series_resume_${seriesId}_timestamp"
+            } else {
+                "${key.substringBeforeLast('_')}_timestamp"
+            }
+        } else if (key.startsWith("snapshot_")) {
+            "snapshot_timestamp"
+        } else if (key.startsWith("global_") || key.startsWith("last_global_")) {
+            "global_latest_timestamp"
+        } else {
+            val suffix = when {
+                key.endsWith("_title") -> "_title"
+                key.endsWith("_pos") -> "_pos"
+                key.endsWith("_dur") -> "_dur"
+                key.endsWith("_fraction") -> "_fraction"
+                key.endsWith("_timestamp") -> "_timestamp"
+                key.endsWith("_is_series") -> "_is_series"
+                key.endsWith("_is_watched") -> "_is_watched"
+                key.endsWith("_series_id") -> "_series_id"
+                key.endsWith("_series_title") -> "_series_title"
+                key.endsWith("_season_num") -> "_season_num"
+                key.endsWith("_episode_num") -> "_episode_num"
+                key.endsWith("_thumb") -> "_thumb"
+                else -> ""
+            }
+            if (suffix.isNotEmpty()) {
+                val fileId = key.removeSuffix(suffix)
+                "${fileId}_timestamp"
+            } else {
+                "${key.substringBeforeLast('_')}_timestamp"
+            }
+        }
+    }
+
+    /**
+     * Merges remote Google Drive history payload with local DataStore preferences using item-level
+     * Last-Write-Wins based on timestamps. Never drops queued next-up episodes (fraction == 0f).
+     */
+    suspend fun mergeRemotePayload(dataStore: DataStore<Preferences>, remoteJson: String): Boolean {
+        if (remoteJson.isBlank()) return false
+        return try {
+            val rootJson = JSONObject(remoteJson)
+            val entriesJson = rootJson.optJSONObject("entries") ?: return false
+            val remoteUpdatedAt = rootJson.optLong("updatedAt", 0L)
+
+            dataStore.edit { prefs ->
+                val currentPrefs = prefs.asMap()
+                val existingKeyNames = currentPrefs.keys.map { it.name }.toSet()
+                val keysIterator = entriesJson.keys()
+
+                while (keysIterator.hasNext()) {
+                    val keyName = keysIterator.next()
+                    val entryObj = entriesJson.optJSONObject(keyName)
+                    val tsKey = resolveTimestampKey(keyName)
+                    val remoteTsEntry = entriesJson.optJSONObject(tsKey)
+                    val remoteTs = remoteTsEntry?.optLong("value", 0L)
+                        ?: if (keyName == tsKey) (entryObj?.optLong("value", 0L) ?: 0L) else remoteUpdatedAt
+
+                    val localTs = (currentPrefs[longPreferencesKey(tsKey)] as? Long)
+                        ?: if (keyName == tsKey) (currentPrefs[longPreferencesKey(keyName)] as? Long ?: 0L) else 0L
+
+                    val isNewer = remoteTs > localTs
+                    val isMissingLocally = !existingKeyNames.contains(keyName)
+
+                    if (isNewer || isMissingLocally) {
+                        if (entryObj != null) {
+                            val type = entryObj.optString("type")
+                            when (type) {
+                                "long" -> prefs[longPreferencesKey(keyName)] = entryObj.optLong("value", 0L)
+                                "int" -> prefs[intPreferencesKey(keyName)] = entryObj.optInt("value", 0)
+                                "float" -> prefs[floatPreferencesKey(keyName)] = entryObj.optDouble("value", 0.0).toFloat()
+                                "boolean" -> prefs[booleanPreferencesKey(keyName)] = entryObj.optBoolean("value", false)
+                                else -> prefs[stringPreferencesKey(keyName)] = entryObj.optString("value", "")
+                            }
+                        } else {
+                            when (val rawVal = entriesJson.opt(keyName)) {
+                                is Long -> prefs[longPreferencesKey(keyName)] = rawVal
+                                is Int -> prefs[intPreferencesKey(keyName)] = rawVal
+                                is Double -> prefs[floatPreferencesKey(keyName)] = rawVal.toFloat()
+                                is Float -> prefs[floatPreferencesKey(keyName)] = rawVal
+                                is Boolean -> prefs[booleanPreferencesKey(keyName)] = rawVal
+                                is String -> prefs[stringPreferencesKey(keyName)] = rawVal
+                            }
+                        }
+                    }
+                }
+
+                val remoteGlobalTs = (entriesJson.optJSONObject("global_latest_timestamp")?.optLong("value", 0L) ?: 0L)
+                    .takeIf { it > 0L }
+                    ?: (entriesJson.optJSONObject("last_global_watch_timestamp")?.optLong("value", 0L) ?: 0L)
+                    .takeIf { it > 0L }
+                    ?: remoteUpdatedAt
+
+                val localGlobalTs = prefs[longPreferencesKey("global_latest_timestamp")] ?: 0L
+                if (remoteGlobalTs > localGlobalTs) {
+                    prefs[longPreferencesKey("last_global_watch_timestamp")] = remoteGlobalTs
+                    prefs[longPreferencesKey("global_last_watched_timestamp")] = remoteGlobalTs
+                    prefs[longPreferencesKey("global_latest_timestamp")] = remoteGlobalTs
+                }
+            }
+            Log.i(TAG, "Successfully merged remote watch history from Google Drive")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Error merging remote history payload: ${e.message}", e)
+            false
+        }
+    }
+
+    /**
+     * Direct suspend upload method used by both the UI app and DriveSyncWorker.
+     * Guarantees atomic pre-pull and merge so no client blindly overwrites remote cross-device history.
+     */
+    suspend fun executeDirectUpload(dataStoreOverride: DataStore<Preferences>? = null): Boolean = withContext(NonCancellable + Dispatchers.IO) {
         syncMutex.withLock {
             if (!isUploading.compareAndSet(false, true)) {
                 Log.w(TAG, "Upload already in flight, skipping duplicate call")
@@ -159,8 +290,26 @@ class DriveWatchHistorySync(private val context: Context) {
                     return@withLock false
                 }
 
-                // Access the app DataStore instance
                 val dataStore = dataStoreOverride ?: appContext.playbackDataStore
+
+                // 1. Pre-pull and merge remote changes from Google Drive first (Atomic Pre-Pull)
+                val targetFileId = cachedFileId.get() ?: findHistoryFileId(driveService)
+                if (targetFileId != null) {
+                    try {
+                        val outputStream = ByteArrayOutputStream()
+                        driveService.files().get(targetFileId)
+                            .setSupportsAllDrives(true)
+                            .executeMediaAndDownloadTo(outputStream)
+                        val remoteJson = outputStream.toString("UTF-8")
+                        if (remoteJson.isNotBlank()) {
+                            mergeRemotePayload(dataStore, remoteJson)
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Pre-upload remote pull failed (continuing with local state): ${e.message}")
+                    }
+                }
+
+                // 2. Read merged preferences from DataStore
                 val prefs = dataStore.data.first()
                 val allEntries = prefs.asMap()
                 Log.d(TAG, "Preparing payload with ${allEntries.size} keys from DataStore...")
@@ -184,30 +333,30 @@ class DriveWatchHistorySync(private val context: Context) {
                 }
 
                 val mediaContent = ByteArrayContent.fromString("application/json", rootJson.toString())
-                var targetFileId = cachedFileId.get() ?: findHistoryFileId(driveService)
+                var currentFileId = targetFileId ?: findHistoryFileId(driveService)
 
-                if (targetFileId != null) {
+                if (currentFileId != null) {
                     try {
-                        driveService.files().update(targetFileId, null, mediaContent)
+                        driveService.files().update(currentFileId, null, mediaContent)
                             .setSupportsAllDrives(true)
                             .execute()
-                        cachedFileId.set(targetFileId)
+                        cachedFileId.set(currentFileId)
                         lastUploadTime.set(System.currentTimeMillis())
                         val payloadSize = mediaContent.length
-                        Log.i(TAG, "SUCCESS! Watch history updated on Google Drive (fileId: $targetFileId, size: $payloadSize bytes)")
+                        Log.i(TAG, "SUCCESS! Watch history updated on Google Drive (fileId: $currentFileId, size: $payloadSize bytes)")
                         return@withLock true
                     } catch (e: GoogleJsonResponseException) {
                         if (e.statusCode == 404) {
-                            Log.w(TAG, "File $targetFileId was deleted or not found. Creating fresh file...")
+                            Log.w(TAG, "File $currentFileId was deleted or not found. Creating fresh file...")
                             cachedFileId.set(null)
-                            targetFileId = null
+                            currentFileId = null
                         } else if (e.statusCode == 403 && (e.details?.errors?.any { it.reason == "appNotAuthorizedToFile" } == true || e.message?.contains("appNotAuthorizedToFile") == true)) {
-                            Log.w(TAG, "File $targetFileId not writable under current scope. Creating fresh file...")
+                            Log.w(TAG, "File $currentFileId not writable under current scope. Creating fresh file...")
                             try {
-                                driveService.files().delete(targetFileId).setSupportsAllDrives(true).execute()
+                                driveService.files().delete(currentFileId).setSupportsAllDrives(true).execute()
                             } catch (ignored: Exception) {}
                             cachedFileId.set(null)
-                            targetFileId = null
+                            currentFileId = null
                         } else {
                             throw e
                         }
@@ -253,62 +402,37 @@ class DriveWatchHistorySync(private val context: Context) {
         return foundId
     }
 
-    suspend fun pullAndMergeHistoryFromDrive(dataStore: DataStore<Preferences>) = withContext(Dispatchers.IO) {
+    /**
+     * Downloads clotube_watch_history.json from Google Drive and synchronizes
+     * local DataStore preferences via Last-Write-Wins item level merge.
+     */
+    suspend fun syncFromCloud(dataStore: DataStore<Preferences>): Boolean = withContext(NonCancellable + Dispatchers.IO) {
         try {
-            val driveService = getDriveService() ?: return@withContext
-            Log.d(TAG, "Checking for remote watch history file to restore...")
-            val fileId = findHistoryFileId(driveService) ?: return@withContext
-            Log.d(TAG, "Downloading remote watch history fileId=$fileId...")
+            val driveService = getDriveService() ?: return@withContext false
+            val fileId = findHistoryFileId(driveService) ?: run {
+                Log.d(TAG, "No remote history file on Drive to pull")
+                return@withContext false
+            }
+
             val outputStream = ByteArrayOutputStream()
             driveService.files().get(fileId)
                 .setSupportsAllDrives(true)
                 .executeMediaAndDownloadTo(outputStream)
 
-            val jsonString = outputStream.toString("UTF-8")
-            if (jsonString.isBlank()) return@withContext
+            val rawJson = outputStream.toString("UTF-8")
+            if (rawJson.isBlank()) return@withContext false
 
-            val rootJson = JSONObject(jsonString)
-            val entriesJson = rootJson.optJSONObject("entries") ?: return@withContext
-
-            var restoredCount = 0
-            dataStore.edit { mutablePrefs ->
-                val keysIterator = entriesJson.keys()
-                while (keysIterator.hasNext()) {
-                    val keyName = keysIterator.next()
-                    val itemObj = entriesJson.optJSONObject(keyName) ?: continue
-                    val type = itemObj.optString("type")
-
-                    when (type) {
-                        "long" -> {
-                            mutablePrefs[longPreferencesKey(keyName)] = itemObj.optLong("value", 0L)
-                            restoredCount++
-                        }
-                        "int" -> {
-                            mutablePrefs[intPreferencesKey(keyName)] = itemObj.optInt("value", 1)
-                            restoredCount++
-                        }
-                        "float" -> {
-                            mutablePrefs[floatPreferencesKey(keyName)] = itemObj.optDouble("value", 0.0).toFloat()
-                            restoredCount++
-                        }
-                        "boolean" -> {
-                            mutablePrefs[booleanPreferencesKey(keyName)] = itemObj.optBoolean("value", false)
-                            restoredCount++
-                        }
-                        "string" -> {
-                            val remoteStr = itemObj.optString("value", "")
-                            if (remoteStr.isNotBlank()) {
-                                mutablePrefs[stringPreferencesKey(keyName)] = remoteStr
-                                restoredCount++
-                            }
-                        }
-                    }
-                }
-            }
-            Log.i(TAG, "SUCCESS! Restored $restoredCount watch history keys from Google Drive!")
+            mergeRemotePayload(dataStore, rawJson)
         } catch (e: Exception) {
-            Log.e(TAG, "Error pulling watch history from Drive: ${e.message}", e)
+            Log.e(TAG, "Error pulling watch history from cloud: ${e.message}", e)
+            false
         }
+    }
+
+    suspend fun syncFromCloud(): Boolean = syncFromCloud(appContext.playbackDataStore)
+
+    suspend fun pullAndMergeHistoryFromDrive(dataStore: DataStore<Preferences>) = withContext(Dispatchers.IO) {
+        syncFromCloud(dataStore)
     }
 
     companion object {
@@ -379,8 +503,25 @@ class DriveWatchHistorySync(private val context: Context) {
             defaultInstance?.backupImmediately(dataStore)
         }
 
+        fun pushHistoryAsync(dataStore: DataStore<Preferences>? = null) {
+            defaultInstance?.pushHistoryAsync(dataStore)
+        }
+
+        fun pushHistoryAsync(context: Context, force: Boolean = false) {
+            val inst = getInstance(context)
+            inst.backupImmediately()
+        }
+
         fun backupToCloudImmediately(dataStore: DataStore<Preferences>? = null) {
             defaultInstance?.backupImmediately(dataStore)
+        }
+
+        suspend fun syncFromCloud(
+            dataStore: DataStore<Preferences>,
+            context: Context? = null
+        ): Boolean {
+            val inst = context?.let { getInstance(it) } ?: defaultInstance
+            return inst?.syncFromCloud(dataStore) ?: false
         }
 
         suspend fun pullAndMergeHistoryFromDrive(

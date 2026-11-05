@@ -284,6 +284,24 @@ class SeriesDetailViewModel(application: Application) : AndroidViewModel(applica
         resumeState: SeriesResumeState?,
         progressMap: Map<String, WatchProgress>
     ): Episode? {
+        val allEpisodes = series.seasons.flatMap { it.episodes }
+        if (allEpisodes.isEmpty()) return null
+
+        // 1. Locate the episode with the highest saved timestamp across all played/watched episodes
+        val latestProgress = progressMap.values
+            .filter { wp -> allEpisodes.any { it.id == wp.fileId } && (wp.positionMs > 0L || wp.progressFraction > 0f) }
+            .maxByOrNull { it.lastWatchedTimestamp }
+
+        val latestEp = if (latestProgress != null) {
+            allEpisodes.find { it.id == latestProgress.fileId }
+        } else null
+
+        if (latestEp != null) {
+            val prog = progressMap[latestEp.id]
+            return if (prog != null) latestEp.copy(watchProgressFraction = prog.progressFraction) else latestEp
+        }
+
+        // 2. Fallback to SeriesResumeState if present
         if (resumeState != null) {
             val matchedSeason = series.seasons.find { it.seasonNumber == resumeState.seasonNumber }
                 ?: series.seasons.firstOrNull()
@@ -292,7 +310,6 @@ class SeriesDetailViewModel(application: Application) : AndroidViewModel(applica
             } ?: matchedSeason?.episodes?.firstOrNull()
 
             if (matchedEp != null) {
-                // Refresh watchProgressFraction from live progress cache if available.
                 val prog = progressMap[matchedEp.id]
                 return if (prog != null) matchedEp.copy(watchProgressFraction = prog.progressFraction)
                 else matchedEp

@@ -18,6 +18,8 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.material3.Text
@@ -36,15 +38,14 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.lifecycleScope
+import com.clotube.app.data.DriveWatchHistorySync
+import com.clotube.app.data.playbackDataStore
 import com.clotube.app.navigation.ClotubeNavHost
 import com.clotube.app.ui.theme.ClotubeTheme
 import com.clotube.app.viewmodel.VideoViewModel
@@ -54,6 +55,8 @@ import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     private val videoViewModel: VideoViewModel by viewModels()
+    private val dataStore by lazy { applicationContext.playbackDataStore }
+    private val driveWatchHistorySync by lazy { DriveWatchHistorySync.getInstance(this) }
 
     private val authRecoveryLauncher = registerForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult()
@@ -118,12 +121,20 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         videoViewModel.vlcPlayerManager.onAppResume()
+        // Pull latest watch history whenever the app comes to foreground
+        lifecycleScope.launch(Dispatchers.IO) {
+            driveWatchHistorySync.syncFromCloud(dataStore)
+        }
     }
 
     override fun onPause() {
         super.onPause()
         videoViewModel.vlcPlayerManager.onAppPause()
         videoViewModel.pauseActivePlayer()
+        try {
+            videoViewModel.playbackHistoryManager.backupImmediately()
+        } catch (ignored: Exception) {}
+        videoViewModel.scheduleBackgroundDriveSync(applicationContext)
     }
 
     override fun onStop() {
@@ -207,89 +218,40 @@ fun ClotubeBootScreen(
 ) {
     val iconScale = remember { Animatable(0.2f) }
     val iconAlpha = remember { Animatable(0f) }
-
-    val letters = remember { listOf('l', 'o', 't', 'u', 'b', 'e') }
-    val letterAlphas = remember { letters.map { Animatable(0f) } }
-    val letterTranslations = remember { letters.map { Animatable(-16f) } }
-
-    val glyphSize = 100.dp
-    val textSpacing = (-6).dp
-
-    val density = LocalDensity.current
-    val textMeasurer = rememberTextMeasurer()
-    val textStyle = TextStyle(
-        color = Color.White,
-        fontSize = 58.sp,
-        fontWeight = FontWeight.Bold,
-        fontFamily = FontFamily.SansSerif,
-        letterSpacing = (-1).sp
-    )
-
-    // Calculate shift required so that in Phase 1, the "C" glyph is positioned precisely at the center of the screen
-    val centerShiftPx = remember(density) {
-        val textWidth = textMeasurer.measure(
-            text = "lotube",
-            style = textStyle
-        ).size.width.toFloat()
-        val spacerPx = with(density) { textSpacing.toPx() }
-        (textWidth + spacerPx) / 2f
-    }
-
-    val rowShiftX = remember { Animatable(centerShiftPx) }
+    val letters = remember { "lotube".map { it.toString() } }
+    val letterAlphas = remember { List(letters.size) { Animatable(0f) } }
 
     LaunchedEffect(Unit) {
-        // 0.0s – 0.5s: The isolated "C" zooms in from the center of the screen with a punchy spring curve (scale: 0.2f -> 1.0f, alpha: 0f -> 1f)
+        // Phase 1: Smooth, elastic pop-in for the glowing "C" glyph
         launch {
             iconAlpha.animateTo(
                 targetValue = 1f,
-                animationSpec = tween(durationMillis = 320, easing = FastOutSlowInEasing)
+                animationSpec = tween(durationMillis = 280)
             )
         }
         iconScale.animateTo(
             targetValue = 1f,
             animationSpec = spring(
                 dampingRatio = Spring.DampingRatioMediumBouncy,
-                stiffness = Spring.StiffnessMediumLow
+                stiffness = Spring.StiffnessLow
             )
         )
 
-        // Settle at 0.5s mark
-        delay(60)
+        // Settle pause before the text emerges
+        delay(120)
 
-        // 0.5s – 1.0s: As the "C" settles, reveal l, o, t, u, b, e sequentially letter-by-letter with a 70ms stagger delay.
-        // Each letter fades in with a quick horizontal slide (translationX: -16f -> 0f).
-        launch {
-            rowShiftX.animateTo(
-                targetValue = 0f,
-                animationSpec = tween(
-                    durationMillis = 440,
-                    easing = FastOutSlowInEasing
-                )
-            )
-        }
-
-        letters.indices.forEach { index ->
+        // Phase 2: Measured, readable letter-by-letter reveal (75ms stagger)
+        letters.forEachIndexed { index, _ ->
             launch {
-                launch {
-                    letterAlphas[index].animateTo(
-                        targetValue = 1f,
-                        animationSpec = tween(durationMillis = 150, easing = FastOutSlowInEasing)
-                    )
-                }
-                launch {
-                    letterTranslations[index].animateTo(
-                        targetValue = 0f,
-                        animationSpec = tween(durationMillis = 150, easing = FastOutSlowInEasing)
-                    )
-                }
+                delay(index * 75L)
+                letterAlphas[index].animateTo(
+                    targetValue = 1f,
+                    animationSpec = tween(durationMillis = 180)
+                )
             }
-            delay(70)
         }
 
-        // Allow final letter animation to settle
-        delay(80)
-
-        // 1.0s – 1.6s: Hold the unified "Clotube" wordmark before flipping isBooting = false
+        // Phase 3: Hold the completed "Clotube" wordmark before transition
         delay(600)
         onBootComplete()
     }
@@ -303,30 +265,27 @@ fun ClotubeBootScreen(
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.Center,
-            modifier = Modifier.graphicsLayer {
-                translationX = rowShiftX.value
-            }
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp)
         ) {
-            // Isolated Floating "C" with Soft Radial Fade
+            // Borderless Glowing "C" Glyph with Soft Radial Mask
             Box(
                 modifier = Modifier
-                    .size(glyphSize) // Proportional visual height to match "lotube"
+                    .size(92.dp)
                     .graphicsLayer {
                         scaleX = iconScale.value
                         scaleY = iconScale.value
                         alpha = iconAlpha.value
-                        // Required so DstIn blends against this offscreen layer rather than the window background
                         compositingStrategy = CompositingStrategy.Offscreen
                     }
                     .drawWithContent {
-                        // 1. Draw the actual logo asset
                         drawContent()
-                        // 2. Erase outer perimeter by applying a radial alpha mask
                         drawRect(
                             brush = Brush.radialGradient(
-                                0.0f to Color.White,        // 100% visible at the center "C"
-                                0.72f to Color.White,       // Retain full vibrant gradient colors
-                                0.98f to Color.Transparent, // Softly feather into zero alpha before reaching the edges
+                                0.0f to Color.White,
+                                0.72f to Color.White,
+                                0.98f to Color.Transparent,
                                 center = center,
                                 radius = size.minDimension / 2f
                             ),
@@ -337,19 +296,19 @@ fun ClotubeBootScreen(
             ) {
                 Image(
                     painter = painterResource(id = iconResId),
-                    contentDescription = "Clotube C",
+                    contentDescription = "Clotube C Glyph",
                     contentScale = ContentScale.Fit,
                     modifier = Modifier.fillMaxSize()
                 )
             }
 
-            Spacer(modifier = Modifier.width(textSpacing))
+            Spacer(modifier = Modifier.width((-6).dp))
 
-            // Trailing "lotube" characters revealed one by one
+            // Sequential "lotube" characters
             Row(verticalAlignment = Alignment.CenterVertically) {
-                letters.forEachIndexed { index, char ->
+                letters.forEachIndexed { index, letter ->
                     Text(
-                        text = char.toString(),
+                        text = letter,
                         color = Color.White,
                         fontSize = 58.sp,
                         fontWeight = FontWeight.Bold,
@@ -357,7 +316,7 @@ fun ClotubeBootScreen(
                         letterSpacing = (-1).sp,
                         modifier = Modifier.graphicsLayer {
                             alpha = letterAlphas[index].value
-                            translationX = letterTranslations[index].value
+                            translationX = (1f - letterAlphas[index].value) * -14f
                         }
                     )
                 }

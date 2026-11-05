@@ -34,6 +34,13 @@ data class EpisodeMetadata(
     val durationMinutes: Long = 0L
 )
 
+@androidx.annotation.Keep
+data class EpisodeOnlineMetadata(
+    val officialTitle: String,
+    val thumbnailUrl: String = "",
+    val durationMinutes: Long = 0L
+)
+
 object OnlineMetadataResolver {
 
     private const val TAG = "OnlineMetadataResolver"
@@ -58,12 +65,14 @@ object OnlineMetadataResolver {
     private val seriesCache = ConcurrentHashMap<String, SeriesMetadata>()
     private val episodeCache = ConcurrentHashMap<String, EpisodeMetadata>()
     private val showEpisodesCache = ConcurrentHashMap<Long, Map<Pair<Int, Int>, EpisodeMetadata>>()
+    private val showMetadataCache = ConcurrentHashMap<String, Map<Pair<Int, Int>, EpisodeOnlineMetadata>>()
 
     fun clearCache() {
         movieCache.clear()
         seriesCache.clear()
         episodeCache.clear()
         showEpisodesCache.clear()
+        showMetadataCache.clear()
     }
 
     // ========================================================
@@ -388,6 +397,139 @@ object OnlineMetadataResolver {
             connection?.disconnect()
         }
         return map
+    }
+
+    suspend fun resolveEpisodeMetadata(
+        seriesName: String,
+        seasonNumber: Int,
+        episodeNumber: Int
+    ): EpisodeOnlineMetadata? = withContext(Dispatchers.IO) {
+        val cleanKey = cleanSeriesName(seriesName)
+        if (cleanKey.isBlank() || seasonNumber <= 0 || episodeNumber <= 0) return@withContext null
+
+        val cachedMap = showMetadataCache[cleanKey]
+        if (cachedMap != null) {
+            val cachedEp = cachedMap[Pair(seasonNumber, episodeNumber)]
+            if (cachedEp != null) return@withContext cachedEp
+        }
+
+        val fetchedMap = fetchEpisodesFromTvMaze(cleanKey, seriesName)
+        if (fetchedMap.isNotEmpty()) {
+            showMetadataCache[cleanKey] = fetchedMap
+            return@withContext fetchedMap[Pair(seasonNumber, episodeNumber)]
+        }
+
+        null
+    }
+
+    private fun fetchEpisodesFromTvMaze(cleanKey: String, originalName: String): Map<Pair<Int, Int>, EpisodeOnlineMetadata> {
+        val result = mutableMapOf<Pair<Int, Int>, EpisodeOnlineMetadata>()
+        var connection: HttpURLConnection? = null
+
+        try {
+            val encodedQuery = URLEncoder.encode(cleanKey.ifBlank { originalName }, "UTF-8")
+            val targetUrl = "https://api.tvmaze.com/singlesearch/shows?q=$encodedQuery&embed=episodes"
+            val url = URL(targetUrl)
+
+            connection = (url.openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 8000
+                readTimeout = 8000
+                setRequestProperty("User-Agent", "Clotube/1.0 (Android)")
+            }
+
+            if (connection.responseCode == HttpURLConnection.HTTP_OK) {
+                val jsonString = connection.inputStream.bufferedReader().use { it.readText() }
+                val rootObj = JSONObject(jsonString)
+
+                if (rootObj.has("_embedded")) {
+                    val embedded = rootObj.getJSONObject("_embedded")
+                    if (embedded.has("episodes")) {
+                        val episodesArray = embedded.getJSONArray("episodes")
+                        for (i in 0 until episodesArray.length()) {
+                            val epObj = episodesArray.getJSONObject(i)
+                            val season = epObj.optInt("season", -1)
+                            val number = epObj.optInt("number", -1)
+                            val title = epObj.optString("name", "").trim()
+                            val runtime = epObj.optLong("runtime", 0L)
+
+                            val imageObj = epObj.optJSONObject("image")
+                            val thumb = imageObj?.optString("original")
+                                ?: imageObj?.optString("medium")
+                                ?: ""
+
+                            if (season > 0 && number > 0) {
+                                result[Pair(season, number)] = EpisodeOnlineMetadata(
+                                    officialTitle = title,
+                                    thumbnailUrl = thumb,
+                                    durationMinutes = runtime
+                                )
+                            }
+                        }
+                    }
+                }
+                logD(TAG, "Cached ${result.size} episodes from TVMaze for '$cleanKey'")
+            } else {
+                Log.w(TAG, "TVMaze responded with code ${connection.responseCode} for '$cleanKey'")
+            }
+        } catch (e: Exception) {
+            logE(TAG, "Error fetching TVMaze metadata for '$cleanKey': ${e.message}")
+        } finally {
+            connection?.disconnect()
+        }
+
+        return result
+    }
+
+    fun cleanSeriesName(rawName: String): String {
+        return rawName
+            .replace(Regex("(?i)\\b(season|s)\\s*\\d+.*$"), "")
+            .replace(Regex("(?i)\\b(complete|completed|1080p|720p|4k|web-dl|bluray|x264|x265|hevc|hdhub4u).*$"), "")
+            .replace(Regex("[._-]"), " ")
+            .trim()
+            .lowercase()
+    }
+
+    /**
+     * Extracts Season & Episode numbers from raw strings like "S05:E01 • Completed", "S05E01", "5x01", etc.
+     */
+    fun extractSeasonAndEpisode(text: String): Pair<Int, Int>? {
+        if (text.isBlank()) return null
+
+        val p1 = Pattern.compile("(?i)[sS](\\d{1,2})[:\\s._-]*[eE](\\d{1,2})")
+        val m1 = p1.matcher(text)
+        if (m1.find()) {
+            val s = m1.group(1)?.toIntOrNull()
+            val e = m1.group(2)?.toIntOrNull()
+            if (s != null && e != null && s > 0 && e > 0) return Pair(s, e)
+        }
+
+        val p2 = Pattern.compile("(?i)\\b(\\d{1,2})x(\\d{1,2})\\b")
+        val m2 = p2.matcher(text)
+        if (m2.find()) {
+            val s = m2.group(1)?.toIntOrNull()
+            val e = m2.group(2)?.toIntOrNull()
+            if (s != null && e != null && s > 0 && e > 0) return Pair(s, e)
+        }
+
+        return null
+    }
+
+    /**
+     * Strips "Completed", repeated series names, and season/episode tags from titles.
+     */
+    fun sanitizeEpisodeTitle(rawTitle: String, seriesName: String, seasonNum: Int, epNum: Int): String {
+        var clean = rawTitle.trim()
+        clean = clean.replace(Regex("(?i)\\bcompleted\\b"), "")
+        clean = clean.replace(Regex("(?i)\\bcomplete\\b"), "")
+        clean = clean.replace(Regex("(?i)^.*?S0*${seasonNum}[:\\s._-]*E0*${epNum}[:\\s-]*"), "")
+        clean = clean.replace(Regex("(?i)^${Regex.escape(seriesName)}[:\\s-]*"), "")
+        clean = clean.replace(Regex("(?i)^S0*${seasonNum}:E0*${epNum}[:\\s-]*"), "")
+        clean = clean.replace(Regex("(?i)\\.(mkv|mp4|avi|mov)$"), "")
+        clean = clean.replace(Regex("(?i)\\b(1080p|720p|WEB-DL|x264|x265|HDHub4u|ESub).*$"), "")
+        clean = clean.trim(' ', '-', '•', ':')
+
+        return if (clean.isBlank()) "Episode $epNum" else clean
     }
 
     // ========================================================

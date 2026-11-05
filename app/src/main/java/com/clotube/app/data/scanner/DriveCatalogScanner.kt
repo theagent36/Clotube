@@ -1,6 +1,7 @@
 package com.clotube.app.data.scanner
 
 import android.util.Log
+import com.clotube.app.data.FreshBootScanResult
 import com.clotube.app.data.metadata.OnlineMetadataResolver
 import com.clotube.app.model.Episode
 import com.clotube.app.model.Movie
@@ -35,6 +36,116 @@ object DriveCatalogScanner {
     var driveServiceProvider: (suspend () -> Drive?)? = null
 
     suspend fun getDriveService(): Drive? = driveServiceProvider?.invoke()
+
+    // ========================================================
+    // COLD-BOOT RESCAN (BYPASSES ALL IN-MEMORY CACHES)
+    // ========================================================
+
+    suspend fun performFreshBootScan(): FreshBootScanResult = withContext(Dispatchers.IO) {
+        Log.d(TAG, "Initiating Fresh-Boot Drive scan (bypassing in-memory cache)...")
+        try {
+            OnlineMetadataResolver.clearCache()
+            val driveService = getDriveService() ?: return@withContext FreshBootScanResult(emptyList(), emptyList())
+
+            // 1. Rescan Movies Folder
+            val freshMovies = scanMoviesDirect(driveService)
+
+            // 2. Rescan Series Folders
+            val freshSeries = scanSeriesDirect(driveService)
+
+            Log.d(TAG, "Fresh-Boot scan complete: ${freshMovies.size} movies, ${freshSeries.size} series.")
+            FreshBootScanResult(movies = freshMovies, series = freshSeries)
+        } catch (e: Exception) {
+            Log.e(TAG, "Fresh-Boot scan failed: ${e.message}", e)
+            FreshBootScanResult(emptyList(), emptyList())
+        }
+    }
+
+    private suspend fun scanMoviesDirect(driveService: Drive): List<Movie> = withContext(Dispatchers.IO) {
+        try {
+            val folderQuery = "name = 'Movies' and mimeType = '$FOLDER_MIME' and trashed = false"
+            val folderRes = driveService.files().list()
+                .setQ(folderQuery)
+                .setFields("files(id, name)")
+                .setSupportsAllDrives(true)
+                .setIncludeItemsFromAllDrives(true)
+                .setPageSize(5)
+                .execute()
+
+            val moviesFolderId = folderRes.files?.firstOrNull()?.id
+                ?: SmartFolderResolver.findPopulatedMoviesFolder(driveService)
+                ?: return@withContext emptyList()
+
+            val fileQuery = "'$moviesFolderId' in parents and mimeType contains 'video/' and trashed = false"
+            val fileRes = driveService.files().list()
+                .setQ(fileQuery)
+                .setFields("files(id, name, size, videoMediaMetadata, thumbnailLink)")
+                .setSupportsAllDrives(true)
+                .setIncludeItemsFromAllDrives(true)
+                .setPageSize(100)
+                .execute()
+
+            val directMovies = fileRes.files?.mapNotNull { file ->
+                val fId = file.id ?: return@mapNotNull null
+                val durationMs = file.videoMediaMetadata?.durationMillis ?: 0L
+                val movieMeta = OnlineMetadataResolver.resolveMovie(file.name.orEmpty())
+                Movie(
+                    id = fId,
+                    title = movieMeta.officialTitle.ifBlank { cleanMovieTitle(file.name.orEmpty()) },
+                    fileName = file.name.orEmpty(),
+                    durationMs = durationMs,
+                    thumbnailUrl = movieMeta.posterUrl.ifBlank { file.thumbnailLink.orEmpty() }
+                )
+            } ?: emptyList()
+
+            val recursiveMovies = scanMoviesRecursively(driveService, moviesFolderId)
+            val allMovies = (directMovies + recursiveMovies).distinctBy { it.id }.sortedBy { it.title }
+            allMovies
+        } catch (e: Exception) {
+            Log.e(TAG, "Error in scanMoviesDirect: ${e.message}", e)
+            emptyList()
+        }
+    }
+
+    private suspend fun scanSeriesDirect(driveService: Drive): List<Series> = withContext(Dispatchers.IO) {
+        try {
+            val seriesParentQuery = "name = 'Series' and mimeType = '$FOLDER_MIME' and trashed = false"
+            val parentFolderRes = driveService.files().list()
+                .setQ(seriesParentQuery)
+                .setFields("files(id, name)")
+                .setSupportsAllDrives(true)
+                .setIncludeItemsFromAllDrives(true)
+                .setPageSize(5)
+                .execute()
+
+            val seriesRootId = parentFolderRes.files?.firstOrNull()?.id
+                ?: SmartFolderResolver.findPopulatedSeriesFolder(driveService)
+                ?: return@withContext emptyList()
+
+            val showFoldersQuery = "'$seriesRootId' in parents and mimeType = '$FOLDER_MIME' and trashed = false"
+            val showFolders = driveService.files().list()
+                .setQ(showFoldersQuery)
+                .setFields("files(id, name)")
+                .setSupportsAllDrives(true)
+                .setIncludeItemsFromAllDrives(true)
+                .setPageSize(50)
+                .execute()
+                .files ?: emptyList()
+
+            val scannedSeries = showFolders.mapNotNull { showFolder ->
+                refreshSingleSeries(driveService, showFolder.id, showFolder.name)
+            }
+
+            if (scannedSeries.isNotEmpty()) {
+                scannedSeries.sortedBy { it.title }
+            } else {
+                scanSeriesRecursively(driveService, seriesRootId)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error in scanSeriesDirect: ${e.message}", e)
+            emptyList()
+        }
+    }
 
     // ========================================================
     // 1. SCAN MOVIES (DIRECT FOLDER & RECURSIVE)
@@ -441,7 +552,7 @@ object DriveCatalogScanner {
         return VIDEO_EXTENSIONS.contains(ext)
     }
 
-    internal fun cleanMovieTitle(fileName: String, parentFolderName: String): String {
+    internal fun cleanMovieTitle(fileName: String, parentFolderName: String = ""): String {
         val baseName = fileName.substringBeforeLast(".")
         val genericNames = setOf("movie", "video", "film", "cd1", "cd2", "stream", "play")
         return if (genericNames.contains(baseName.lowercase(Locale.ROOT)) && parentFolderName.isNotBlank() && parentFolderName != "Movies") {
@@ -533,6 +644,14 @@ object DriveCatalogScanner {
      * Refreshes a single series by its folder ID, retrieving all subfolders, episodes,
      * and resolving metadata via OnlineMetadataResolver.
      */
+    suspend fun refreshSingleSeries(
+        seriesFolderId: String,
+        seriesTitleHint: String? = null
+    ): TvSeries? {
+        val driveService = getDriveService() ?: return null
+        return refreshSingleSeries(driveService, seriesFolderId, seriesTitleHint)
+    }
+
     suspend fun refreshSingleSeries(
         driveService: Drive,
         seriesFolderId: String,
