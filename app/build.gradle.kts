@@ -15,8 +15,8 @@ android {
         applicationId = "com.clotube.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 11
-        versionName = "2.7"
+        versionCode = 15
+        versionName = "3.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -65,21 +65,14 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = true
-            isShrinkResources = true
+            isMinifyEnabled = false
+            isShrinkResources = false
             isDebuggable = false
+            signingConfig = signingConfigs.getByName("debug")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-
-            // Safely bind to release signing if configured; otherwise allow manual Android Studio signing wizard
-            val releaseConfig = signingConfigs.findByName("release")
-            if (releaseConfig != null && releaseConfig.storeFile != null && releaseConfig.storeFile!!.exists()) {
-                signingConfig = releaseConfig
-            } else {
-                signingConfig = signingConfigs.getByName("debug")
-            }
         }
         debug {
             // CRITICAL: Do NOT append applicationIdSuffix here.
