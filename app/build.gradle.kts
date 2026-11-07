@@ -7,6 +7,12 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+val keystorePropertiesFile = rootProject.file("keystore.properties")
+val keystoreProperties = Properties()
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(FileInputStream(keystorePropertiesFile))
+}
+
 android {
     namespace = "com.clotube.app"
     compileSdk = 35
@@ -24,55 +30,44 @@ android {
         }
 
         ndk {
+            // Include target ABIs for LibVLC native playback
             abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a", "x86_64"))
         }
     }
 
     signingConfigs {
-        getByName("debug") {
-            enableV1Signing = true
-            enableV2Signing = true
-        }
         create("release") {
-            enableV1Signing = true
-            enableV2Signing = true
-
-            // Checks keystore.properties, gradle.properties, or environment variables for the developer's original keystore
-            val keystorePropsFile = rootProject.file("keystore.properties")
-            val keystoreProps = Properties()
-            if (keystorePropsFile.exists()) {
-                keystoreProps.load(FileInputStream(keystorePropsFile))
-            }
-
-            val storeFilePath = keystoreProps.getProperty("storeFile")
-                ?: project.findProperty("CLOTUBE_KEYSTORE_FILE")?.toString()
-                ?: project.findProperty("CLOTUBE_RELEASE_STORE_FILE")?.toString()
-
-            if (!storeFilePath.isNullOrBlank() && file(storeFilePath).exists()) {
-                storeFile = file(storeFilePath)
-                storePassword = keystoreProps.getProperty("storePassword")
-                    ?: project.findProperty("CLOTUBE_KEYSTORE_PASSWORD")?.toString()
-                    ?: project.findProperty("CLOTUBE_RELEASE_STORE_PASSWORD")?.toString() ?: ""
-                keyAlias = keystoreProps.getProperty("keyAlias")
-                    ?: project.findProperty("CLOTUBE_KEY_ALIAS")?.toString()
-                    ?: project.findProperty("CLOTUBE_RELEASE_KEY_ALIAS")?.toString() ?: ""
-                keyPassword = keystoreProps.getProperty("keyPassword")
-                    ?: project.findProperty("CLOTUBE_KEY_PASSWORD")?.toString()
-                    ?: project.findProperty("CLOTUBE_RELEASE_KEY_PASSWORD")?.toString() ?: ""
+            val storePath = if (keystorePropertiesFile.exists()) keystoreProperties.getProperty("storeFile") else null
+            if (!storePath.isNullOrBlank() && file(storePath).exists()) {
+                storeFile = file(storePath)
+                storePassword = keystoreProperties.getProperty("storePassword") ?: ""
+                keyAlias = keystoreProperties.getProperty("keyAlias") ?: ""
+                keyPassword = keystoreProperties.getProperty("keyPassword") ?: ""
+                enableV1Signing = true
+                enableV2Signing = true
+            } else {
+                // Fallback to debug keystore if properties file is not yet populated
+                val debugConfig = signingConfigs.getByName("debug")
+                storeFile = debugConfig.storeFile
+                storePassword = debugConfig.storePassword
+                keyAlias = debugConfig.keyAlias
+                keyPassword = debugConfig.keyPassword
+                enableV1Signing = true
+                enableV2Signing = true
             }
         }
     }
 
     buildTypes {
         release {
-            isMinifyEnabled = false
-            isShrinkResources = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             isDebuggable = false
-            signingConfig = signingConfigs.getByName("debug")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            signingConfig = signingConfigs.getByName("release")
         }
         debug {
             // CRITICAL: Do NOT append applicationIdSuffix here.

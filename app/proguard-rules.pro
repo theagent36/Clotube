@@ -1,10 +1,8 @@
 # ==============================================================================
-# CLOTUBE - PRODUCTION R8 / PROGUARD KEEP RULES
+# CLOTUBE - COMPREHENSIVE R8 / PROGUARD PRODUCTION RULES
 # ==============================================================================
 
-# ------------------------------------------------------------------------------
-# 1. Core Domain Models, DTOs & DataStore Preferences
-# ------------------------------------------------------------------------------
+# 1. Domain Models, DTOs & DataStore Preferences
 -keep class com.clotube.app.model.** { *; }
 -keepclassmembers class com.clotube.app.model.** { *; }
 
@@ -19,9 +17,7 @@
 -keep class androidx.datastore.preferences.** { *; }
 -keep class androidx.datastore.core.** { *; }
 
-# ------------------------------------------------------------------------------
 # 2. LibVLC Native JNI & Media Playback Engine
-# ------------------------------------------------------------------------------
 -keep class org.videolan.libvlc.** { *; }
 -keep interface org.videolan.libvlc.** { *; }
 -keep class org.videolan.medialibrary.** { *; }
@@ -36,9 +32,7 @@
     void onEvent(org.videolan.libvlc.MediaPlayer$Event);
 }
 
-# ------------------------------------------------------------------------------
 # 3. WorkManager & Background Download Workers
-# ------------------------------------------------------------------------------
 -keep public class androidx.work.Worker { *; }
 -keep public class androidx.work.CoroutineWorker { *; }
 -keep public class androidx.work.ListenableWorker { *; }
@@ -50,16 +44,12 @@
 -keep class com.clotube.app.data.DriveSyncWorker { *; }
 -keep class com.clotube.app.data.ClotubeSyncService { *; }
 
-# ------------------------------------------------------------------------------
-# 4. MediaSessionCompat, Audio Focus & Telephony Interruption
-# ------------------------------------------------------------------------------
+# 4. MediaSessionCompat & Audio Focus
 -keep class com.clotube.app.media.** { *; }
 -keep class android.support.v4.media.** { *; }
 -keep class androidx.media.** { *; }
 
-# ------------------------------------------------------------------------------
 # 5. Google Play Services & Google Drive REST API
-# ------------------------------------------------------------------------------
 -keep class com.google.android.gms.auth.api.** { *; }
 -keep class com.google.android.gms.auth.api.signin.** { *; }
 -keep class com.google.android.gms.common.** { *; }
@@ -79,9 +69,7 @@
 -dontwarn com.google.common.**
 -dontwarn org.apache.http.**
 
-# ------------------------------------------------------------------------------
 # 6. OkHttp, Networking & Coil
-# ------------------------------------------------------------------------------
 -keepattributes Signature
 -keepattributes *Annotation*
 -keepattributes EnclosingMethod
@@ -95,9 +83,7 @@
 -keep class coil.** { *; }
 -dontwarn coil.**
 
-# ------------------------------------------------------------------------------
 # 7. Jetpack Compose & Kotlin Coroutines
-# ------------------------------------------------------------------------------
 -keepclassmembers class * {
     @androidx.compose.runtime.Immutable <fields>;
     @androidx.compose.runtime.Stable <fields>;

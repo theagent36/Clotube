@@ -284,22 +284,46 @@ class PlaybackHistoryManager(
         fun getResumePosition(context: Context, userEmail: String, fileId: String, durationMs: Long): Long {
             if (userEmail.isBlank() || fileId.isBlank()) return 0L
 
-            // If the episode is marked as watched, replay must strictly start at 00:00
-            if (AndroidWatchHistoryManager.isEpisodeWatched(context, userEmail, fileId)) {
-                return 0L
-            }
-
             val local = AndroidWatchHistoryManager.loadLocalSync(context, userEmail)
             val pos = (local["${fileId}_pos"]?.value as? Number)?.toLong() ?: 0L
             val dur = if (durationMs > 0L) durationMs else (local["${fileId}_dur"]?.value as? Number)?.toLong() ?: 0L
             val fraction = (local["${fileId}_fraction"]?.value as? Number)?.toFloat() ?: 0f
+            val isWatched = AndroidWatchHistoryManager.isEpisodeWatched(context, userEmail, fileId) || fraction >= 0.90f
 
-            // If progress is >= 92% of runtime, restart from beginning
-            if (fraction >= 0.92f || (dur > 0L && pos >= (dur * 0.92f))) {
-                return 0L
+            return when {
+                // User is actively re-watching past 5 seconds and has not reached the end credits
+                pos > 5000L && (dur == 0L || pos < dur - 15000L) -> pos
+
+                // Watched episode with no active re-watch progress: start from beginning
+                isWatched -> 0L
+
+                // Standard in-progress playback
+                pos > 3000L -> pos
+
+                else -> 0L
             }
+        }
+    }
 
-            return if (pos > 1500L) pos else 0L
+    suspend fun getResumePosition(fileId: String): Long = withContext(Dispatchers.IO) {
+        val prefs = dataStore.data.first()
+        val isWatched = prefs[booleanPreferencesKey("${fileId}_is_watched")]
+            ?: ((prefs[floatPreferencesKey("${fileId}_fraction")] ?: 0f) >= 0.90f)
+
+        val savedPos = prefs[longPreferencesKey("${fileId}_pos")] ?: 0L
+        val duration = prefs[longPreferencesKey("${fileId}_dur")] ?: 0L
+
+        when {
+            // User is actively re-watching past 5 seconds and has not reached the end credits
+            savedPos > 5000L && (duration == 0L || savedPos < duration - 15000L) -> savedPos
+
+            // Watched episode with no active re-watch progress: start from beginning
+            isWatched -> 0L
+
+            // Standard in-progress playback
+            savedPos > 3000L -> savedPos
+
+            else -> 0L
         }
     }
 
@@ -1467,7 +1491,7 @@ class PlaybackHistoryManager(
                 }
             }
 
-            candidates.maxByOrNull { it.lastWatchedTimestamp }
+            candidates.filter { it.progressFraction < 0.95f }.maxByOrNull { it.lastWatchedTimestamp }
         }
     }
 
@@ -1627,7 +1651,7 @@ class PlaybackHistoryManager(
             }
         }
 
-        candidates.maxByOrNull { it.lastWatchedTimestamp }
+        candidates.filter { it.progressFraction < 0.95f }.maxByOrNull { it.lastWatchedTimestamp }
     }
 
     /**

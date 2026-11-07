@@ -128,6 +128,7 @@ fun ClotubeVideoPlayer(
     viewModel: VideoViewModel,
     seriesId: String? = null,
     initialPositionMs: Long = 0L,
+    startPositionMs: Long = initialPositionMs,
     nextEpisode: Episode? = null,
     onPreviousEpisode: (() -> Unit)? = null,
     onNextEpisode: (() -> Unit)? = null,
@@ -137,6 +138,7 @@ fun ClotubeVideoPlayer(
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    val effectiveStartPositionMs = if (startPositionMs > 0L) startPositionMs else initialPositionMs
 
     fun isScreenVisible(): Boolean {
         return lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
@@ -219,7 +221,8 @@ fun ClotubeVideoPlayer(
                     }
 
                     Media(libVLCInstance, Uri.parse(streamUrl)).apply {
-                        addOption(":network-caching=1500")
+                        addOption(":network-caching=3000")
+                        addOption(":http-reconnect")
                         if (!token.isNullOrBlank()) {
                             addOption(":http-header=Authorization: Bearer $token")
                         }
@@ -232,6 +235,9 @@ fun ClotubeVideoPlayer(
                         (startPositionMs / 1000L).coerceAtLeast(0L)
                     }
                     applyClotubeMediaOptions(startSec)
+                    if (startSec > 0L) {
+                        addOption(":start-time=$startSec")
+                    }
                     setHWDecoderEnabled(true, true)
                 }
 
@@ -262,7 +268,7 @@ fun ClotubeVideoPlayer(
             try {
                 val current = mediaPlayer.time
                 val total = mediaPlayer.length
-                if (total > 0L && current >= 1000L) {
+                if (total > 0L && current >= 3000L) {
                     val isNearEnd = current >= (total * 0.95f) || (total - current <= 15_000L)
                     if (isNearEnd) {
                         val next = nextEpisode ?: viewModel.getNextEpisode(resolvedSeriesId, episode.id)
@@ -307,30 +313,21 @@ fun ClotubeVideoPlayer(
 
     var computedInitialPositionMs by remember(episode.id) { mutableLongStateOf(0L) }
 
-    // Initial launch with progress recovery (Resets completed / already-watched episodes to 0L)
+    // Initial launch with progress recovery (Resets completed / already-watched episodes to 0L unless re-watching)
     LaunchedEffect(episode.id) {
         val streamUrl = viewModel.getStreamUrlForEpisode(episode.id)
         if (streamUrl.isBlank()) return@LaunchedEffect
 
-        val userEmail = viewModel.uiState.value.userEmail.orEmpty()
         val resumePos = withContext(Dispatchers.IO) {
-            val isWatched = com.clotube.app.data.AndroidWatchHistoryManager.isEpisodeWatched(context, userEmail, episode.id)
-            if (isWatched) {
-                0L
-            } else if (initialPositionMs > 0L) {
-                initialPositionMs
+            if (effectiveStartPositionMs > 0L) {
+                effectiveStartPositionMs
             } else {
-                com.clotube.app.data.PlaybackHistoryManager.getResumePosition(
-                    context = context,
-                    userEmail = userEmail,
-                    fileId = episode.id,
-                    durationMs = episode.durationMs
-                )
+                viewModel.playbackHistoryManager.getResumePosition(episode.id)
             }
         }
 
         computedInitialPositionMs = resumePos
-        loadAndPlayStream(resumePos)
+        loadAndPlayStream(startPositionMs = resumePos)
     }
 
     // Periodic progress saving loop

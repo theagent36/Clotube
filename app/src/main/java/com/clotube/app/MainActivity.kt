@@ -101,6 +101,7 @@ class MainActivity : ComponentActivity() {
                     if (booting) {
                         ClotubeBootScreen(
                             iconResId = R.drawable.ic_clotube,
+                            viewModel = videoViewModel,
                             onBootComplete = {
                                 isBooting = false
                             }
@@ -214,6 +215,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun ClotubeBootScreen(
     iconResId: Int = R.drawable.ic_clotube,
+    viewModel: VideoViewModel,
     onBootComplete: () -> Unit = {}
 ) {
     val iconScale = remember { Animatable(0.2f) }
@@ -251,8 +253,17 @@ fun ClotubeBootScreen(
             }
         }
 
-        // Phase 3: Hold the completed "Clotube" wordmark before transition
-        delay(600)
+        // Concurrently fetch clotube_watch_history.json from Google Drive
+        val syncJob = launch {
+            viewModel.prepareInitialState()
+        }
+
+        // Minimum display duration for branding animation
+        delay(1200)
+
+        // Wait for cloud history to finish loading before unlocking the UI
+        syncJob.join()
+
         onBootComplete()
     }
 

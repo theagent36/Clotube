@@ -33,7 +33,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.firstOrNull
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
 import com.clotube.app.model.ContinueWatchingItem
@@ -267,6 +269,34 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
     val downloadRepository by lazy { com.clotube.app.data.DownloadRepository(application) }
 
     val tokenRepository = com.clotube.app.data.TokenRepository(application)
+    val driveWatchHistorySync by lazy { DriveWatchHistorySync.getInstance(getApplication()) }
+
+    private val _isHistoryLoaded = MutableStateFlow(false)
+    val isHistoryLoaded: StateFlow<Boolean> = _isHistoryLoaded.asStateFlow()
+
+    /**
+     * Invoked during ClotubeBootScreen to fetch clotube_watch_history.json from Drive
+     * and ensure the latest watched episode or movie is ready before transitioning to Home.
+     */
+    suspend fun prepareInitialState() = withContext(Dispatchers.IO) {
+        try {
+            // 1. Pull the remote history JSON directly from Google Drive into DataStore
+            driveWatchHistorySync.syncFromCloud(playbackHistoryManager.dataStore)
+        } catch (e: Exception) {
+            android.util.Log.e("ClotubeBoot", "Failed to sync history on boot: ${e.message}")
+        } finally {
+            // 2. Await initial catalog & history emission or time out safely (max 2.5s) to prevent offline stalls
+            withTimeoutOrNull(2500L) {
+                val lastWatched = playbackHistoryManager.lastWatchedFlow.first()
+                if (lastWatched != null && lastWatched.progressFraction < 0.95f) {
+                    continueWatchingDisplayState.first { it != null }
+                } else {
+                    continueWatchingDisplayState.first { true }
+                }
+            }
+            _isHistoryLoaded.value = true
+        }
+    }
 
     init {
         DriveCatalogScanner.driveServiceProvider = { getDriveService() }
@@ -356,18 +386,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                 val isNearEof = (totalDuration > 0L && startPositionMs >= totalDuration - 30_000L)
                 if (isNearEof) 0L else startPositionMs
             } else {
-                val savedProgress = playbackHistoryManager.getProgressSync(episode.id)
-                val isWatched = playbackHistoryManager.isEpisodeWatched(episode.id).firstOrNull() ?: false
-                val totalDuration = if (savedProgress != null && savedProgress.durationMs > 0L) savedProgress.durationMs else episode.durationMs
-                val isCompletedOrNearEof = isWatched || (savedProgress != null && (
-                    savedProgress.progressFraction >= 0.95f ||
-                    (totalDuration > 0L && savedProgress.positionMs >= totalDuration - 30_000L)
-                ))
-                if (isCompletedOrNearEof || savedProgress == null || savedProgress.positionMs <= 2000L) {
-                    0L
-                } else {
-                    savedProgress.positionMs
-                }
+                playbackHistoryManager.getResumePosition(episode.id)
             }
             withContext(Dispatchers.Main) {
                 vlcPlayerManager.play(
@@ -853,104 +872,137 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
 
     val continueWatchingDisplayState: StateFlow<ContinueWatchingDisplayData?> = combine(
         playbackHistoryManager.lastWatchedFlow,
-        seriesList
-    ) { lastWatchedItem, allSeries ->
+        seriesList,
+        moviesList
+    ) { lastWatchedItem, allSeries, allMovies ->
         if (lastWatchedItem == null) return@combine null
 
+        // If an episode or movie has been completed (e.g. >= 95%), do not show it as continuing
+        if (lastWatchedItem.progressFraction >= 0.95f) return@combine null
+
         val effectiveSeries = allSeries.ifEmpty { loadCatalogFromDisk(getApplication()) }
-        if (effectiveSeries.isEmpty()) return@combine null
 
-        // 1. Resolve parent series
-        val parentSeries = effectiveSeries.firstOrNull { it.id == lastWatchedItem.seriesId }
-            ?: effectiveSeries.firstOrNull { s ->
-                s.seasons.any { season -> season.episodes.any { ep -> ep.id == lastWatchedItem.mediaId || ep.id == lastWatchedItem.fileId } }
-            } ?: effectiveSeries.firstOrNull { s ->
-                !lastWatchedItem.seriesTitle.isNullOrBlank() && s.title.equals(lastWatchedItem.seriesTitle, ignoreCase = true)
-            } ?: return@combine null
+        if (lastWatchedItem.isSeries) {
+            if (effectiveSeries.isEmpty()) return@combine null
 
-        val allEpisodes = parentSeries.seasons.flatMap { it.episodes }
+            // 1. Resolve parent series
+            val parentSeries = effectiveSeries.firstOrNull { it.id == lastWatchedItem.seriesId }
+                ?: effectiveSeries.firstOrNull { s ->
+                    s.seasons.any { season -> season.episodes.any { ep -> ep.id == lastWatchedItem.mediaId || ep.id == lastWatchedItem.fileId } }
+                } ?: effectiveSeries.firstOrNull { s ->
+                    !lastWatchedItem.seriesTitle.isNullOrBlank() && s.title.equals(lastWatchedItem.seriesTitle, ignoreCase = true)
+                } ?: return@combine null
 
-        // 2. Determine actual Season and Episode numbers (extracting from title if DataStore keys were 0 or null)
-        val parsedFromTitle = OnlineMetadataResolver.extractSeasonAndEpisode(lastWatchedItem.title)
-            ?: OnlineMetadataResolver.extractSeasonAndEpisode(lastWatchedItem.formattedDisplayTitle)
+            val allEpisodes = parentSeries.seasons.flatMap { it.episodes }
 
-        val targetSeason = when {
-            parsedFromTitle != null -> parsedFromTitle.first
-            lastWatchedItem.seasonNumber > 0 -> lastWatchedItem.seasonNumber
-            else -> 1
-        }
+            // 2. Determine actual Season and Episode numbers (extracting from title if DataStore keys were 0 or null)
+            val parsedFromTitle = OnlineMetadataResolver.extractSeasonAndEpisode(lastWatchedItem.title)
+                ?: OnlineMetadataResolver.extractSeasonAndEpisode(lastWatchedItem.formattedDisplayTitle)
 
-        val targetEpisode = when {
-            parsedFromTitle != null -> parsedFromTitle.second
-            lastWatchedItem.episodeNumber > 0 -> lastWatchedItem.episodeNumber
-            else -> 1
-        }
+            val targetSeason = when {
+                parsedFromTitle != null -> parsedFromTitle.first
+                lastWatchedItem.seasonNumber > 0 -> lastWatchedItem.seasonNumber
+                else -> 1
+            }
 
-        // 3. Resolve matched episode object
-        val matchedEpisode = (if (parsedFromTitle != null) {
-            allEpisodes.firstOrNull { it.seasonNumber == targetSeason && it.episodeNumber == targetEpisode }
-        } else null)
-            ?: allEpisodes.firstOrNull { it.id == lastWatchedItem.mediaId || it.id == lastWatchedItem.fileId }
-            ?: allEpisodes.firstOrNull { it.seasonNumber == targetSeason && it.episodeNumber == targetEpisode }
-            ?: allEpisodes.firstOrNull() ?: return@combine null
+            val targetEpisode = when {
+                parsedFromTitle != null -> parsedFromTitle.second
+                lastWatchedItem.episodeNumber > 0 -> lastWatchedItem.episodeNumber
+                else -> 1
+            }
 
-        val resolvedSeasonNumber = if (targetSeason > 0) targetSeason else matchedEpisode.seasonNumber
-        val resolvedEpisodeNumber = if (targetEpisode > 0) targetEpisode else matchedEpisode.episodeNumber
+            // 3. Resolve matched episode object
+            val matchedEpisode = (if (parsedFromTitle != null) {
+                allEpisodes.firstOrNull { it.seasonNumber == targetSeason && it.episodeNumber == targetEpisode }
+            } else null)
+                ?: allEpisodes.firstOrNull { it.id == lastWatchedItem.mediaId || it.id == lastWatchedItem.fileId }
+                ?: allEpisodes.firstOrNull { it.seasonNumber == targetSeason && it.episodeNumber == targetEpisode }
+                ?: allEpisodes.firstOrNull() ?: return@combine null
 
-        // 4. TVMaze online resolution for official title & high-res still image
-        val onlineMeta = OnlineMetadataResolver.resolveEpisodeMetadata(
-            seriesName = parentSeries.title,
-            seasonNumber = resolvedSeasonNumber,
-            episodeNumber = resolvedEpisodeNumber
-        )
+            val resolvedSeasonNumber = if (targetSeason > 0) targetSeason else matchedEpisode.seasonNumber
+            val resolvedEpisodeNumber = if (targetEpisode > 0) targetEpisode else matchedEpisode.episodeNumber
 
-        // 5. Clean Title: Use TVMaze official name ("The Crimson Ticket") or sanitize raw title
-        val resolvedTitle = when {
-            !onlineMeta?.officialTitle.isNullOrBlank() -> onlineMeta!!.officialTitle
-            else -> OnlineMetadataResolver.sanitizeEpisodeTitle(
-                rawTitle = lastWatchedItem.title.ifBlank { matchedEpisode.displayTitle },
+            // 4. TVMaze online resolution for official title & high-res still image
+            val onlineMeta = OnlineMetadataResolver.resolveEpisodeMetadata(
                 seriesName = parentSeries.title,
-                seasonNum = resolvedSeasonNumber,
-                epNum = resolvedEpisodeNumber
+                seasonNumber = resolvedSeasonNumber,
+                episodeNumber = resolvedEpisodeNumber
+            )
+
+            // 5. Clean Title: Use TVMaze official name ("The Crimson Ticket") or sanitize raw title
+            val resolvedTitle = when {
+                !onlineMeta?.officialTitle.isNullOrBlank() -> onlineMeta!!.officialTitle
+                else -> OnlineMetadataResolver.sanitizeEpisodeTitle(
+                    rawTitle = lastWatchedItem.title.ifBlank { matchedEpisode.displayTitle },
+                    seriesName = parentSeries.title,
+                    seasonNum = resolvedSeasonNumber,
+                    epNum = resolvedEpisodeNumber
+                )
+            }
+
+            // 6. Thumbnail Resolution: TVMaze episode screenshot -> Series backdrop -> Series poster -> Drive fallback
+            val backdrop = parentSeries.backdropUrl.orEmpty()
+            val poster = parentSeries.posterUrl.orEmpty()
+            val resolvedThumbnail = when {
+                !onlineMeta?.thumbnailUrl.isNullOrBlank() -> onlineMeta!!.thumbnailUrl
+                backdrop.isNotBlank() -> backdrop
+                poster.isNotBlank() -> poster
+                matchedEpisode.thumbnailUrl.isNotBlank() && !matchedEpisode.thumbnailUrl.contains("drive.google.com") -> matchedEpisode.thumbnailUrl
+                else -> matchedEpisode.thumbnailUrl
+            }
+
+            // 7. Watch progress calculation
+            val effectiveDuration = when {
+                lastWatchedItem.durationMs > 0L -> lastWatchedItem.durationMs
+                matchedEpisode.durationMs > 0L -> matchedEpisode.durationMs
+                else -> 0L
+            }
+
+            val fraction = if (effectiveDuration > 0L) {
+                (lastWatchedItem.positionMs.toFloat() / effectiveDuration.toFloat()).coerceIn(0f, 1f)
+            } else {
+                lastWatchedItem.progressFraction.coerceIn(0f, 1f)
+            }
+
+            ContinueWatchingDisplayData(
+                mediaId = matchedEpisode.id,
+                seriesId = parentSeries.id,
+                seriesTitle = parentSeries.title,
+                seasonNumber = resolvedSeasonNumber,
+                episodeNumber = resolvedEpisodeNumber,
+                episodeTitle = resolvedTitle,
+                displayThumbnailUrl = resolvedThumbnail,
+                progressFraction = fraction,
+                currentPositionMs = lastWatchedItem.positionMs,
+                durationMs = effectiveDuration
+            )
+        } else {
+            // Movie Handling
+            val movie = allMovies.firstOrNull { it.id == lastWatchedItem.mediaId || it.id == lastWatchedItem.fileId }
+            val effectiveDuration = when {
+                lastWatchedItem.durationMs > 0L -> lastWatchedItem.durationMs
+                movie != null && movie.durationMs > 0L -> movie.durationMs
+                else -> 0L
+            }
+            val fraction = if (effectiveDuration > 0L) {
+                (lastWatchedItem.positionMs.toFloat() / effectiveDuration.toFloat()).coerceIn(0f, 1f)
+            } else {
+                lastWatchedItem.progressFraction.coerceIn(0f, 1f)
+            }
+
+            ContinueWatchingDisplayData(
+                mediaId = lastWatchedItem.mediaId.ifBlank { lastWatchedItem.fileId },
+                seriesId = "",
+                seriesTitle = movie?.title ?: lastWatchedItem.seriesTitle ?: lastWatchedItem.title,
+                seasonNumber = 0,
+                episodeNumber = 0,
+                episodeTitle = movie?.title ?: lastWatchedItem.title,
+                displayThumbnailUrl = movie?.thumbnailUrl.orEmpty().ifBlank { lastWatchedItem.thumbnailUrl.orEmpty() },
+                progressFraction = fraction,
+                currentPositionMs = lastWatchedItem.positionMs,
+                durationMs = effectiveDuration
             )
         }
-
-        // 6. Thumbnail Resolution: TVMaze episode screenshot -> Series backdrop -> Series poster -> Drive fallback
-        val backdrop = parentSeries.backdropUrl.orEmpty()
-        val poster = parentSeries.posterUrl.orEmpty()
-        val resolvedThumbnail = when {
-            !onlineMeta?.thumbnailUrl.isNullOrBlank() -> onlineMeta!!.thumbnailUrl
-            backdrop.isNotBlank() -> backdrop
-            poster.isNotBlank() -> poster
-            matchedEpisode.thumbnailUrl.isNotBlank() && !matchedEpisode.thumbnailUrl.contains("drive.google.com") -> matchedEpisode.thumbnailUrl
-            else -> matchedEpisode.thumbnailUrl
-        }
-
-        // 7. Watch progress calculation
-        val effectiveDuration = when {
-            lastWatchedItem.durationMs > 0L -> lastWatchedItem.durationMs
-            matchedEpisode.durationMs > 0L -> matchedEpisode.durationMs
-            else -> 0L
-        }
-
-        val fraction = if (effectiveDuration > 0L) {
-            (lastWatchedItem.positionMs.toFloat() / effectiveDuration.toFloat()).coerceIn(0f, 1f)
-        } else {
-            lastWatchedItem.progressFraction.coerceIn(0f, 1f)
-        }
-
-        ContinueWatchingDisplayData(
-            mediaId = matchedEpisode.id,
-            seriesId = parentSeries.id,
-            seriesTitle = parentSeries.title,
-            seasonNumber = resolvedSeasonNumber,
-            episodeNumber = resolvedEpisodeNumber,
-            episodeTitle = resolvedTitle,
-            displayThumbnailUrl = resolvedThumbnail,
-            progressFraction = fraction,
-            currentPositionMs = lastWatchedItem.positionMs,
-            durationMs = effectiveDuration
-        )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
     val continueWatchingState: StateFlow<ContinueWatchingData?> = continueWatchingDisplayState
@@ -960,7 +1012,6 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
     val lastWatchedEpisodeState: StateFlow<Episode?> = continueWatchingState
         .map { it?.episode }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
     val resolvedContinueWatching: StateFlow<ContinueWatchingItem?> = combine(
         playbackHistoryManager.lastWatchedFlow,
@@ -968,6 +1019,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         moviesList
     ) { lastWatched, allSeries, allMovies ->
         if (lastWatched == null) return@combine null
+        if (lastWatched.progressFraction >= 0.95f) return@combine null
 
         val effectiveSeries = allSeries.ifEmpty { loadCatalogFromDisk(getApplication()) }
 

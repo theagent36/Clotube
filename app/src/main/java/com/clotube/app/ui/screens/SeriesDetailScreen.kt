@@ -22,6 +22,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -58,16 +59,33 @@ import com.clotube.app.ui.components.EpisodeItemRow
 import com.clotube.app.ui.components.SeasonTabChip
 import com.clotube.app.ui.components.shimmerEffect
 import com.clotube.app.viewmodel.VideoViewModel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+
+private val org.videolan.libvlc.MediaPlayer.currentPosition: Long get() = this.time
+private val org.videolan.libvlc.MediaPlayer.duration: Long get() = this.length
+
+private fun org.videolan.libvlc.MediaPlayer.clearMediaItems() {}
+private fun org.videolan.libvlc.MediaPlayer.setMediaItem(mediaItem: Any?, seekPositionMs: Long = 0L) {
+    if (seekPositionMs > 0L) {
+        try { this.time = seekPositionMs } catch (_: Exception) {}
+    }
+}
+private fun org.videolan.libvlc.MediaPlayer.prepare() {}
+private var org.videolan.libvlc.MediaPlayer.playWhenReady: Boolean
+    get() = this.isPlaying
+    set(_) {}
 
 @OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
 @Composable
 fun SeriesDetailScreen(
     series: Series,
     viewModel: VideoViewModel,
-    activePlayingEpisode: Episode?,
+    activePlayingEpisode: Episode? = null,
     initialPositionMs: Long = 0L,
-    onEpisodeSelected: (Episode) -> Unit,
+    autoPlayEpisodeId: String? = null,
+    onEpisodeSelected: (Episode) -> Unit = {},
+    onEpisodeSelectedWithPosition: (Episode, Long) -> Unit = { ep, _ -> onEpisodeSelected(ep) },
     onBackClick: () -> Unit,
     onClosePlayer: () -> Unit = onBackClick,
     isLoadingEpisodes: Boolean = false,
@@ -77,16 +95,98 @@ fun SeriesDetailScreen(
     val view = LocalView.current
     val activity = context as? Activity
     val configuration = LocalConfiguration.current
+    val density = LocalDensity.current
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
     val coroutineScope = rememberCoroutineScope()
     val listState = rememberLazyListState()
+
+    val playbackHistoryManager = viewModel.playbackHistoryManager
+    val player = viewModel.mediaPlayer
+
+    var activeEpisode by remember(series.id) {
+        mutableStateOf<Episode?>(activePlayingEpisode)
+    }
+    var initialResumePositionMs by remember(series.id) {
+        mutableLongStateOf(initialPositionMs)
+    }
+    var targetResumeEpisode by remember(series.id) { mutableStateOf<Episode?>(null) }
+    var targetResumePosMs by remember(series.id) { mutableLongStateOf(initialPositionMs) }
+    var targetDurationMs by remember(series.id) { mutableLongStateOf(0L) }
+
+    LaunchedEffect(series.id, series.seasons) {
+        val allEps = series.seasons.flatMap { it.episodes }
+        val lastWatched = viewModel.getLastWatchedEpisode(series) ?: allEps.firstOrNull()
+        if (lastWatched != null) {
+            targetResumeEpisode = lastWatched
+            val pos = viewModel.playbackHistoryManager.getResumePosition(lastWatched.id)
+            targetResumePosMs = if (initialPositionMs > 0L && targetResumeEpisode?.id == autoPlayEpisodeId) initialPositionMs else pos
+            val savedProgress = viewModel.playbackHistoryManager.getProgressSync(lastWatched.id)
+            targetDurationMs = when {
+                lastWatched.durationMs > 0L -> lastWatched.durationMs
+                savedProgress != null && savedProgress.durationMs > 0L -> savedProgress.durationMs
+                else -> 0L
+            }
+        }
+    }
+
+    var hasHandledAutoPlay by remember(series.id, autoPlayEpisodeId) {
+        mutableStateOf(false)
+    }
+
+    LaunchedEffect(activePlayingEpisode) {
+        if (activePlayingEpisode != null && activePlayingEpisode != activeEpisode) {
+            activeEpisode = activePlayingEpisode
+        }
+    }
+
+    fun playEpisode(episode: Episode, seekPositionMs: Long = 0L) {
+        initialResumePositionMs = seekPositionMs
+        targetResumePosMs = seekPositionMs
+        targetResumeEpisode = episode
+        targetDurationMs = episode.durationMs
+        activeEpisode = episode
+        try {
+            player.stop()
+            player.clearMediaItems()
+            player.setMediaItem(episode, seekPositionMs)
+            player.prepare()
+            player.playWhenReady = true
+            player.play()
+        } catch (_: Exception) {}
+        onEpisodeSelectedWithPosition(episode, seekPositionMs)
+    }
+
+    LaunchedEffect(player.isPlaying, activeEpisode) {
+        val ep = activeEpisode ?: return@LaunchedEffect
+        while (player.isPlaying) {
+            val pos = player.currentPosition
+            val dur = player.duration
+
+            // Guard: Only commit progress once playback has advanced past 3 seconds and duration is valid
+            if (pos > 3000L && dur > 0L && dur != androidx.media3.common.C.TIME_UNSET) {
+                playbackHistoryManager.saveSeriesPlaybackState(
+                    seriesId = series.id,
+                    seriesTitle = series.title,
+                    episodeId = ep.id,
+                    episodeTitle = ep.displayTitle,
+                    seasonNumber = ep.seasonNumber,
+                    episodeNumber = ep.episodeNumber,
+                    positionMs = pos,
+                    durationMs = dur
+                )
+            }
+            kotlinx.coroutines.delay(4000L)
+        }
+    }
 
     // Hardware BackHandler: If in landscape, revert to portrait without closing player; else close player or navigate back
     BackHandler {
         if (isLandscape) {
             activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-        } else if (activePlayingEpisode != null) {
+        } else if (activeEpisode != null) {
             viewModel.clearActiveEpisode()
+            activeEpisode = null
+            initialResumePositionMs = 0L
             onClosePlayer()
         } else {
             onBackClick()
@@ -105,6 +205,79 @@ fun SeriesDetailScreen(
         mutableIntStateOf(defaultSeasonNumber)
     }
 
+    val allSeriesEpisodes = remember(series) {
+        series.seasons.flatMap { it.episodes }
+    }
+
+    var lastScrolledEpisodeId by rememberSaveable(series.id) { mutableStateOf<String?>(null) }
+    val seasonRowState = rememberLazyListState()
+
+    LaunchedEffect(currentSeasonNumber) {
+        val seasonIdx = series.seasons.indexOfFirst { it.seasonNumber == currentSeasonNumber }
+        if (seasonIdx != -1) {
+            seasonRowState.animateScrollToItem(seasonIdx)
+        }
+    }
+
+    val ongoingEpisode = remember(activeEpisode, activePlayingEpisode, autoPlayEpisodeId, series) {
+        activeEpisode
+            ?: activePlayingEpisode
+            ?: allSeriesEpisodes.firstOrNull { it.id == autoPlayEpisodeId }
+    }
+
+    LaunchedEffect(series.id, ongoingEpisode?.id) {
+        val targetEpisode = ongoingEpisode 
+            ?: viewModel.getLastWatchedEpisode(series) 
+            ?: allSeriesEpisodes.firstOrNull()
+            
+        if (targetEpisode == null) return@LaunchedEffect
+
+        // 1. Align active season tab with the target episode
+        if (currentSeasonNumber != targetEpisode.seasonNumber) {
+            currentSeasonNumber = targetEpisode.seasonNumber
+        }
+
+        // 2. Prevent redundant auto-scrolls for the same episode
+        if (lastScrolledEpisodeId == targetEpisode.id) return@LaunchedEffect
+
+        // 3. Wait for the season episodes to compose in layout
+        snapshotFlow {
+            val season = series.seasons.firstOrNull { it.seasonNumber == currentSeasonNumber }
+            val episodes = season?.episodes ?: emptyList()
+            val epIdx = episodes.indexOfFirst { it.id == targetEpisode.id }
+            episodes.isNotEmpty() to epIdx
+        }.collect { (hasEpisodes, epIndex) ->
+            if (hasEpisodes && epIndex != -1) {
+                // Layout indices:
+                // Index 0: series_metadata_section (Title & Up Next card)
+                // Index 1: sticky_season_selector_bar (Sticky season tabs)
+                // Index 2 + epIndex: Target episode card
+
+                // Small delay to allow Compose layout measurement to complete
+                kotlinx.coroutines.delay(120L)
+
+                if (epIndex <= 0) {
+                    // For Episode 1, scroll to the sticky header so Episode 1 docks directly beneath it
+                    listState.animateScrollToItem(
+                        index = 1,
+                        scrollOffset = 0
+                    )
+                } else {
+                    // For Episode 2+, target the preceding item with a positive offset.
+                    // This scrolls the previous card up behind the sticky bar, placing the target episode
+                    // completely in view right below the season bar with zero clipping.
+                    val precedingCardOffsetPx = with(density) { 34.dp.roundToPx() }
+                    listState.animateScrollToItem(
+                        index = 1 + epIndex,
+                        scrollOffset = precedingCardOffsetPx
+                    )
+                }
+
+                lastScrolledEpisodeId = targetEpisode.id
+            }
+        }
+    }
+
     LaunchedEffect(series.id, series.seasons) {
         if (series.seasons.firstOrNull { it.seasonNumber == currentSeasonNumber }?.episodes.isNullOrEmpty()) {
             val seasonWithEpisodes = series.seasons.firstOrNull { it.episodes.isNotEmpty() }?.seasonNumber
@@ -114,10 +287,37 @@ fun SeriesDetailScreen(
         }
     }
 
-    LaunchedEffect(activePlayingEpisode?.seasonNumber) {
-        val epSeason = activePlayingEpisode?.seasonNumber
+    LaunchedEffect(activeEpisode?.seasonNumber) {
+        val epSeason = activeEpisode?.seasonNumber
         if (epSeason != null && epSeason != currentSeasonNumber) {
             currentSeasonNumber = epSeason
+        }
+    }
+
+    // Trigger auto-play on entry if coming from Continue Watching
+    LaunchedEffect(series.id, series.seasons, autoPlayEpisodeId) {
+        if (!hasHandledAutoPlay && !autoPlayEpisodeId.isNullOrBlank()) {
+            val allEpisodes = series.seasons.flatMap { it.episodes }
+            val targetEpisode = allEpisodes.firstOrNull { it.id == autoPlayEpisodeId }
+
+            if (targetEpisode != null) {
+                // 1. Align active season tab with the target episode
+                viewModel.selectedSeasonNumber.value = targetEpisode.seasonNumber
+                currentSeasonNumber = targetEpisode.seasonNumber
+
+                // 2. Resolve resume position from DataStore
+                val resumePos = if (initialResumePositionMs > 0L) {
+                    initialResumePositionMs
+                } else {
+                    viewModel.playbackHistoryManager.getResumePosition(targetEpisode.id)
+                }
+                initialResumePositionMs = resumePos
+
+                // 3. Mount ClotubeVideoPlayer
+                activeEpisode = targetEpisode
+                onEpisodeSelectedWithPosition(targetEpisode, resumePos)
+                hasHandledAutoPlay = true
+            }
         }
     }
 
@@ -133,6 +333,15 @@ fun SeriesDetailScreen(
             val lastWatched = viewModel.getLastWatchedEpisode(series)
             if (lastWatched != null) {
                 lastWatchedEpisode = lastWatched
+                targetResumeEpisode = lastWatched
+                val pos = viewModel.playbackHistoryManager.getResumePosition(lastWatched.id)
+                targetResumePosMs = if (initialPositionMs > 0L && lastWatched.id == autoPlayEpisodeId) initialPositionMs else pos
+                val savedProgress = viewModel.playbackHistoryManager.getProgressSync(lastWatched.id)
+                targetDurationMs = when {
+                    lastWatched.durationMs > 0L -> lastWatched.durationMs
+                    savedProgress != null && savedProgress.durationMs > 0L -> savedProgress.durationMs
+                    else -> 0L
+                }
                 if (currentSeasonNumber != lastWatched.seasonNumber) {
                     currentSeasonNumber = lastWatched.seasonNumber
                 }
@@ -161,7 +370,7 @@ fun SeriesDetailScreen(
     }
 
     val currentEpisodeList = activeSeason?.episodes ?: emptyList()
-    val currentIndex = currentEpisodeList.indexOfFirst { it.id == activePlayingEpisode?.id }
+    val currentIndex = currentEpisodeList.indexOfFirst { it.id == activeEpisode?.id }
 
     val prevEpisode = if (currentIndex > 0) currentEpisodeList[currentIndex - 1] else null
     val nextEpisode = if (currentIndex != -1 && currentIndex < currentEpisodeList.lastIndex) currentEpisodeList[currentIndex + 1] else null
@@ -177,7 +386,7 @@ fun SeriesDetailScreen(
         // ========================================================
         Box(
             modifier = if (isLandscape) {
-                if (activePlayingEpisode != null) {
+                if (activeEpisode != null) {
                     Modifier
                         .fillMaxSize()
                         .background(Color.Black)
@@ -195,9 +404,9 @@ fun SeriesDetailScreen(
                     .background(Color.Black)
             }
         ) {
-            if (activePlayingEpisode != null) {
+            if (activeEpisode != null) {
                 val currentEpisodeList = activeSeason?.episodes ?: emptyList()
-                val currentIndex = currentEpisodeList.indexOfFirst { it.id == activePlayingEpisode.id }
+                val currentIndex = currentEpisodeList.indexOfFirst { it.id == activeEpisode!!.id }
 
                 val prevEpisode = if (currentIndex > 0) currentEpisodeList[currentIndex - 1] else null
                 val nextEpisode = if (currentIndex != -1 && currentIndex < currentEpisodeList.lastIndex) {
@@ -210,67 +419,74 @@ fun SeriesDetailScreen(
                 } else null
 
                 ClotubeVideoPlayer(
-                    episode = activePlayingEpisode,
+                    episode = activeEpisode!!,
                     viewModel = viewModel,
                     seriesId = series.id,
-                    initialPositionMs = initialPositionMs,
+                    initialPositionMs = initialResumePositionMs,
+                    startPositionMs = initialResumePositionMs,
                     nextEpisode = nextEpisode,
-                    onPreviousEpisode = prevEpisode?.let { ep -> { onEpisodeSelected(ep) } },
-                    onNextEpisode = nextEpisode?.let { ep -> { onEpisodeSelected(ep) } },
+                    onPreviousEpisode = prevEpisode?.let { ep ->
+                        {
+                            coroutineScope.launch {
+                                val resumePos = playbackHistoryManager.getResumePosition(ep.id)
+                                playEpisode(ep, seekPositionMs = resumePos)
+                            }
+                        }
+                    },
+                    onNextEpisode = nextEpisode?.let { ep ->
+                        {
+                            coroutineScope.launch {
+                                val resumePos = playbackHistoryManager.getResumePosition(ep.id)
+                                playEpisode(ep, seekPositionMs = resumePos)
+                            }
+                        }
+                    },
                     onClosePlayer = {
                         viewModel.clearActiveEpisode()
+                        activeEpisode = null
+                        initialResumePositionMs = 0L
                         onClosePlayer()
                     },
                     modifier = Modifier.fillMaxSize()
                 )
             } else {
-                Box(
-                    modifier = Modifier.fillMaxSize(),
-                    contentAlignment = Alignment.Center
-                ) {
-                    if (!series.posterUrl.isNullOrBlank()) {
-                        coil.compose.AsyncImage(
-                            model = series.posterUrl,
-                            contentDescription = series.title,
-                            contentScale = androidx.compose.ui.layout.ContentScale.Crop,
-                            modifier = Modifier.fillMaxSize()
-                        )
-                    }
+                val fallbackEp = targetResumeEpisode
+                    ?: upNextEpisode
+                    ?: lastWatchedEpisode
+                    ?: series.seasons.firstOrNull { it.episodes.isNotEmpty() }?.episodes?.firstOrNull()
+                    ?: allSeriesEpisodes.firstOrNull()
 
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(Color(0x66000000))
-                    )
-
-                    IconButton(
-                        onClick = {
-                            val targetEpisode = upNextEpisode ?: lastWatchedEpisode ?: activeSeason?.episodes?.firstOrNull()
-                            if (targetEpisode != null) {
-                                onEpisodeSelected(targetEpisode)
+                if (fallbackEp != null) {
+                    SeriesResumeHeaderCard(
+                        series = series,
+                        episode = fallbackEp,
+                        currentPositionMs = targetResumePosMs,
+                        durationMs = targetDurationMs,
+                        onBackClick = {
+                            view.triggerNavigationHaptic()
+                            if (isLandscape) {
+                                activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                            } else {
+                                onBackClick()
                             }
                         },
-                        modifier = Modifier
-                            .size(60.dp)
-                            .clip(androidx.compose.foundation.shape.CircleShape)
-                            .background(Color(0xCC0E131E))
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.PlayArrow,
-                            contentDescription = "Play Series",
-                            tint = Color.White,
-                            modifier = Modifier.size(36.dp)
-                        )
-                    }
-
-                    Row(
-                        modifier = Modifier
-                            .align(Alignment.TopCenter)
-                            .fillMaxWidth()
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
+                        onResumeClick = { ep, seekPos ->
+                            coroutineScope.launch {
+                                val resumePos = if (seekPos > 0L) seekPos else playbackHistoryManager.getResumePosition(ep.id)
+                                playEpisode(ep, seekPositionMs = resumePos)
+                            }
+                        }
+                    )
+                } else {
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        if (!series.posterUrl.isNullOrBlank()) {
+                            coil.compose.AsyncImage(
+                                model = series.posterUrl,
+                                contentDescription = series.title,
+                                contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        }
                         IconButton(
                             onClick = {
                                 view.triggerNavigationHaptic()
@@ -281,6 +497,7 @@ fun SeriesDetailScreen(
                                 }
                             },
                             modifier = Modifier
+                                .padding(horizontal = 12.dp, vertical = 8.dp)
                                 .size(36.dp)
                                 .clip(RoundedCornerShape(18.dp))
                                 .background(Color(0x80000000))
@@ -292,19 +509,6 @@ fun SeriesDetailScreen(
                                 modifier = Modifier.size(20.dp)
                             )
                         }
-
-                        Box(
-                            modifier = Modifier
-                                .background(Color(0xCC111D2D), RoundedCornerShape(16.dp))
-                                .padding(horizontal = 10.dp, vertical = 4.dp)
-                        ) {
-                            Text(
-                                text = "• OTT DIRECT STREAM",
-                                color = Color(0xFF00E5FF),
-                                fontSize = 10.sp,
-                                fontWeight = FontWeight.Bold
-                            )
-                        }
                     }
                 }
             }
@@ -313,7 +517,7 @@ fun SeriesDetailScreen(
         // ========================================================
         // 2. SCROLLABLE CONTENT WITH PINNED SEASON HEADER
         // ========================================================
-        if (!isLandscape || activePlayingEpisode == null) {
+        if (!isLandscape || activeEpisode == null) {
             var isSeriesRefreshing by remember { mutableStateOf(false) }
             val seriesPullRefreshState = rememberPullToRefreshState()
             val seriesHaptic = LocalHapticFeedback.current
@@ -365,8 +569,8 @@ fun SeriesDetailScreen(
                     contentPadding = PaddingValues(bottom = 96.dp)
                 ) {
 
-            // ITEM 0: Series Title & Genre Header
-            item(key = "series_title_header") {
+            // ITEM 0: series_metadata_section (Title, genre, watch card)
+            item(key = "series_metadata_section") {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -416,10 +620,7 @@ fun SeriesDetailScreen(
                         }
                     }
                 }
-            }
 
-            // ITEM 1: "Up Next" Watch Card
-            item(key = "up_next_watch_card") {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -484,7 +685,12 @@ fun SeriesDetailScreen(
                                 }
 
                                 IconButton(
-                                    onClick = { onEpisodeSelected(upNextToDisplay) },
+                                    onClick = {
+                                        coroutineScope.launch {
+                                            val resumePos = playbackHistoryManager.getResumePosition(upNextToDisplay.id)
+                                            playEpisode(upNextToDisplay, seekPositionMs = resumePos)
+                                        }
+                                    },
                                     modifier = Modifier
                                         .size(40.dp)
                                         .clip(androidx.compose.foundation.shape.CircleShape)
@@ -505,8 +711,8 @@ fun SeriesDetailScreen(
                 }
             }
 
-            // ITEM 2: Season Selector Row
-            item(key = "season_selector_row") {
+            // ITEM 1: sticky_season_selector_bar (Season tabs)
+            stickyHeader(key = "sticky_season_selector_bar") {
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
                     color = Color(0xFF07090E),
@@ -517,6 +723,7 @@ fun SeriesDetailScreen(
                             SeasonSelectorRowSkeleton()
                         } else {
                             LazyRow(
+                                state = seasonRowState,
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .padding(horizontal = 16.dp, vertical = 10.dp),
@@ -595,13 +802,19 @@ fun SeriesDetailScreen(
                     }
                     val isWatchedFlow by viewModel.playbackHistoryManager.isEpisodeWatched(episode.id).collectAsState(initial = false)
                     val isWatched = isWatchedLocal || isWatchedFlow
+                    val isOngoing = (activeEpisode?.id == episode.id)
 
                     EpisodeItemRow(
                         episode = episode,
                         seriesId = series.id,
                         seriesTitle = series.title,
-                        isPlayingThis = (activePlayingEpisode?.id == episode.id),
-                        onEpisodeClick = { onEpisodeSelected(episode) },
+                        isPlayingThis = isOngoing,
+                        onEpisodeClick = {
+                            coroutineScope.launch {
+                                val resumePos = playbackHistoryManager.getResumePosition(episode.id)
+                                playEpisode(episode, seekPositionMs = resumePos)
+                            }
+                        },
                         onStartDownload = {
                             coroutineScope.launch {
                                 val token = viewModel.getValidAccessToken()
@@ -640,6 +853,26 @@ fun SeriesDetailScreen(
 }
 
 /**
+ * Convenience overload for direct series + autoPlayEpisodeId invocation.
+ */
+@Composable
+fun SeriesDetailScreen(
+    series: Series,
+    viewModel: VideoViewModel,
+    autoPlayEpisodeId: String? = null,
+    onBackClick: () -> Unit,
+    modifier: Modifier = Modifier
+) = SeriesDetailScreen(
+    series = series,
+    viewModel = viewModel,
+    activePlayingEpisode = null,
+    initialPositionMs = 0L,
+    autoPlayEpisodeId = autoPlayEpisodeId,
+    onBackClick = onBackClick,
+    modifier = modifier
+)
+
+/**
  * Backward-compatible navigation overload for NavHost entry.
  */
 @Composable
@@ -647,6 +880,7 @@ fun SeriesDetailScreen(
     seriesId: String,
     initialEpisodeId: String? = null,
     initialPositionMs: Long = 0L,
+    autoPlayEpisodeId: String? = null,
     initialSeries: TvSeries? = null,
     accessToken: String? = null,
     onNavigateBack: () -> Unit,
@@ -654,16 +888,17 @@ fun SeriesDetailScreen(
     onRegisterActivePlayer: ((org.videolan.libvlc.MediaPlayer?) -> Unit)? = null,
     viewModel: VideoViewModel = androidx.lifecycle.viewmodel.compose.viewModel()
 ) {
+    val effectiveAutoPlayId = autoPlayEpisodeId ?: initialEpisodeId
     val context = androidx.compose.ui.platform.LocalContext.current
     val uiState by viewModel.uiState.collectAsState()
     val seriesList by viewModel.seriesList.collectAsState()
 
-    val cachedSeries = remember(seriesId, initialEpisodeId, seriesList, uiState.tvSeriesList) {
+    val cachedSeries = remember(seriesId, effectiveAutoPlayId, seriesList, uiState.tvSeriesList) {
         val diskCatalog = com.clotube.app.viewmodel.loadCatalogFromDisk(context)
-        val byEpId = if (!initialEpisodeId.isNullOrBlank()) {
-            seriesList.find { s -> s.seasons.any { it.episodes.any { ep -> ep.id == initialEpisodeId } } }
-                ?: uiState.tvSeriesList.find { s -> s.seasons.any { it.episodes.any { ep -> ep.id == initialEpisodeId } } }
-                ?: diskCatalog.find { s -> s.seasons.any { it.episodes.any { ep -> ep.id == initialEpisodeId } } }
+        val byEpId = if (!effectiveAutoPlayId.isNullOrBlank()) {
+            seriesList.find { s -> s.seasons.any { it.episodes.any { ep -> ep.id == effectiveAutoPlayId } } }
+                ?: uiState.tvSeriesList.find { s -> s.seasons.any { it.episodes.any { ep -> ep.id == effectiveAutoPlayId } } }
+                ?: diskCatalog.find { s -> s.seasons.any { it.episodes.any { ep -> ep.id == effectiveAutoPlayId } } }
         } else null
 
         byEpId
@@ -704,7 +939,7 @@ fun SeriesDetailScreen(
         }
     }
 
-    LaunchedEffect(seriesId, initialEpisodeId) {
+    LaunchedEffect(seriesId, effectiveAutoPlayId) {
         val needsFetch = currentSeries == null ||
             currentSeries?.seasons.isNullOrEmpty() ||
             currentSeries?.seasons?.all { it.episodes.isEmpty() } == true
@@ -716,7 +951,7 @@ fun SeriesDetailScreen(
                     val authRepo = com.clotube.app.auth.GoogleAuthRepository(context)
                     val seriesRepo = com.clotube.app.data.SeriesRepository(authRepo)
                     val effectiveId = if (seriesId.isNotBlank()) seriesId else {
-                        viewModel.getSeriesIdForEpisode(initialEpisodeId.orEmpty())
+                        viewModel.getSeriesIdForEpisode(effectiveAutoPlayId.orEmpty())
                             ?: viewModel.getDefaultSeriesId()
                             ?: viewModel.resolveSeriesFolderId()
                             ?: ""
@@ -742,8 +977,8 @@ fun SeriesDetailScreen(
         }
     }
 
-    val fallbackSeries = remember(initialEpisodeId, seriesId, uiState.lastWatchedMedia) {
-        if (!initialEpisodeId.isNullOrBlank()) {
+    val fallbackSeries = remember(effectiveAutoPlayId, seriesId, uiState.lastWatchedMedia) {
+        if (!effectiveAutoPlayId.isNullOrBlank()) {
             val lastWatched = uiState.lastWatchedMedia
             val sNum = lastWatched?.seasonNumber?.coerceAtLeast(1) ?: 1
             val eNum = lastWatched?.episodeNumber?.coerceAtLeast(1) ?: 1
@@ -754,7 +989,7 @@ fun SeriesDetailScreen(
                 String.format(java.util.Locale.US, "%02d:%02d", (durMs / 1000) / 60, (durMs / 1000) % 60)
             } else ""
             val fallbackEp = Episode(
-                id = initialEpisodeId,
+                id = effectiveAutoPlayId,
                 seriesTitle = sTitle,
                 displayTitle = epTitle,
                 seasonNumber = sNum,
@@ -780,21 +1015,25 @@ fun SeriesDetailScreen(
 
     val targetSeries = currentSeries ?: cachedSeries ?: fallbackSeries
 
-    var activePlayingEpisode by rememberSaveable(seriesId, initialEpisodeId) {
+    var activePlayingEpisode by rememberSaveable(seriesId, effectiveAutoPlayId) {
         mutableStateOf<Episode?>(
-            if (!initialEpisodeId.isNullOrBlank() && targetSeries != null) {
-                targetSeries.seasons.flatMap { it.episodes }.find { it.id == initialEpisodeId }
+            if (!effectiveAutoPlayId.isNullOrBlank() && targetSeries != null) {
+                targetSeries.seasons.flatMap { it.episodes }.find { it.id == effectiveAutoPlayId }
             } else null
         )
     }
 
-    LaunchedEffect(targetSeries, initialEpisodeId) {
-        if (activePlayingEpisode == null && !initialEpisodeId.isNullOrBlank() && targetSeries != null) {
-            val found = targetSeries.seasons.flatMap { it.episodes }.find { it.id == initialEpisodeId }
+    LaunchedEffect(targetSeries, effectiveAutoPlayId) {
+        if (activePlayingEpisode == null && !effectiveAutoPlayId.isNullOrBlank() && targetSeries != null) {
+            val found = targetSeries.seasons.flatMap { it.episodes }.find { it.id == effectiveAutoPlayId }
             if (found != null) {
                 activePlayingEpisode = found
             }
         }
+    }
+
+    var currentInitialPositionMs by rememberSaveable(seriesId, effectiveAutoPlayId) {
+        mutableLongStateOf(if (effectiveAutoPlayId != null) initialPositionMs else 0L)
     }
 
     if (targetSeries != null) {
@@ -802,8 +1041,16 @@ fun SeriesDetailScreen(
             series = targetSeries,
             viewModel = viewModel,
             activePlayingEpisode = activePlayingEpisode,
-            initialPositionMs = if (initialEpisodeId != null && activePlayingEpisode?.id == initialEpisodeId) initialPositionMs else 0L,
+            initialPositionMs = currentInitialPositionMs,
+            autoPlayEpisodeId = effectiveAutoPlayId,
             onEpisodeSelected = { ep ->
+                currentInitialPositionMs = 0L
+                viewModel.selectEpisode(ep)
+                activePlayingEpisode = ep
+                onRegisterActivePlayer?.invoke(viewModel.mediaPlayer)
+            },
+            onEpisodeSelectedWithPosition = { ep, seekPos ->
+                currentInitialPositionMs = seekPos
                 viewModel.selectEpisode(ep)
                 activePlayingEpisode = ep
                 onRegisterActivePlayer?.invoke(viewModel.mediaPlayer)
