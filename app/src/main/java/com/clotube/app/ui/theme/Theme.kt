@@ -10,22 +10,29 @@ import androidx.compose.ui.platform.LocalView
 import androidx.core.view.WindowCompat
 
 val DarkCinemaColorScheme = darkColorScheme(
-    primary = PrimaryAccent,
-    onPrimary = TextHighEmphasis,
+    primary = AccentBlue,
+    onPrimary = TextPrimary,
     primaryContainer = SurfaceElevated,
-    onPrimaryContainer = PrimaryAccent,
-    secondary = SecondaryAccent,
-    onSecondary = BackgroundDeep,
+    onPrimaryContainer = AccentPrimary,
+    secondary = AccentBlue,
+    onSecondary = CanvasDeep,
     secondaryContainer = SurfaceElevated,
-    onSecondaryContainer = SecondaryAccent,
-    background = BackgroundDeep,
-    onBackground = TextHighEmphasis,
+    onSecondaryContainer = AccentPrimary,
+    tertiary = AccentPrimary,
+    onTertiary = CanvasDeep,
+    background = CanvasDeep,
+    onBackground = TextPrimary,
     surface = SurfaceDefault,
-    onSurface = TextHighEmphasis,
+    onSurface = TextPrimary,
     surfaceVariant = SurfaceElevated,
-    onSurfaceVariant = TextMuted,
-    outline = BorderOutline,
-    outlineVariant = BorderOutline
+    onSurfaceVariant = TextSecondary,
+    surfaceContainer = SurfaceDefault,
+    surfaceContainerHigh = SurfaceElevated,
+    surfaceContainerHighest = SurfaceElevated,
+    surfaceContainerLow = CanvasDeep,
+    surfaceContainerLowest = CanvasDeep,
+    outline = SurfaceBorder,
+    outlineVariant = SurfaceBorder
 )
 
 @Composable
@@ -38,8 +45,8 @@ fun ClotubeTheme(
         SideEffect {
             val window = (view.context as? Activity)?.window
             if (window != null) {
-                window.statusBarColor = BackgroundDeep.toArgb()
-                window.navigationBarColor = BackgroundDeep.toArgb()
+                window.statusBarColor = CanvasDeep.toArgb()
+                window.navigationBarColor = CanvasDeep.toArgb()
                 val insetsController = WindowCompat.getInsetsController(window, view)
                 insetsController.isAppearanceLightStatusBars = false
                 insetsController.isAppearanceLightNavigationBars = false

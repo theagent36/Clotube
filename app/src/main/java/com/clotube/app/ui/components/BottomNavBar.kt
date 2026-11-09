@@ -91,47 +91,11 @@ fun BottomNavBar(
     modifier: Modifier = Modifier,
     tabs: List<BottomNavTabItem> = DefaultNavTabs
 ) {
-    val view = LocalView.current
-
-    Box(
+    ClassyBottomBar(
+        selectedTab = selectedTab,
+        onTabSelected = onTabSelected,
         modifier = modifier
-            .fillMaxWidth()
-            .background(Color.Transparent)
-            .navigationBarsPadding()
-            .padding(start = 24.dp, end = 24.dp, bottom = 16.dp),
-        contentAlignment = Alignment.Center
-    ) {
-        Surface(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(64.dp),
-            shape = RoundedCornerShape(32.dp),
-            color = Color(0xFF161A26), // Cinema dark surface
-            border = BorderStroke(1.dp, Color(0xFF2A3142)), // Subtle outline
-            shadowElevation = 12.dp,
-            tonalElevation = 4.dp
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(horizontal = 8.dp),
-                horizontalArrangement = Arrangement.SpaceEvenly,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                tabs.forEach { navItem ->
-                    val isSelected = selectedTab == navItem.tab
-                    BottomNavItem(
-                        item = navItem,
-                        isSelected = isSelected,
-                        onClick = {
-                            view.triggerTabTickHaptic()
-                            onTabSelected(navItem.tab)
-                        }
-                    )
-                }
-            }
-        }
-    }
+    )
 }
 
 /**

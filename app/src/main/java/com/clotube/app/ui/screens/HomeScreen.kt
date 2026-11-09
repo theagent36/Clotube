@@ -116,6 +116,7 @@ import com.clotube.app.model.VideoItem
 import com.clotube.app.model.ContinueWatchingItem
 import com.clotube.app.player.DriveMediaSourceFactory
 import com.clotube.app.ui.components.BottomNavBar
+import com.clotube.app.ui.components.ClassyBottomBar
 import com.clotube.app.ui.components.DriveFolderPickerDialog
 import com.clotube.app.ui.components.GoogleAccountDialog
 import kotlinx.coroutines.launch
@@ -418,7 +419,7 @@ fun HomeScreen(
             }
         },
         bottomBar = {
-            BottomNavBar(
+            ClassyBottomBar(
                 selectedTab = uiState.currentTab,
                 onTabSelected = { tab ->
                     if (tab == NavigationTab.SETTINGS) {
@@ -2477,58 +2478,10 @@ fun HomeScreen(
         // ========================================================
         // 4. FLOATING BOTTOM NAVIGATION BAR
         // ========================================================
-        Surface(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .navigationBarsPadding()
-                .padding(bottom = 12.dp)
-                .clip(RoundedCornerShape(32.dp)),
-            shape = RoundedCornerShape(32.dp),
-            color = Color(0xF20D1424),
-            border = BorderStroke(1.dp, Color(0xFF1E2A3E)),
-            shadowElevation = 8.dp
-        ) {
-            Row(
-                modifier = Modifier.padding(horizontal = 20.dp, vertical = 6.dp),
-                horizontalArrangement = Arrangement.spacedBy(28.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                HomeNavigationTab.values().forEach { tab ->
-                    val isSelected = currentNavTab == tab
-
-                    Column(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(16.dp))
-                            .clickable { currentNavTab = tab }
-                            .padding(horizontal = 12.dp, vertical = 4.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(14.dp))
-                                .background(if (isSelected) Color(0xFF1976D2) else Color.Transparent)
-                                .padding(horizontal = 14.dp, vertical = 4.dp),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                imageVector = tab.icon,
-                                contentDescription = tab.title,
-                                tint = if (isSelected) Color.White else Color(0xFF6B7A90),
-                                modifier = Modifier.size(20.dp)
-                            )
-                        }
-
-                        Spacer(modifier = Modifier.height(2.dp))
-
-                        Text(
-                            text = tab.title,
-                            color = if (isSelected) Color.White else Color(0xFF6B7A90),
-                            fontSize = 10.sp,
-                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium
-                        )
-                    }
-                }
-            }
-        }
+        ClassyBottomBar(
+            selectedTab = currentNavTab,
+            onTabSelected = { currentNavTab = it },
+            modifier = Modifier.align(Alignment.BottomCenter)
+        )
     }
 }
