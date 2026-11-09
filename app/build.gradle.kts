@@ -74,13 +74,11 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = true
-            isShrinkResources = true
+            // Keep code and resources 1:1 identical to debug build to prevent any runtime breakage
+            isMinifyEnabled = false
+            isShrinkResources = false
             isDebuggable = false
-            proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro"
-            )
+
             signingConfig = signingConfigs.getByName("release")
         }
         debug {
