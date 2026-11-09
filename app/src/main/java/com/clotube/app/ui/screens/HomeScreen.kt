@@ -609,7 +609,13 @@ fun HomeScreen(
                                     ) { movie ->
                                         MovieCard(
                                             movie = movie,
-                                            onClick = { viewModel.openInspector(movie) },
+                                            onClick = {
+                                                if (onPlayMovie != null) {
+                                                    onPlayMovie(movie.id)
+                                                } else {
+                                                    onVideoSelected(movie)
+                                                }
+                                            },
                                             modifier = Modifier.fillMaxWidth()
                                         )
                                     }
@@ -725,13 +731,18 @@ fun HomeScreen(
                                                 series = heroSeries,
                                                 continueWatching = null,
                                                 lastWatched = null,
-                                                onWatchMovie = { heroMovie?.let { onVideoSelected(it) } },
+                                                onWatchMovie = {
+                                                    heroMovie?.let {
+                                                        if (onPlayMovie != null) onPlayMovie(it.id) else onVideoSelected(it)
+                                                    }
+                                                },
                                                 onWatchSeries = { heroSeries?.let { onSeriesSelected(it) } },
                                                 onResume = { },
                                                 onResumeContinueWatching = null,
                                                 onInspect = {
-                                                    heroMovie?.let { viewModel.openInspector(it) }
-                                                        ?: heroSeries?.let { onSeriesSelected(it) }
+                                                    heroMovie?.let {
+                                                        if (onPlayMovie != null) onPlayMovie(it.id) else onVideoSelected(it)
+                                                    } ?: heroSeries?.let { onSeriesSelected(it) }
                                                 },
                                                 onRemoveResume = null
                                             )
@@ -757,7 +768,13 @@ fun HomeScreen(
                                             ) { movie ->
                                                 MovieCard(
                                                     movie = movie,
-                                                    onClick = { viewModel.openInspector(movie) },
+                                                    onClick = {
+                                                        if (onPlayMovie != null) {
+                                                            onPlayMovie(movie.id)
+                                                        } else {
+                                                            onVideoSelected(movie)
+                                                        }
+                                                    },
                                                     modifier = Modifier.width(220.dp)
                                                 )
                                             }
@@ -836,19 +853,7 @@ fun HomeScreen(
     }
 }
 
-    // Modal Bottom Sheet inspector when a video is clicked
-    uiState.selectedVideoForInspection?.let { selectedVideo ->
-        StreamInspectorBottomSheet(
-            video = selectedVideo,
-            isHardwareAccelerationEnabled = uiState.isHardwareAccelerationEnabled,
-            onHardwareAccelerationChanged = { viewModel.setHardwareAcceleration(it) },
-            onDismiss = { viewModel.closeInspector() },
-            onPlayFullQuality = {
-                viewModel.closeInspector()
-                onVideoSelected(selectedVideo)
-            }
-        )
-    }
+
 
     // Google Account Profile Dialog Overlay
     GoogleAccountDialog(

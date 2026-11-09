@@ -231,7 +231,9 @@ fun ClotubeNavHost(
                         navController.navigate(NavRoutes.seriesDetailRoute(seriesId, episodeId = autoPlayEpisodeId, autoPlayEpisodeId = autoPlayEpisodeId))
                     },
                     onPlayMovie = { fileId ->
-                        navController.navigate(NavRoutes.playerRoute(fileId, "Movie"))
+                        val movie = videoViewModel.getMovieById(fileId)
+                        val title = movie?.title?.ifBlank { null } ?: movie?.displayTitle?.ifBlank { null } ?: "Movie"
+                        navController.navigate(NavRoutes.playerRoute(fileId, title))
                     }
                 )
             }
