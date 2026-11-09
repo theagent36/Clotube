@@ -177,14 +177,17 @@ data class ContinueWatchingData(
         return ContinueWatchingDisplayData(
             mediaId = mediaId,
             seriesId = seriesId,
-            seriesTitle = seriesTitle,
-            seasonNumber = episode.seasonNumber,
-            episodeNumber = episode.episodeNumber,
-            episodeTitle = episode.displayTitle,
+            isSeries = true,
+            displayHeader = seriesTitle,
+            displayTitle = episode.displayTitle,
             displayThumbnailUrl = displayThumbnailUrl,
             progressFraction = progressFraction,
             currentPositionMs = currentPositionMs,
-            durationMs = durationMs
+            durationMs = durationMs,
+            seriesTitle = seriesTitle,
+            seasonNumber = episode.seasonNumber,
+            episodeNumber = episode.episodeNumber,
+            episodeTitle = episode.displayTitle
         )
     }
 }
@@ -193,22 +196,25 @@ typealias EpisodeItem = com.clotube.app.model.Episode
 
 @Keep
 data class ContinueWatchingDisplayData(
-    val mediaId: String,
-    val seriesId: String,
-    val seriesTitle: String,
-    val seasonNumber: Int,
-    val episodeNumber: Int,
-    val episodeTitle: String,
-    val displayThumbnailUrl: String,
-    val progressFraction: Float,
-    val currentPositionMs: Long,
-    val durationMs: Long
+    val mediaId: String = "",
+    val seriesId: String? = null,
+    val isSeries: Boolean = true,
+    val displayHeader: String = "",
+    val displayTitle: String = "",
+    val displayThumbnailUrl: String = "",
+    val progressFraction: Float = 0f,
+    val currentPositionMs: Long = 0L,
+    val durationMs: Long = 0L,
+    val seriesTitle: String = displayHeader,
+    val seasonNumber: Int = 0,
+    val episodeNumber: Int = 0,
+    val episodeTitle: String = displayTitle
 ) : Serializable {
     fun toContinueWatchingData(): ContinueWatchingData {
         val ep = Episode(
             id = mediaId,
-            seriesTitle = seriesTitle,
-            displayTitle = episodeTitle,
+            seriesTitle = if (seriesTitle.isNotBlank()) seriesTitle else displayHeader,
+            displayTitle = if (episodeTitle.isNotBlank()) episodeTitle else displayTitle,
             seasonNumber = seasonNumber,
             episodeNumber = episodeNumber,
             thumbnailUrl = displayThumbnailUrl,
@@ -216,8 +222,8 @@ data class ContinueWatchingDisplayData(
         )
         return ContinueWatchingData(
             episode = ep,
-            seriesId = seriesId,
-            seriesTitle = seriesTitle,
+            seriesId = seriesId ?: "",
+            seriesTitle = if (seriesTitle.isNotBlank()) seriesTitle else displayHeader,
             displayThumbnailUrl = displayThumbnailUrl,
             progressFraction = progressFraction,
             currentPositionMs = currentPositionMs,
@@ -315,6 +321,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         tokenProvider = { getValidAccessToken() }
     )
     val mediaPlayer: MediaPlayer get() = vlcPlayerManager.mediaPlayer
+    val player: MediaPlayer get() = mediaPlayer
 
     suspend fun getValidAccessToken(forceRefresh: Boolean = false): String = withContext(Dispatchers.IO) {
         if (forceRefresh) {
@@ -368,6 +375,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             withContext(Dispatchers.Main) {
+                registerActivePlayer(vlcPlayerManager.mediaPlayer)
                 vlcPlayerManager.play(
                     fileId = fileId,
                     localFile = localFile,
@@ -389,6 +397,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                 playbackHistoryManager.getResumePosition(episode.id)
             }
             withContext(Dispatchers.Main) {
+                registerActivePlayer(vlcPlayerManager.mediaPlayer)
                 vlcPlayerManager.play(
                     fileId = episode.id,
                     localFile = localFile,
@@ -429,9 +438,50 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
     val hasNext: Boolean
         get() = isSeriesMode.value && currentEpisodeIndex.value >= 0 && currentEpisodeIndex.value < (_episodeList.value.size - 1)
 
-    fun registerActivePlayer(activePlayer: MediaPlayer?) {}
+    @Volatile
+    private var activeMediaPlayer: MediaPlayer? = null
 
-    fun unregisterActivePlayer(activePlayer: MediaPlayer?) {}
+    fun registerActivePlayer(activePlayer: MediaPlayer?) {
+        if (activePlayer == null) return
+        val current = activeMediaPlayer
+        if (current != null && current != activePlayer) {
+            stopAndReleaseCurrentPlayer()
+        }
+        activeMediaPlayer = activePlayer
+    }
+
+    fun unregisterActivePlayer(activePlayer: MediaPlayer?) {
+        if (activeMediaPlayer == activePlayer) {
+            activeMediaPlayer = null
+        }
+    }
+
+    fun stopAndReleaseCurrentPlayer() {
+        val playerToRelease = activeMediaPlayer
+        activeMediaPlayer = null
+        if (playerToRelease != null) {
+            try {
+                playerToRelease.setEventListener(null)
+                if (playerToRelease.isPlaying) {
+                    playerToRelease.stop()
+                } else {
+                    playerToRelease.stop()
+                }
+                playerToRelease.detachViews()
+                if (playerToRelease != vlcPlayerManager.mediaPlayer) {
+                    playerToRelease.release()
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("VideoViewModel", "Error releasing active player: ${e.message}")
+            }
+        }
+        try {
+            if (vlcPlayerManager.mediaPlayer.isPlaying) {
+                vlcPlayerManager.mediaPlayer.stop()
+            }
+            vlcPlayerManager.mediaPlayer.detachViews()
+        } catch (_: Exception) {}
+    }
 
     fun selectEpisode(episode: Episode) {
         val index = _episodeList.value.indexOfFirst { it.id == episode.id }
@@ -555,7 +605,14 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
     fun pauseActivePlayer() {
         vlcPlayerManager.onAppPause()
         try {
-            mediaPlayer.pause()
+            activeMediaPlayer?.let { player ->
+                if (player.isPlaying) {
+                    player.pause()
+                }
+            }
+            if (mediaPlayer.isPlaying) {
+                mediaPlayer.pause()
+            }
         } catch (_: Exception) {}
     }
 
@@ -874,132 +931,89 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         playbackHistoryManager.lastWatchedFlow,
         seriesList,
         moviesList
-    ) { lastWatchedItem, allSeries, allMovies ->
-        if (lastWatchedItem == null) return@combine null
+    ) { lastWatched, allSeries, allMovies ->
+        if (lastWatched == null) return@combine null
+        if (lastWatched.progressFraction >= 0.95f) return@combine null
 
-        // If an episode or movie has been completed (e.g. >= 95%), do not show it as continuing
-        if (lastWatchedItem.progressFraction >= 0.95f) return@combine null
+        val isSeriesItem = lastWatched.isSeries || !lastWatched.seriesId.isNullOrBlank()
 
-        val effectiveSeries = allSeries.ifEmpty { loadCatalogFromDisk(getApplication()) }
-
-        if (lastWatchedItem.isSeries) {
-            if (effectiveSeries.isEmpty()) return@combine null
-
-            // 1. Resolve parent series
-            val parentSeries = effectiveSeries.firstOrNull { it.id == lastWatchedItem.seriesId }
-                ?: effectiveSeries.firstOrNull { s ->
-                    s.seasons.any { season -> season.episodes.any { ep -> ep.id == lastWatchedItem.mediaId || ep.id == lastWatchedItem.fileId } }
-                } ?: effectiveSeries.firstOrNull { s ->
-                    !lastWatchedItem.seriesTitle.isNullOrBlank() && s.title.equals(lastWatchedItem.seriesTitle, ignoreCase = true)
-                } ?: return@combine null
+        if (isSeriesItem) {
+            // ==================== TV SERIES BRANCH ====================
+            val effectiveSeries = allSeries.ifEmpty { loadCatalogFromDisk(getApplication()) }
+            val parentSeries = effectiveSeries.firstOrNull { it.id == lastWatched.seriesId }
+                ?: effectiveSeries.firstOrNull { s -> s.seasons.any { sn -> sn.episodes.any { ep -> ep.id == lastWatched.fileId || ep.id == lastWatched.mediaId } } }
+                ?: return@combine null
 
             val allEpisodes = parentSeries.seasons.flatMap { it.episodes }
+            val matchedEpisode = allEpisodes.firstOrNull { it.id == lastWatched.fileId || it.id == lastWatched.mediaId }
+                ?: allEpisodes.firstOrNull { 
+                    it.seasonNumber == (if (lastWatched.seasonNumber > 0) lastWatched.seasonNumber else 1) && 
+                    it.episodeNumber == (if (lastWatched.episodeNumber > 0) lastWatched.episodeNumber else 1) 
+                } ?: return@combine null
 
-            // 2. Determine actual Season and Episode numbers (extracting from title if DataStore keys were 0 or null)
-            val parsedFromTitle = OnlineMetadataResolver.extractSeasonAndEpisode(lastWatchedItem.title)
-                ?: OnlineMetadataResolver.extractSeasonAndEpisode(lastWatchedItem.formattedDisplayTitle)
+            val epCode = "S${matchedEpisode.seasonNumber.toString().padStart(2, '0')}:E${matchedEpisode.episodeNumber.toString().padStart(2, '0')}"
+            val cleanTitle = matchedEpisode.displayTitle.ifBlank { "Episode ${matchedEpisode.episodeNumber}" }
 
-            val targetSeason = when {
-                parsedFromTitle != null -> parsedFromTitle.first
-                lastWatchedItem.seasonNumber > 0 -> lastWatchedItem.seasonNumber
-                else -> 1
+            val thumbnail: String = when {
+                !matchedEpisode.thumbnailUrl.isNullOrBlank() && !matchedEpisode.thumbnailUrl!!.contains("drive.google.com") -> matchedEpisode.thumbnailUrl!!
+                !parentSeries.backdropUrl.isNullOrBlank() -> parentSeries.backdropUrl!!
+                !parentSeries.posterUrl.isNullOrBlank() -> parentSeries.posterUrl!!
+                else -> matchedEpisode.thumbnailUrl.orEmpty()
             }
 
-            val targetEpisode = when {
-                parsedFromTitle != null -> parsedFromTitle.second
-                lastWatchedItem.episodeNumber > 0 -> lastWatchedItem.episodeNumber
-                else -> 1
-            }
-
-            // 3. Resolve matched episode object
-            val matchedEpisode = (if (parsedFromTitle != null) {
-                allEpisodes.firstOrNull { it.seasonNumber == targetSeason && it.episodeNumber == targetEpisode }
-            } else null)
-                ?: allEpisodes.firstOrNull { it.id == lastWatchedItem.mediaId || it.id == lastWatchedItem.fileId }
-                ?: allEpisodes.firstOrNull { it.seasonNumber == targetSeason && it.episodeNumber == targetEpisode }
-                ?: allEpisodes.firstOrNull() ?: return@combine null
-
-            val resolvedSeasonNumber = if (targetSeason > 0) targetSeason else matchedEpisode.seasonNumber
-            val resolvedEpisodeNumber = if (targetEpisode > 0) targetEpisode else matchedEpisode.episodeNumber
-
-            // 4. TVMaze online resolution for official title & high-res still image
-            val onlineMeta = OnlineMetadataResolver.resolveEpisodeMetadata(
-                seriesName = parentSeries.title,
-                seasonNumber = resolvedSeasonNumber,
-                episodeNumber = resolvedEpisodeNumber
-            )
-
-            // 5. Clean Title: Use TVMaze official name ("The Crimson Ticket") or sanitize raw title
-            val resolvedTitle = when {
-                !onlineMeta?.officialTitle.isNullOrBlank() -> onlineMeta!!.officialTitle
-                else -> OnlineMetadataResolver.sanitizeEpisodeTitle(
-                    rawTitle = lastWatchedItem.title.ifBlank { matchedEpisode.displayTitle },
-                    seriesName = parentSeries.title,
-                    seasonNum = resolvedSeasonNumber,
-                    epNum = resolvedEpisodeNumber
-                )
-            }
-
-            // 6. Thumbnail Resolution: TVMaze episode screenshot -> Series backdrop -> Series poster -> Drive fallback
-            val backdrop = parentSeries.backdropUrl.orEmpty()
-            val poster = parentSeries.posterUrl.orEmpty()
-            val resolvedThumbnail = when {
-                !onlineMeta?.thumbnailUrl.isNullOrBlank() -> onlineMeta!!.thumbnailUrl
-                backdrop.isNotBlank() -> backdrop
-                poster.isNotBlank() -> poster
-                matchedEpisode.thumbnailUrl.isNotBlank() && !matchedEpisode.thumbnailUrl.contains("drive.google.com") -> matchedEpisode.thumbnailUrl
-                else -> matchedEpisode.thumbnailUrl
-            }
-
-            // 7. Watch progress calculation
-            val effectiveDuration = when {
-                lastWatchedItem.durationMs > 0L -> lastWatchedItem.durationMs
-                matchedEpisode.durationMs > 0L -> matchedEpisode.durationMs
-                else -> 0L
-            }
-
+            val effectiveDuration = if (matchedEpisode.durationMs > 0L) matchedEpisode.durationMs else lastWatched.durationMs
             val fraction = if (effectiveDuration > 0L) {
-                (lastWatchedItem.positionMs.toFloat() / effectiveDuration.toFloat()).coerceIn(0f, 1f)
-            } else {
-                lastWatchedItem.progressFraction.coerceIn(0f, 1f)
-            }
+                (lastWatched.positionMs.toFloat() / effectiveDuration.toFloat()).coerceIn(0f, 1f)
+            } else lastWatched.progressFraction.coerceIn(0f, 1f)
 
             ContinueWatchingDisplayData(
                 mediaId = matchedEpisode.id,
                 seriesId = parentSeries.id,
-                seriesTitle = parentSeries.title,
-                seasonNumber = resolvedSeasonNumber,
-                episodeNumber = resolvedEpisodeNumber,
-                episodeTitle = resolvedTitle,
-                displayThumbnailUrl = resolvedThumbnail,
+                isSeries = true,
+                displayHeader = parentSeries.title,
+                displayTitle = "$epCode • $cleanTitle",
+                displayThumbnailUrl = thumbnail,
                 progressFraction = fraction,
-                currentPositionMs = lastWatchedItem.positionMs,
+                currentPositionMs = lastWatched.positionMs,
                 durationMs = effectiveDuration
             )
         } else {
-            // Movie Handling
-            val movie = allMovies.firstOrNull { it.id == lastWatchedItem.mediaId || it.id == lastWatchedItem.fileId }
+            // ==================== MOVIE BRANCH ====================
+            val matchedMovie = allMovies.firstOrNull { it.id == lastWatched.fileId || it.id == lastWatched.mediaId }
+            val fallbackItem = if (matchedMovie == null) getMovieById(lastWatched.fileId) else null
+
+            val movieTitle = matchedMovie?.title?.ifBlank { null }
+                ?: fallbackItem?.title?.ifBlank { null }
+                ?: fallbackItem?.displayTitle?.ifBlank { null }
+                ?: lastWatched.title.ifBlank { null }
+                ?: "Movie"
+
+            val thumbnail: String = when {
+                !matchedMovie?.thumbnailUrl.isNullOrBlank() -> matchedMovie!!.thumbnailUrl!!
+                !fallbackItem?.thumbnailUrl.isNullOrBlank() -> fallbackItem!!.thumbnailUrl!!
+                !lastWatched.thumbnailUrl.isNullOrBlank() -> lastWatched.thumbnailUrl!!
+                else -> ""
+            }
+
             val effectiveDuration = when {
-                lastWatchedItem.durationMs > 0L -> lastWatchedItem.durationMs
-                movie != null && movie.durationMs > 0L -> movie.durationMs
+                matchedMovie != null && matchedMovie.durationMs > 0L -> matchedMovie.durationMs
+                fallbackItem != null && fallbackItem.durationMs > 0L -> fallbackItem.durationMs
+                lastWatched.durationMs > 0L -> lastWatched.durationMs
                 else -> 0L
             }
             val fraction = if (effectiveDuration > 0L) {
-                (lastWatchedItem.positionMs.toFloat() / effectiveDuration.toFloat()).coerceIn(0f, 1f)
-            } else {
-                lastWatchedItem.progressFraction.coerceIn(0f, 1f)
-            }
+                (lastWatched.positionMs.toFloat() / effectiveDuration.toFloat()).coerceIn(0f, 1f)
+            } else lastWatched.progressFraction.coerceIn(0f, 1f)
 
             ContinueWatchingDisplayData(
-                mediaId = lastWatchedItem.mediaId.ifBlank { lastWatchedItem.fileId },
-                seriesId = "",
-                seriesTitle = movie?.title ?: lastWatchedItem.seriesTitle ?: lastWatchedItem.title,
-                seasonNumber = 0,
-                episodeNumber = 0,
-                episodeTitle = movie?.title ?: lastWatchedItem.title,
-                displayThumbnailUrl = movie?.thumbnailUrl.orEmpty().ifBlank { lastWatchedItem.thumbnailUrl.orEmpty() },
+                mediaId = matchedMovie?.id ?: fallbackItem?.id ?: lastWatched.fileId,
+                seriesId = null,
+                isSeries = false,
+                displayHeader = movieTitle,
+                displayTitle = "Movie • Cinema",
+                displayThumbnailUrl = thumbnail,
                 progressFraction = fraction,
-                currentPositionMs = lastWatchedItem.positionMs,
+                currentPositionMs = lastWatched.positionMs,
                 durationMs = effectiveDuration
             )
         }
@@ -1026,10 +1040,11 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         if (lastWatched.isSeries) {
             // Find matching series across catalog
             val series = effectiveSeries.firstOrNull { it.id == lastWatched.seriesId }
-                ?: effectiveSeries.firstOrNull { s -> s.seasons.any { sn -> sn.episodes.any { ep -> ep.id == lastWatched.mediaId } } }
+                ?: effectiveSeries.firstOrNull { s -> s.seasons.any { sn -> sn.episodes.any { ep -> ep.id == lastWatched.mediaId || ep.id == lastWatched.fileId } } }
                 ?: effectiveSeries.firstOrNull { s -> !lastWatched.seriesTitle.isNullOrBlank() && s.title.equals(lastWatched.seriesTitle, ignoreCase = true) }
+                ?: return@combine null
 
-            val allEpisodes = series?.seasons?.flatMap { it.episodes } ?: emptyList()
+            val allEpisodes = series.seasons.flatMap { it.episodes }
 
             // Extract season/ep from stored title if keys were corrupted
             val sEpPattern = java.util.regex.Pattern.compile("(?i)[sS](\\d{1,2})[:\\s._-]*[eE](\\d{1,2})")
@@ -1052,9 +1067,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             val matchedEpisode = allEpisodes.firstOrNull { it.id == lastWatched.mediaId }
                 ?: allEpisodes.firstOrNull { it.seasonNumber == actualSeason && it.episodeNumber == actualEpisode }
 
-            val seriesTitle = series?.title
-                ?: lastWatched.seriesTitle?.ifBlank { null }
-                ?: "The Mentalist"
+            val seriesTitle = series.title
 
             // TVMaze Online Metadata
             val onlineMeta = com.clotube.app.data.metadata.OnlineMetadataResolver.resolveEpisode(
@@ -2243,6 +2256,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         super.onCleared()
+        stopAndReleaseCurrentPlayer()
         vlcPlayerManager.release()
     }
 }

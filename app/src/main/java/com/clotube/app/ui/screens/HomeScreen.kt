@@ -689,11 +689,11 @@ fun HomeScreen(
                                             ContinueWatchingCard(
                                                 data = item,
                                                 onResumeClick = {
-                                                    if (item.seriesId.isNotBlank()) {
+                                                    if (item.isSeries && !item.seriesId.isNullOrBlank()) {
                                                         if (onNavigateToSeriesDetail != null) {
                                                             onNavigateToSeriesDetail(item.seriesId, item.mediaId)
                                                         } else if (onResumePlayback != null) {
-                                                            onResumePlayback(item.mediaId, item.episodeTitle, item.seriesId, item.currentPositionMs)
+                                                            onResumePlayback(item.mediaId, item.displayTitle, item.seriesId, item.currentPositionMs)
                                                         } else {
                                                             val matchedSeries = uiState.tvSeriesList.find { it.id == item.seriesId }
                                                             if (matchedSeries != null) {
@@ -704,7 +704,7 @@ fun HomeScreen(
                                                         if (onPlayMovie != null) {
                                                             onPlayMovie(item.mediaId)
                                                         } else if (onResumePlayback != null) {
-                                                            onResumePlayback(item.mediaId, item.episodeTitle, null, item.currentPositionMs)
+                                                            onResumePlayback(item.mediaId, item.displayHeader, null, item.currentPositionMs)
                                                         } else {
                                                             val movie = viewModel.getMovieById(item.mediaId)
                                                             if (movie != null) {
@@ -1935,7 +1935,7 @@ fun ContinueWatchingCard(
                         border = BorderStroke(1.dp, Color(0xFF00E5FF).copy(alpha = 0.5f))
                     ) {
                         Text(
-                            text = if (data.seasonNumber <= 0) "RESUME MOVIE" else "CONTINUE WATCHING",
+                            text = "CONTINUE WATCHING",
                             color = Color(0xFF00E5FF),
                             fontSize = 10.sp,
                             fontWeight = FontWeight.Bold,
@@ -1957,7 +1957,7 @@ fun ContinueWatchingCard(
                             .padding(end = 12.dp)
                     ) {
                         Text(
-                            text = data.seriesTitle,
+                            text = data.displayHeader.ifBlank { data.seriesTitle },
                             color = Color(0xFF00E5FF),
                             fontSize = 12.sp,
                             fontWeight = FontWeight.SemiBold
@@ -1965,10 +1965,10 @@ fun ContinueWatchingCard(
 
                         Spacer(modifier = Modifier.height(2.dp))
 
-                        val displaySubtitle = if (data.seasonNumber > 0) {
-                            "S${data.seasonNumber.toString().padStart(2, '0')}:E${data.episodeNumber.toString().padStart(2, '0')} • ${data.episodeTitle}"
-                        } else {
-                            data.episodeTitle
+                        val displaySubtitle = when {
+                            data.displayTitle.isNotBlank() -> data.displayTitle
+                            data.seasonNumber > 0 -> "S${data.seasonNumber.toString().padStart(2, '0')}:E${data.episodeNumber.toString().padStart(2, '0')} • ${data.episodeTitle}"
+                            else -> data.episodeTitle
                         }
 
                         Text(
@@ -2032,21 +2032,54 @@ fun ContinueWatchingCard(
 
 @Composable
 fun ContinueWatchingCard(
+    headerTitle: String,
+    subTitle: String,
+    thumbnailUrl: String,
+    progressFraction: Float,
+    currentPositionMs: Long,
+    durationMs: Long,
+    isSeries: Boolean,
+    onResumeClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val displayData = ContinueWatchingDisplayData(
+        mediaId = "",
+        seriesId = null,
+        isSeries = isSeries,
+        displayHeader = headerTitle,
+        displayTitle = subTitle,
+        displayThumbnailUrl = thumbnailUrl,
+        progressFraction = progressFraction,
+        currentPositionMs = currentPositionMs,
+        durationMs = durationMs
+    )
+    ContinueWatchingCard(
+        data = displayData,
+        onResumeClick = onResumeClick,
+        modifier = modifier
+    )
+}
+
+@Composable
+fun ContinueWatchingCard(
     item: ContinueWatchingItem,
     onResumeClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val displayData = ContinueWatchingDisplayData(
         mediaId = item.mediaId,
-        seriesId = item.seriesId ?: "",
-        seriesTitle = item.seriesTitle,
-        seasonNumber = item.seasonNumber,
-        episodeNumber = item.episodeNumber,
-        episodeTitle = item.episodeTitle,
+        seriesId = item.seriesId,
+        isSeries = item.isSeries,
+        displayHeader = item.seriesTitle,
+        displayTitle = item.displaySubtitle.ifBlank { item.episodeTitle },
         displayThumbnailUrl = item.thumbnailUrl,
         progressFraction = item.progressFraction,
         currentPositionMs = item.currentPositionMs,
-        durationMs = item.durationMs
+        durationMs = item.durationMs,
+        seriesTitle = item.seriesTitle,
+        seasonNumber = item.seasonNumber,
+        episodeNumber = item.episodeNumber,
+        episodeTitle = item.episodeTitle
     )
     ContinueWatchingCard(
         data = displayData,
@@ -2080,14 +2113,17 @@ fun ContinueWatchingCard(
     val displayData = ContinueWatchingDisplayData(
         mediaId = episode.id,
         seriesId = "",
-        seriesTitle = seriesTitle,
-        seasonNumber = episode.seasonNumber,
-        episodeNumber = episode.episodeNumber,
-        episodeTitle = episode.displayTitle,
+        isSeries = true,
+        displayHeader = seriesTitle,
+        displayTitle = episode.displayTitle,
         displayThumbnailUrl = thumb,
         progressFraction = episode.watchProgressFraction,
         currentPositionMs = (episode.watchProgressFraction * episode.durationMs).toLong(),
-        durationMs = episode.durationMs
+        durationMs = episode.durationMs,
+        seriesTitle = seriesTitle,
+        seasonNumber = episode.seasonNumber,
+        episodeNumber = episode.episodeNumber,
+        episodeTitle = episode.displayTitle
     )
     ContinueWatchingCard(
         data = displayData,
@@ -2309,7 +2345,7 @@ fun HomeScreen(
                                         ContinueWatchingCard(
                                             data = item,
                                             onResumeClick = {
-                                                if (item.seriesId.isNotBlank()) {
+                                                if (item.isSeries && !item.seriesId.isNullOrBlank()) {
                                                     val ep = series.flatMap { it.seasons }.flatMap { it.episodes }.find { it.id == safeCwId }
                                                     if (ep != null) {
                                                         onContinueWatchingClick(ep)
@@ -2319,7 +2355,21 @@ fun HomeScreen(
                                                     }
                                                 } else {
                                                     val matched = movies.find { it.id == safeCwId }
-                                                    if (matched != null) onMovieClick(matched)
+                                                    if (matched != null) {
+                                                        onMovieClick(matched)
+                                                    } else {
+                                                        val videoItem = viewModel.getMovieById(safeCwId)
+                                                        if (videoItem != null) {
+                                                            onMovieClick(
+                                                                com.clotube.app.model.Movie(
+                                                                    id = videoItem.id,
+                                                                    title = videoItem.title.ifBlank { videoItem.displayTitle },
+                                                                    durationMs = videoItem.durationMs,
+                                                                    thumbnailUrl = videoItem.thumbnailUrl
+                                                                )
+                                                            )
+                                                        }
+                                                    }
                                                 }
                                             }
                                         )

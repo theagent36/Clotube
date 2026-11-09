@@ -21,8 +21,8 @@ android {
         applicationId = "com.clotube.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 15
-        versionName = "3.0"
+        versionCode = 19
+        versionName = "3.4"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -37,8 +37,8 @@ android {
 
     signingConfigs {
         create("release") {
-            val storePath = if (keystorePropertiesFile.exists()) keystoreProperties.getProperty("storeFile") else null
-            if (!storePath.isNullOrBlank() && file(storePath).exists()) {
+            if (keystorePropertiesFile.exists() && keystoreProperties.containsKey("storeFile")) {
+                val storePath = keystoreProperties.getProperty("storeFile")
                 storeFile = file(storePath)
                 storePassword = keystoreProperties.getProperty("storePassword") ?: ""
                 keyAlias = keystoreProperties.getProperty("keyAlias") ?: ""
@@ -46,14 +46,28 @@ android {
                 enableV1Signing = true
                 enableV2Signing = true
             } else {
-                // Fallback to debug keystore if properties file is not yet populated
-                val debugConfig = signingConfigs.getByName("debug")
-                storeFile = debugConfig.storeFile
-                storePassword = debugConfig.storePassword
-                keyAlias = debugConfig.keyAlias
-                keyPassword = debugConfig.keyPassword
-                enableV1Signing = true
-                enableV2Signing = true
+                val storeFilePath = project.findProperty("CLOTUBE_KEYSTORE_FILE")?.toString()
+                    ?: project.findProperty("CLOTUBE_RELEASE_STORE_FILE")?.toString()
+
+                if (!storeFilePath.isNullOrBlank() && file(storeFilePath).exists()) {
+                    storeFile = file(storeFilePath)
+                    storePassword = project.findProperty("CLOTUBE_KEYSTORE_PASSWORD")?.toString()
+                        ?: project.findProperty("CLOTUBE_RELEASE_STORE_PASSWORD")?.toString() ?: ""
+                    keyAlias = project.findProperty("CLOTUBE_KEY_ALIAS")?.toString()
+                        ?: project.findProperty("CLOTUBE_RELEASE_KEY_ALIAS")?.toString() ?: ""
+                    keyPassword = project.findProperty("CLOTUBE_KEY_PASSWORD")?.toString()
+                        ?: project.findProperty("CLOTUBE_RELEASE_KEY_PASSWORD")?.toString() ?: ""
+                    enableV1Signing = true
+                    enableV2Signing = true
+                } else {
+                    val debugConfig = signingConfigs.getByName("debug")
+                    storeFile = debugConfig.storeFile
+                    storePassword = debugConfig.storePassword
+                    keyAlias = debugConfig.keyAlias
+                    keyPassword = debugConfig.keyPassword
+                    enableV1Signing = true
+                    enableV2Signing = true
+                }
             }
         }
     }

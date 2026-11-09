@@ -99,12 +99,57 @@ fun calculateSafeSeekTargetMs(fraction: Float, totalDuration: Long): Long {
 
 @Composable
 fun ClotubeVideoPlayer(
+    episode: Episode?,
+    movie: com.clotube.app.model.VideoItem?,
+    viewModel: VideoViewModel,
+    startPositionMs: Long = 0L,
+    onPlayerCreated: ((MediaPlayer) -> Unit)? = null,
+    onClosePlayer: () -> Unit = {},
+    modifier: Modifier = Modifier
+) {
+    if (movie != null) {
+        val movieTitle = movie.title.ifBlank { movie.displayTitle }.ifBlank { "Playing Movie" }
+        LaunchedEffect(viewModel.mediaPlayer) {
+            viewModel.registerActivePlayer(viewModel.mediaPlayer)
+            onPlayerCreated?.invoke(viewModel.mediaPlayer)
+        }
+        ClotubeVideoPlayer(
+            mediaPlayer = viewModel.mediaPlayer,
+            mediaId = movie.id,
+            startPositionMs = startPositionMs,
+            title = movieTitle,
+            thumbnailUrl = movie.thumbnailUrl,
+            fallbackDurationMs = movie.durationMs,
+            modifier = modifier,
+            isInitiallyFullscreen = true,
+            onReloadMedia = { startMs ->
+                viewModel.prepareAndPlayMovie(movie.id, startMs)
+            },
+            onPlayerCreated = onPlayerCreated,
+            onNavigateBack = onClosePlayer
+        )
+    } else if (episode != null) {
+        ClotubeVideoPlayer(
+            episode = episode,
+            viewModel = viewModel,
+            startPositionMs = startPositionMs,
+            onPlayerCreated = onPlayerCreated,
+            onClosePlayer = onClosePlayer,
+            modifier = modifier
+        )
+    }
+}
+
+@Composable
+fun ClotubeVideoPlayer(
     episode: Episode,
     viewModel: VideoViewModel,
     modifier: Modifier = Modifier,
     seriesId: String? = null,
     initialPositionMs: Long = 0L,
+    startPositionMs: Long = initialPositionMs,
     nextEpisode: Episode? = null,
+    onPlayerCreated: ((MediaPlayer) -> Unit)? = null,
     onPreviousEpisode: (() -> Unit)? = null,
     onNextEpisode: (() -> Unit)? = null,
     onNavigateBack: () -> Unit = {}
@@ -115,6 +160,7 @@ fun ClotubeVideoPlayer(
         seriesId = seriesId,
         initialPositionMs = initialPositionMs,
         nextEpisode = nextEpisode,
+        onPlayerCreated = onPlayerCreated,
         onPreviousEpisode = onPreviousEpisode,
         onNextEpisode = onNextEpisode,
         onClosePlayer = onNavigateBack,
@@ -130,6 +176,7 @@ fun ClotubeVideoPlayer(
     initialPositionMs: Long = 0L,
     startPositionMs: Long = initialPositionMs,
     nextEpisode: Episode? = null,
+    onPlayerCreated: ((MediaPlayer) -> Unit)? = null,
     onPreviousEpisode: (() -> Unit)? = null,
     onNextEpisode: (() -> Unit)? = null,
     onClosePlayer: () -> Unit,
@@ -172,6 +219,11 @@ fun ClotubeVideoPlayer(
 
     val mediaPlayer = remember(libVLCInstance) {
         MediaPlayer(libVLCInstance)
+    }
+
+    LaunchedEffect(mediaPlayer) {
+        viewModel.registerActivePlayer(mediaPlayer)
+        onPlayerCreated?.invoke(mediaPlayer)
     }
 
     val audioFocusManager = remember(context) {
@@ -261,9 +313,10 @@ fun ClotubeVideoPlayer(
         }
     }
 
-    // MediaTek Hardware Decoder & Crash Prevention (Strict Order: detachViews -> stop -> release)
+    // MediaTek Hardware Decoder & Crash Prevention (Strict Order: setEventListener(null) -> stop -> detachViews -> release)
     DisposableEffect(episode.id) {
         onDispose {
+            viewModel.unregisterActivePlayer(mediaPlayer)
             audioFocusManager.abandonAudioFocus()
             try {
                 val current = mediaPlayer.time
@@ -297,8 +350,12 @@ fun ClotubeVideoPlayer(
 
             try {
                 mediaPlayer.setEventListener(null)
+                if (mediaPlayer.isPlaying) {
+                    mediaPlayer.stop()
+                } else {
+                    mediaPlayer.stop()
+                }
                 mediaPlayer.detachViews()
-                mediaPlayer.stop()
                 mediaPlayer.release()
             } catch (t: Throwable) {
                 Log.e("ClotubePlayer", "Safe LibVLC release error: ${t.message}")
@@ -402,6 +459,7 @@ fun ClotubeVideoPlayer(
     thumbnailUrl: String? = null,
     fallbackDurationMs: Long = 0L,
     initialPositionMs: Long = 0L,
+    startPositionMs: Long = initialPositionMs,
     activeStreamUrl: String = "",
     tokenRefreshProvider: TokenRefreshProvider? = null,
     modifier: Modifier = Modifier,
@@ -417,9 +475,13 @@ fun ClotubeVideoPlayer(
     onIsPlayingChanged: ((Boolean) -> Unit)? = null,
     onPlaybackEnded: (() -> Unit)? = null,
     onReloadMedia: ((startPositionMs: Long) -> Unit)? = null,
+    onPlayerCreated: ((MediaPlayer) -> Unit)? = null,
     onNavigateBack: () -> Unit
 ) {
     val context = LocalContext.current
+    LaunchedEffect(mediaPlayer) {
+        onPlayerCreated?.invoke(mediaPlayer)
+    }
     val effectiveTokenRefreshProvider = remember(tokenRefreshProvider, context) {
         tokenRefreshProvider ?: TokenRefreshProvider(context.applicationContext)
     }
@@ -615,14 +677,16 @@ fun ClotubeVideoPlayer(
     var isViewsAttached by remember { mutableStateOf(false) }
     var autoHideJob by remember { mutableStateOf<Job?>(null) }
 
+    val effectiveStartPositionMs = if (startPositionMs > 0L) startPositionMs else initialPositionMs
+
     // Dynamic Network Handover, 8s Buffer Underrun Stall Watchdog & State
     var lastValidPositionMs by remember(mediaId) {
         val curTime = mediaPlayer.time
-        mutableLongStateOf(if (curTime > 0L) curTime else initialPositionMs)
+        mutableLongStateOf(if (curTime > 0L) curTime else effectiveStartPositionMs)
     }
     var currentPositionMs by remember(mediaId) {
         val curTime = mediaPlayer.time
-        mutableLongStateOf(if (curTime > 0L) curTime else initialPositionMs)
+        mutableLongStateOf(if (curTime > 0L) curTime else effectiveStartPositionMs)
     }
     var durationMs by remember(mediaId) {
         val len = mediaPlayer.length
@@ -1256,6 +1320,11 @@ fun ClotubeVideoPlayer(
             seekWatchdogJob = null
             try {
                 mediaPlayer.setEventListener(null)
+                if (mediaPlayer.isPlaying) {
+                    mediaPlayer.stop()
+                } else {
+                    mediaPlayer.stop()
+                }
                 if (isViewsAttached) {
                     try {
                         mediaPlayer.detachViews()
@@ -1266,7 +1335,6 @@ fun ClotubeVideoPlayer(
                         mediaPlayer.detachViews()
                     } catch (_: Exception) {}
                 }
-                mediaPlayer.stop()
             } catch (t: Throwable) {
                 android.util.Log.e("ClotubePlayer", "Safe LibVLC release error: ${t.message}")
             }

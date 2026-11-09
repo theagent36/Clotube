@@ -62,20 +62,6 @@ import com.clotube.app.viewmodel.VideoViewModel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
-private val org.videolan.libvlc.MediaPlayer.currentPosition: Long get() = this.time
-private val org.videolan.libvlc.MediaPlayer.duration: Long get() = this.length
-
-private fun org.videolan.libvlc.MediaPlayer.clearMediaItems() {}
-private fun org.videolan.libvlc.MediaPlayer.setMediaItem(mediaItem: Any?, seekPositionMs: Long = 0L) {
-    if (seekPositionMs > 0L) {
-        try { this.time = seekPositionMs } catch (_: Exception) {}
-    }
-}
-private fun org.videolan.libvlc.MediaPlayer.prepare() {}
-private var org.videolan.libvlc.MediaPlayer.playWhenReady: Boolean
-    get() = this.isPlaying
-    set(_) {}
-
 @OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
 @Composable
 fun SeriesDetailScreen(
@@ -101,8 +87,6 @@ fun SeriesDetailScreen(
     val listState = rememberLazyListState()
 
     val playbackHistoryManager = viewModel.playbackHistoryManager
-    val player = viewModel.mediaPlayer
-
     var activeEpisode by remember(series.id) {
         mutableStateOf<Episode?>(activePlayingEpisode)
     }
@@ -112,6 +96,12 @@ fun SeriesDetailScreen(
     var targetResumeEpisode by remember(series.id) { mutableStateOf<Episode?>(null) }
     var targetResumePosMs by remember(series.id) { mutableLongStateOf(initialPositionMs) }
     var targetDurationMs by remember(series.id) { mutableLongStateOf(0L) }
+
+    DisposableEffect(series.id) {
+        onDispose {
+            viewModel.stopAndReleaseCurrentPlayer()
+        }
+    }
 
     LaunchedEffect(series.id, series.seasons) {
         val allEps = series.seasons.flatMap { it.episodes }
@@ -140,43 +130,13 @@ fun SeriesDetailScreen(
     }
 
     fun playEpisode(episode: Episode, seekPositionMs: Long = 0L) {
+        viewModel.stopAndReleaseCurrentPlayer()
         initialResumePositionMs = seekPositionMs
         targetResumePosMs = seekPositionMs
         targetResumeEpisode = episode
         targetDurationMs = episode.durationMs
         activeEpisode = episode
-        try {
-            player.stop()
-            player.clearMediaItems()
-            player.setMediaItem(episode, seekPositionMs)
-            player.prepare()
-            player.playWhenReady = true
-            player.play()
-        } catch (_: Exception) {}
         onEpisodeSelectedWithPosition(episode, seekPositionMs)
-    }
-
-    LaunchedEffect(player.isPlaying, activeEpisode) {
-        val ep = activeEpisode ?: return@LaunchedEffect
-        while (player.isPlaying) {
-            val pos = player.currentPosition
-            val dur = player.duration
-
-            // Guard: Only commit progress once playback has advanced past 3 seconds and duration is valid
-            if (pos > 3000L && dur > 0L && dur != androidx.media3.common.C.TIME_UNSET) {
-                playbackHistoryManager.saveSeriesPlaybackState(
-                    seriesId = series.id,
-                    seriesTitle = series.title,
-                    episodeId = ep.id,
-                    episodeTitle = ep.displayTitle,
-                    seasonNumber = ep.seasonNumber,
-                    episodeNumber = ep.episodeNumber,
-                    positionMs = pos,
-                    durationMs = dur
-                )
-            }
-            kotlinx.coroutines.delay(4000L)
-        }
     }
 
     // Hardware BackHandler: If in landscape, revert to portrait without closing player; else close player or navigate back
@@ -184,11 +144,13 @@ fun SeriesDetailScreen(
         if (isLandscape) {
             activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         } else if (activeEpisode != null) {
+            viewModel.stopAndReleaseCurrentPlayer()
             viewModel.clearActiveEpisode()
             activeEpisode = null
             initialResumePositionMs = 0L
             onClosePlayer()
         } else {
+            viewModel.stopAndReleaseCurrentPlayer()
             onBackClick()
         }
     }
@@ -301,6 +263,7 @@ fun SeriesDetailScreen(
             val targetEpisode = allEpisodes.firstOrNull { it.id == autoPlayEpisodeId }
 
             if (targetEpisode != null) {
+                viewModel.stopAndReleaseCurrentPlayer()
                 // 1. Align active season tab with the target episode
                 viewModel.selectedSeasonNumber.value = targetEpisode.seasonNumber
                 currentSeasonNumber = targetEpisode.seasonNumber
@@ -425,6 +388,9 @@ fun SeriesDetailScreen(
                     initialPositionMs = initialResumePositionMs,
                     startPositionMs = initialResumePositionMs,
                     nextEpisode = nextEpisode,
+                    onPlayerCreated = { epPlayer ->
+                        viewModel.registerActivePlayer(epPlayer)
+                    },
                     onPreviousEpisode = prevEpisode?.let { ep ->
                         {
                             coroutineScope.launch {
@@ -442,6 +408,7 @@ fun SeriesDetailScreen(
                         }
                     },
                     onClosePlayer = {
+                        viewModel.stopAndReleaseCurrentPlayer()
                         viewModel.clearActiveEpisode()
                         activeEpisode = null
                         initialResumePositionMs = 0L
@@ -1045,21 +1012,23 @@ fun SeriesDetailScreen(
             autoPlayEpisodeId = effectiveAutoPlayId,
             onEpisodeSelected = { ep ->
                 currentInitialPositionMs = 0L
+                viewModel.stopAndReleaseCurrentPlayer()
                 viewModel.selectEpisode(ep)
                 activePlayingEpisode = ep
-                onRegisterActivePlayer?.invoke(viewModel.mediaPlayer)
             },
             onEpisodeSelectedWithPosition = { ep, seekPos ->
                 currentInitialPositionMs = seekPos
+                viewModel.stopAndReleaseCurrentPlayer()
                 viewModel.selectEpisode(ep)
                 activePlayingEpisode = ep
-                onRegisterActivePlayer?.invoke(viewModel.mediaPlayer)
             },
             onClosePlayer = {
+                viewModel.stopAndReleaseCurrentPlayer()
                 viewModel.clearActiveEpisode()
                 activePlayingEpisode = null
             },
             onBackClick = {
+                viewModel.stopAndReleaseCurrentPlayer()
                 if (activePlayingEpisode != null) {
                     viewModel.clearActiveEpisode()
                     activePlayingEpisode = null

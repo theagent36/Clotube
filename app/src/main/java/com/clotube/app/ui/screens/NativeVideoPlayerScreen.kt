@@ -1,17 +1,22 @@
 package com.clotube.app.ui.screens
 
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.lifecycle.viewModelScope
 import com.clotube.app.ui.components.ClotubeVideoPlayer
 import com.clotube.app.viewmodel.VideoViewModel
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -21,127 +26,106 @@ fun NativeVideoPlayerScreen(
     viewModel: VideoViewModel,
     onNavigateBack: () -> Unit
 ) {
+    val coroutineScope = rememberCoroutineScope()
     val movie = remember(fileId) { viewModel.getMovieById(fileId) }
     val movieTitle = remember(movie) {
-        movie?.title?.ifBlank { null } ?: movie?.displayTitle?.ifBlank { null } ?: "Untitled Movie"
+        movie?.title?.ifBlank { null } ?: movie?.displayTitle?.ifBlank { null } ?: "Movie"
     }
-    val mediaPlayer = viewModel.mediaPlayer
+    var resumePositionMs by remember { mutableLongStateOf(0L) }
+    var isReadyToPlay by remember { mutableStateOf(false) }
 
+    // 1. Resolve resume position from DataStore before mounting player
     LaunchedEffect(fileId) {
-        viewModel.prepareAndPlayMovie(fileId)
+        viewModel.stopAndReleaseCurrentPlayer()
+        resumePositionMs = viewModel.playbackHistoryManager.getResumePosition(fileId)
+
+        // Immediately record playback start with current timestamp so it becomes the newest history item
+        viewModel.playbackHistoryManager.saveMoviePlaybackState(
+            fileId = fileId,
+            title = movieTitle,
+            positionMs = resumePositionMs.coerceAtLeast(1000L),
+            durationMs = movie?.durationMs?.coerceAtLeast(1000L) ?: 1000L
+        )
+        viewModel.prepareAndPlayMovie(fileId, resumePositionMs)
+        isReadyToPlay = true
     }
 
-    LaunchedEffect(mediaPlayer.isPlaying) {
-        if (!mediaPlayer.isPlaying) {
-            viewModel.playbackHistoryManager.backupToCloudImmediately()
-            return@LaunchedEffect
-        }
-        while (mediaPlayer.isPlaying) {
-            val current = mediaPlayer.time
-            val total = mediaPlayer.length
-            if (total > 0L && current >= 3000L) {
-                viewModel.playbackHistoryManager.saveProgress(
-                    fileId = fileId,
-                    title = movieTitle,
-                    seriesTitle = null,
-                    seasonNumber = 0,
-                    episodeNumber = 0,
-                    isSeries = false,
-                    positionMs = current,
-                    durationMs = total,
-                    thumbnailUrl = movie?.thumbnailUrl
-                )
-            }
+    // 2. Periodic progress ticker while playing
+    LaunchedEffect(isReadyToPlay) {
+        if (!isReadyToPlay) return@LaunchedEffect
+        while (true) {
             delay(4000L)
-        }
-        viewModel.playbackHistoryManager.backupToCloudImmediately()
-    }
-
-    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
-
-    DisposableEffect(lifecycleOwner, mediaPlayer) {
-        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
-            when (event) {
-                androidx.lifecycle.Lifecycle.Event.ON_PAUSE,
-                androidx.lifecycle.Lifecycle.Event.ON_STOP -> {
-                    val currentPos = mediaPlayer.time
-                    val duration = mediaPlayer.length
-                    if (currentPos > 1000L && duration > 0L) {
-                        mediaPlayer.pause()
-                        viewModel.savePlaybackPositionImmediate(
+            viewModel.mediaPlayer.let { player ->
+                if (player.isPlaying) {
+                    val pos = player.time
+                    val dur = if (player.length > 0L) player.length else (movie?.durationMs ?: 0L)
+                    if (pos > 1000L && dur > 0L) {
+                        viewModel.playbackHistoryManager.saveMoviePlaybackState(
                             fileId = fileId,
-                            positionMs = currentPos,
-                            durationMs = duration,
                             title = movieTitle,
-                            thumbnailUrl = movie?.thumbnailUrl
+                            positionMs = pos,
+                            durationMs = dur
                         )
                     }
-                    viewModel.playbackHistoryManager.backupToCloudImmediately()
                 }
-                else -> Unit
             }
-        }
-
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose {
-            lifecycleOwner.lifecycle.removeObserver(observer)
         }
     }
 
+    val handleExit = {
+        viewModel.mediaPlayer.let { player ->
+            val pos = player.time
+            val dur = if (player.length > 0L) player.length else (movie?.durationMs ?: 0L)
+            if (pos > 1000L && dur > 0L) {
+                viewModel.viewModelScope.launch {
+                    viewModel.playbackHistoryManager.saveMoviePlaybackState(
+                        fileId = fileId,
+                        title = movieTitle,
+                        positionMs = pos,
+                        durationMs = dur
+                    )
+                }
+            }
+        }
+        viewModel.stopAndReleaseCurrentPlayer()
+        onNavigateBack()
+    }
+
+    // 3. Save progress on back navigation / disposal and release native player
     DisposableEffect(fileId) {
         onDispose {
-            val current = mediaPlayer.time
-            val total = mediaPlayer.length
-            if (total > 0L && current >= 1000L) {
-                viewModel.savePlaybackPositionImmediate(
-                    fileId = fileId,
-                    positionMs = current,
-                    durationMs = total,
-                    title = movieTitle,
-                    thumbnailUrl = movie?.thumbnailUrl
-                )
+            viewModel.mediaPlayer.let { player ->
+                val pos = player.time
+                val dur = if (player.length > 0L) player.length else (movie?.durationMs ?: 0L)
+                if (pos > 1000L && dur > 0L) {
+                    viewModel.viewModelScope.launch {
+                        viewModel.playbackHistoryManager.saveMoviePlaybackState(
+                            fileId = fileId,
+                            title = movieTitle,
+                            positionMs = pos,
+                            durationMs = dur
+                        )
+                    }
+                }
             }
-            viewModel.playbackHistoryManager.backupToCloudImmediately()
-            mediaPlayer.pause()
-            try {
-                mediaPlayer.detachViews()
-            } catch (_: Exception) {}
+            viewModel.stopAndReleaseCurrentPlayer()
         }
     }
 
-    val coroutineScope = rememberCoroutineScope()
+    BackHandler {
+        handleExit()
+    }
 
-    ClotubeVideoPlayer(
-        mediaPlayer = mediaPlayer,
-        mediaId = fileId,
-        title = movieTitle,
-        thumbnailUrl = movie?.thumbnailUrl,
-        activeStreamUrl = "http://127.0.0.1:${com.clotube.app.data.LocalStreamProxy.PORT}/stream?fileId=$fileId",
-        tokenRefreshProvider = viewModel.tokenRefreshProvider,
-        modifier = Modifier.fillMaxSize(),
-        isInitiallyFullscreen = true, // Movies start directly in landscape fullscreen
-        onPlaybackEnded = {
-            val total = mediaPlayer.length.coerceAtLeast(1000L)
-            coroutineScope.launch(NonCancellable + Dispatchers.IO) {
-                viewModel.playbackHistoryManager.markCompleted(
-                    fileId = fileId,
-                    title = movieTitle,
-                    durationMs = total,
-                    isSeries = false,
-                    thumbnailUrl = movie?.thumbnailUrl
-                )
-            }
-        },
-        onReloadMedia = { startMs ->
-            viewModel.prepareAndPlayMovie(fileId, startMs)
-        },
-        onNavigateBack = {
-            mediaPlayer.pause()
-            try {
-                mediaPlayer.detachViews()
-            } catch (_: Exception) {}
-            viewModel.playbackHistoryManager.backupToCloudImmediately()
-            onNavigateBack()
-        }
-    )
+    if (isReadyToPlay) {
+        ClotubeVideoPlayer(
+            episode = null,
+            movie = movie,
+            viewModel = viewModel,
+            startPositionMs = resumePositionMs,
+            onClosePlayer = handleExit,
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black)
+        )
+    }
 }

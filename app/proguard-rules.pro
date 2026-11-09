@@ -17,7 +17,7 @@
 -keep class androidx.datastore.preferences.** { *; }
 -keep class androidx.datastore.core.** { *; }
 
-# 2. LibVLC Native JNI & Media Playback Engine
+# 2. LibVLC Native JNI & VLCVideoLayout
 -keep class org.videolan.libvlc.** { *; }
 -keep interface org.videolan.libvlc.** { *; }
 -keep class org.videolan.medialibrary.** { *; }
@@ -32,7 +32,7 @@
     void onEvent(org.videolan.libvlc.MediaPlayer$Event);
 }
 
-# 3. WorkManager & Background Download Workers
+# 3. WorkManager & Background Sync Workers
 -keep public class androidx.work.Worker { *; }
 -keep public class androidx.work.CoroutineWorker { *; }
 -keep public class androidx.work.ListenableWorker { *; }
