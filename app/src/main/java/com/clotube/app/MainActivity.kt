@@ -224,46 +224,39 @@ fun ClotubeBootScreen(
     val letterAlphas = remember { List(letters.size) { Animatable(0f) } }
 
     LaunchedEffect(Unit) {
-        // Phase 1: Smooth, elastic pop-in for the glowing "C" glyph
+        // 1. Kick off cloud sync and catalog hydration asynchronously in the background
+        viewModel.prepareInitialState()
+
+        // 2. Play brand animation smoothly
         launch {
             iconAlpha.animateTo(
                 targetValue = 1f,
-                animationSpec = tween(durationMillis = 280)
+                animationSpec = tween(durationMillis = 240)
             )
         }
         iconScale.animateTo(
             targetValue = 1f,
             animationSpec = spring(
                 dampingRatio = Spring.DampingRatioMediumBouncy,
-                stiffness = Spring.StiffnessLow
+                stiffness = Spring.StiffnessMedium
             )
         )
 
-        // Settle pause before the text emerges
-        delay(120)
+        delay(80)
 
-        // Phase 2: Measured, readable letter-by-letter reveal (75ms stagger)
+        // Rapid sequential character reveal
         letters.forEachIndexed { index, _ ->
             launch {
-                delay(index * 75L)
+                delay(index * 55L)
                 letterAlphas[index].animateTo(
                     targetValue = 1f,
-                    animationSpec = tween(durationMillis = 180)
+                    animationSpec = tween(durationMillis = 160)
                 )
             }
         }
 
-        // Concurrently fetch clotube_watch_history.json from Google Drive
-        val syncJob = launch {
-            viewModel.prepareInitialState()
-        }
-
-        // Minimum display duration for branding animation
-        delay(1200)
-
-        // Wait for cloud history to finish loading before unlocking the UI
-        syncJob.join()
-
+        // Brief hold to view the completed wordmark, then transition immediately
+        delay(400)
         onBootComplete()
     }
 
@@ -327,7 +320,7 @@ fun ClotubeBootScreen(
                         letterSpacing = (-1).sp,
                         modifier = Modifier.graphicsLayer {
                             alpha = letterAlphas[index].value
-                            translationX = (1f - letterAlphas[index].value) * -14f
+                            translationX = (1f - letterAlphas[index].value) * -12f
                         }
                     )
                 }

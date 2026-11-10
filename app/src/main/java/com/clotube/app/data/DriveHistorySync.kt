@@ -47,15 +47,25 @@ object DriveHistorySync {
                 return@withContext
             }
 
-            val query = "name = '$SYNC_FILE_NAME' and trashed = false"
-            val fileList = driveService.files().list()
-                .setQ(query)
+            val dirs = DriveDirectoryManager.resolveHierarchy(driveService)
+            val scopedQuery = "'${dirs.historyFolderId}' in parents and name = '$SYNC_FILE_NAME' and trashed = false"
+            val scopedFileList = driveService.files().list()
+                .setQ(scopedQuery)
                 .setFields("files(id, name)")
                 .setSupportsAllDrives(true)
                 .setIncludeItemsFromAllDrives(true)
                 .execute()
 
-            val cloudFile = fileList.files?.firstOrNull() ?: return@withContext
+            val cloudFile = scopedFileList.files?.firstOrNull() ?: run {
+                val fallbackQuery = "name = '$SYNC_FILE_NAME' and trashed = false"
+                driveService.files().list()
+                    .setQ(fallbackQuery)
+                    .setFields("files(id, name)")
+                    .setSupportsAllDrives(true)
+                    .setIncludeItemsFromAllDrives(true)
+                    .execute()
+                    .files?.firstOrNull()
+            } ?: return@withContext
             val outputStream = ByteArrayOutputStream()
             driveService.files().get(cloudFile.id)
                 .setSupportsAllDrives(true)
@@ -82,7 +92,8 @@ object DriveHistorySync {
             val jsonContent = historyManager.exportHistoryJson()
             if (jsonContent.isBlank() || jsonContent == "[]") return@withContext
 
-            val query = "name = '$SYNC_FILE_NAME' and trashed = false"
+            val dirs = DriveDirectoryManager.resolveHierarchy(driveService)
+            val query = "'${dirs.historyFolderId}' in parents and name = '$SYNC_FILE_NAME' and trashed = false"
             val fileList = driveService.files().list()
                 .setQ(query)
                 .setFields("files(id, name)")
@@ -97,16 +108,17 @@ object DriveHistorySync {
                 driveService.files().update(existing.id, null, mediaContent)
                     .setSupportsAllDrives(true)
                     .execute()
-                Log.d(TAG, "Updated existing clotube_history.json on Google Drive.")
+                Log.d(TAG, "Updated existing clotube_history.json in clotube/History/ on Google Drive.")
             } else {
                 val metadata = DriveFile().apply {
                     name = SYNC_FILE_NAME
                     mimeType = "application/json"
+                    parents = listOf(dirs.historyFolderId)
                 }
                 driveService.files().create(metadata, mediaContent)
                     .setSupportsAllDrives(true)
                     .execute()
-                Log.d(TAG, "Created fresh clotube_history.json on Google Drive.")
+                Log.d(TAG, "Created fresh clotube_history.json in clotube/History/ on Google Drive.")
             }
         } catch (e: Exception) {
             Log.e(TAG, "History cloud backup failed: ${e.message}", e)

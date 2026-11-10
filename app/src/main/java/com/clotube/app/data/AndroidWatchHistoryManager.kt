@@ -4,19 +4,54 @@ import android.content.Context
 import com.google.gson.GsonBuilder
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
+import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 
 data class AndroidTypedEntry(val type: String, val value: Any)
 
 object AndroidWatchHistoryManager {
+    private const val MAX_V2_PAYLOAD_BYTES = 28 * 1024
     private val gson = GsonBuilder().setPrettyPrinting().create()
     private val memoryCache = ConcurrentHashMap<String, MutableMap<String, AndroidTypedEntry>>()
+
+    private val ITEM_SUFFIXES = listOf(
+        "_is_watched",
+        "_is_series",
+        "_series_id",
+        "_season_num",
+        "_episode_num",
+        "_timestamp",
+        "_fraction",
+        "_title",
+        "_pos",
+        "_dur"
+    )
+
+    private val NON_ITEM_PREFIXES = listOf(
+        "series_resume_",
+        "global_",
+        "last_global_",
+        "snapshot_",
+        "progress_",
+        "playback_pos_",
+        "playback_dur_",
+        "completed_",
+        "timestamp_",
+        "watch_progress_",
+        "episode_title_"
+    )
 
     private fun getFile(context: Context, email: String): File {
         val dir = File(context.filesDir, "profiles/${email.replace("[^a-zA-Z0-9._-]".toRegex(), "_")}")
         if (!dir.exists()) dir.mkdirs()
         return File(dir, "clotube_watch_history.json")
+    }
+
+    private fun getV2File(context: Context, email: String): File {
+        val dir = File(context.filesDir, "profiles/${email.replace("[^a-zA-Z0-9._-]".toRegex(), "_")}")
+        if (!dir.exists()) dir.mkdirs()
+        return File(dir, "clotube_active_sync.json")
     }
 
     @Synchronized
@@ -79,9 +114,272 @@ object AndroidWatchHistoryManager {
 
             val file = getFile(context, email)
             file.writeText(gson.toJson(root), Charsets.UTF_8)
+
+            val v2Json = buildV2PayloadFromEntries(entries).toJsonString()
+            getV2File(context, email).writeText(v2Json, Charsets.UTF_8)
         } catch (e: Exception) {
             e.printStackTrace()
         }
+    }
+
+    @Synchronized
+    fun clearLocal(context: Context, email: String) {
+        if (email.isBlank()) return
+        memoryCache.remove(email)
+        try {
+            getFile(context, email).delete()
+            getV2File(context, email).delete()
+        } catch (_: Exception) {}
+    }
+
+    fun isV2Payload(json: String): Boolean {
+        if (json.isBlank()) return false
+        return try {
+            val root = JSONObject(json)
+            root.optInt("v", 0) >= 2 ||
+                (!root.has("entries") && (root.has("active") || root.has("watchedIds") || root.has("resume")))
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    fun buildV2PayloadFromEntries(
+        entries: Map<String, AndroidTypedEntry>,
+        updatedAt: Long = System.currentTimeMillis()
+    ): WatchHistoryPayloadV2 {
+        val itemIds = linkedSetOf<String>()
+        val seriesResumeIds = linkedSetOf<String>()
+
+        for (key in entries.keys) {
+            if (key == "watch_history_list_json") continue
+            if (key.startsWith("series_resume_") && key.endsWith("_episode_id")) {
+                val sid = key.removePrefix("series_resume_").removeSuffix("_episode_id")
+                if (sid.isNotBlank()) seriesResumeIds.add(sid)
+                continue
+            }
+            if (NON_ITEM_PREFIXES.any { key.startsWith(it) }) continue
+            val matchedSuffix = ITEM_SUFFIXES.firstOrNull { key.endsWith(it) } ?: continue
+            val id = key.removeSuffix(matchedSuffix)
+            if (id.isNotBlank()) {
+                itemIds.add(id)
+            }
+        }
+
+        // Also migrate legacy DataStore keys (playback_pos_<id>, completed_<id>) if present without modern keys
+        for (key in entries.keys) {
+            when {
+                key.startsWith("playback_pos_") -> {
+                    val id = key.removePrefix("playback_pos_")
+                    if (id.isNotBlank()) itemIds.add(id)
+                }
+                key.startsWith("completed_") -> {
+                    val id = key.removePrefix("completed_")
+                    if (id.isNotBlank()) itemIds.add(id)
+                }
+            }
+        }
+
+        val watchedIds = mutableListOf<String>()
+        val activeItems = mutableListOf<HistoryItemEntityV2>()
+
+        for (id in itemIds) {
+            val title = (entries["${id}_title"]?.value as? String)
+                ?: (entries["episode_title_${id}"]?.value as? String)
+                ?: ""
+            val pos = (entries["${id}_pos"]?.value as? Number)?.toLong()
+                ?: (entries["playback_pos_${id}"]?.value as? Number)?.toLong()
+                ?: 0L
+            val dur = (entries["${id}_dur"]?.value as? Number)?.toLong()
+                ?: (entries["playback_dur_${id}"]?.value as? Number)?.toLong()
+                ?: 0L
+            val frac = (entries["${id}_fraction"]?.value as? Number)?.toFloat()
+                ?: if (dur > 0L) (pos.toFloat() / dur.toFloat()).coerceIn(0f, 1f) else 0f
+            val ts = (entries["${id}_timestamp"]?.value as? Number)?.toLong()
+                ?: (entries["timestamp_${id}"]?.value as? Number)?.toLong()
+                ?: 0L
+            val explicitWatched = (entries["${id}_is_watched"]?.value as? Boolean)
+                ?: (entries["${id}_is_watched"]?.value as? String)?.toBooleanStrictOrNull()
+                ?: (entries["completed_${id}"]?.value as? Boolean)
+            val isWatched = explicitWatched ?: (frac >= 0.90f)
+
+            val seriesId = (entries["${id}_series_id"]?.value as? String)?.ifBlank { null }
+            val seasonNum = (entries["${id}_season_num"]?.value as? Number)?.toInt()
+            val episodeNum = (entries["${id}_episode_num"]?.value as? Number)?.toInt()
+
+            if (isWatched) {
+                watchedIds.add(id)
+            }
+            if (ts > 0L || pos > 0L || dur > 0L || isWatched) {
+                activeItems.add(
+                    HistoryItemEntityV2(
+                        id = id,
+                        title = title,
+                        positionMs = pos,
+                        durationMs = dur,
+                        timestamp = ts,
+                        isWatched = isWatched,
+                        seriesId = seriesId,
+                        seasonNumber = seasonNum,
+                        episodeNumber = episodeNum
+                    )
+                )
+            }
+        }
+
+        val resumeMap = linkedMapOf<String, SeriesResumeEntityV2>()
+        for (sid in seriesResumeIds) {
+            val prefix = "series_resume_$sid"
+            val epId = (entries["${prefix}_episode_id"]?.value as? String)?.trim().orEmpty()
+            if (epId.isBlank()) continue
+            val sNum = (entries["${prefix}_season_num"]?.value as? Number)?.toInt() ?: 1
+            val eNum = (entries["${prefix}_episode_num"]?.value as? Number)?.toInt() ?: 1
+            val posMs = (entries["${prefix}_pos_ms"]?.value as? Number)?.toLong() ?: 0L
+            val durMs = (entries["${prefix}_dur_ms"]?.value as? Number)?.toLong() ?: 0L
+            val ts = (entries["${prefix}_timestamp"]?.value as? Number)?.toLong() ?: 0L
+            resumeMap[sid] = SeriesResumeEntityV2(
+                episodeId = epId,
+                seasonNumber = sNum,
+                episodeNumber = eNum,
+                positionMs = posMs,
+                durationMs = durMs,
+                timestamp = ts
+            )
+        }
+
+        return WatchHistoryPayloadV2(
+            version = 2,
+            updatedAt = updatedAt,
+            active = activeItems,
+            resume = resumeMap,
+            watchedIds = watchedIds
+        ).prunedToMaxBytes(MAX_V2_PAYLOAD_BYTES)
+    }
+
+    /**
+     * Returns the V2-format JSON payload for the given user's local history,
+     * built from the in-memory cache (which is authoritative after setEpisodeWatched mutations).
+     */
+    fun getV2PayloadJson(context: Context, email: String): String {
+        val entries = loadLocalSync(context, email)
+        val snapshot = synchronized(entries) { entries.toMap() }
+        return buildV2PayloadFromEntries(snapshot).toJsonString()
+    }
+
+    /**
+     * Merges a remote V2 payload into the local profile-scoped file-based cache.
+     *
+     * Reconciliation strategy (timestamp-wins with explicit unwatch support):
+     * - For each item in remote `active`: if remote timestamp > local, adopt the remote item's
+     *   isWatched flag exactly. If the remote says isWatched=false, the local `_is_watched` key
+     *   is written as false, so subsequent buildV2PayloadFromEntries excludes it from watchedIds.
+     * - For IDs in remote `watchedIds` that have no corresponding `active` entry: mark watched
+     *   only if local timestamp is not newer with an explicit unwatched state.
+     * - Resume pointers merge by timestamp-wins as before.
+     */
+    fun mergeRemoteV2Payload(context: Context, email: String, remoteJson: String): Boolean {
+        if (email.isBlank() || remoteJson.isBlank()) return false
+        if (!isV2Payload(remoteJson)) {
+            return mergeRemotePayload(context, email, remoteJson)
+        }
+
+        val local = loadLocalSync(context, email)
+        var changed = false
+
+        try {
+            val payload = WatchHistoryPayloadV2.fromJsonString(remoteJson)
+            synchronized(local) {
+                val remoteWatchedSet = payload.watchedIds.toSet()
+
+                // 1. Reconcile active items: adopt remote isWatched flag when remote is newer.
+                for (item in payload.active) {
+                    if (item.id.isBlank()) continue
+                    val localTs = (local["${item.id}_timestamp"]?.value as? Number)?.toLong() ?: 0L
+                    val isMissing = !local.containsKey("${item.id}_pos") &&
+                        !local.containsKey("${item.id}_is_watched")
+                    if (item.timestamp > localTs || isMissing) {
+                        if (item.title.isNotBlank()) {
+                            local["${item.id}_title"] = AndroidTypedEntry("string", item.title)
+                        }
+                        // When unmarked (isWatched=false), write pos=0 and fraction=0
+                        val effectivePos = if (item.isWatched) item.positionMs else 0L
+                        val effectiveFrac = if (item.isWatched) {
+                            if (item.durationMs > 0L)
+                                (item.positionMs.toFloat() / item.durationMs.toFloat()).coerceIn(0f, 1f)
+                            else 1.0f
+                        } else {
+                            0.0f
+                        }
+                        local["${item.id}_pos"] = AndroidTypedEntry("long", effectivePos)
+                        local["${item.id}_dur"] = AndroidTypedEntry("long", item.durationMs)
+                        local["${item.id}_fraction"] = AndroidTypedEntry("float", effectiveFrac)
+                        local["${item.id}_timestamp"] = AndroidTypedEntry("long", item.timestamp)
+                        // Authoritative: use the item's explicit isWatched from remote,
+                        // also checking remoteWatchedSet for IDs that are only in watchedIds.
+                        val watchedValue = item.isWatched || item.id in remoteWatchedSet
+                        local["${item.id}_is_watched"] = AndroidTypedEntry("boolean", watchedValue)
+                        local["${item.id}_is_series"] = AndroidTypedEntry("boolean", !item.seriesId.isNullOrBlank())
+                        if (!item.seriesId.isNullOrBlank()) {
+                            local["${item.id}_series_id"] = AndroidTypedEntry("string", item.seriesId)
+                        }
+                        if (item.seasonNumber != null) {
+                            local["${item.id}_season_num"] = AndroidTypedEntry("int", item.seasonNumber)
+                        }
+                        if (item.episodeNumber != null) {
+                            local["${item.id}_episode_num"] = AndroidTypedEntry("int", item.episodeNumber)
+                        }
+                        changed = true
+                    }
+                }
+
+                // 2. For IDs in remoteWatchedSet that have no active entry:
+                //    mark watched only when remote payload is newer than local timestamp.
+                val coveredByActive = payload.active.map { it.id }.toSet()
+                for (id in remoteWatchedSet) {
+                    if (id.isBlank() || id in coveredByActive) continue
+                    val localTs = (local["${id}_timestamp"]?.value as? Number)?.toLong() ?: 0L
+                    val localExplicit = local["${id}_is_watched"]?.value as? Boolean
+                    // Only override if the remote payload is authoritative (newer) or not set locally
+                    if (localExplicit != false || payload.updatedAt > localTs) {
+                        if (localExplicit != true) {
+                            local["${id}_is_watched"] = AndroidTypedEntry("boolean", true)
+                            changed = true
+                        }
+                        if (!local.containsKey("${id}_fraction")) {
+                            local["${id}_fraction"] = AndroidTypedEntry("float", 1.0f)
+                            changed = true
+                        }
+                        if (!local.containsKey("${id}_timestamp")) {
+                            local["${id}_timestamp"] = AndroidTypedEntry("long", payload.updatedAt)
+                            changed = true
+                        }
+                    }
+                }
+
+                // 3. Merge series resume pointers by timestamp-wins.
+                for ((sid, res) in payload.resume) {
+                    if (sid.isBlank() || res.episodeId.isBlank()) continue
+                    val prefix = "series_resume_$sid"
+                    val localTs = (local["${prefix}_timestamp"]?.value as? Number)?.toLong() ?: 0L
+                    val isMissing = !local.containsKey("${prefix}_episode_id")
+                    if (res.timestamp > localTs || isMissing) {
+                        local["${prefix}_episode_id"] = AndroidTypedEntry("string", res.episodeId)
+                        local["${prefix}_season_num"] = AndroidTypedEntry("int", res.seasonNumber)
+                        local["${prefix}_episode_num"] = AndroidTypedEntry("int", res.episodeNumber)
+                        local["${prefix}_pos_ms"] = AndroidTypedEntry("long", res.positionMs)
+                        local["${prefix}_dur_ms"] = AndroidTypedEntry("long", res.durationMs)
+                        local["${prefix}_timestamp"] = AndroidTypedEntry("long", res.timestamp)
+                        changed = true
+                    }
+                }
+            }
+
+            if (changed) {
+                saveLocal(context, email, local)
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return changed
     }
 
     fun getLocalPayloadJson(context: Context, email: String): String {
@@ -274,6 +572,18 @@ object AndroidWatchHistoryManager {
         return watched
     }
 
+    /**
+     * Marks or unmarks an episode as watched.
+     *
+     * When isWatched=false:
+     * - Sets _is_watched=false, _fraction=0, _pos=0 in the local cache.
+     * - Updates the timestamp so that subsequent remote merges recognise this as the
+     *   authoritative unwatch event (timestamp-wins).
+     * - If the series resume pointer points at this episode, resets its positionMs to 0.
+     * - Persists to disk and immediately triggers a force-upload to Drive via
+     *   DriveWatchHistorySync.pushHistoryAsync(context, force=true), bypassing all debounce
+     *   and hash-equality guards in executeDirectUploadInternal.
+     */
     fun setEpisodeWatched(
         context: Context,
         email: String,
@@ -314,6 +624,8 @@ object AndroidWatchHistoryManager {
             }
         }
         saveLocal(context, email, local)
+        // force=true bypasses the 15-second debounce AND the hash-equality guard in
+        // executeDirectUploadInternal, ensuring the unwatch propagates to Drive immediately.
         DriveWatchHistorySync.pushHistoryAsync(context.applicationContext, force = true)
     }
 

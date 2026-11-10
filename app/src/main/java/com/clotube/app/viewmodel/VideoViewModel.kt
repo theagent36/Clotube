@@ -18,7 +18,6 @@ import com.clotube.app.model.VideoItem
 import com.clotube.app.data.CachedCatalog
 import com.clotube.app.data.CatalogCacheManager
 import com.clotube.app.data.scanner.DriveCatalogScanner
-import com.clotube.app.data.scanner.SmartFolderResolver
 import com.clotube.app.model.Movie
 import com.google.android.gms.auth.GoogleAuthUtil
 import com.google.android.gms.auth.api.signin.GoogleSignIn
@@ -282,26 +281,33 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
     val isHistoryLoaded: StateFlow<Boolean> = _isHistoryLoaded.asStateFlow()
 
     /**
-     * Invoked during ClotubeBootScreen to fetch clotube_watch_history.json from Drive
-     * and ensure the latest watched episode or movie is ready before transitioning to Home.
+     * Initiates startup state resolution:
+     * 1. Immediately validates local DataStore records (< 15ms).
+     * 2. Asynchronously fetches clotube_active_sync.json / history from Drive in the background.
      */
-    suspend fun prepareInitialState() = withContext(Dispatchers.IO) {
-        try {
-            // 1. Pull the remote history JSON directly from Google Drive into DataStore
-            driveWatchHistorySync.syncFromCloud(playbackHistoryManager.dataStore)
-        } catch (e: Exception) {
-            android.util.Log.e("ClotubeBoot", "Failed to sync history on boot: ${e.message}")
-        } finally {
-            // 2. Await initial catalog & history emission or time out safely (max 2.5s) to prevent offline stalls
-            withTimeoutOrNull(2500L) {
+    fun prepareInitialState() {
+        viewModelScope.launch(Dispatchers.IO) {
+            // Step 1: Hydrate local DataStore state immediately before releasing hero gate
+            try {
                 val lastWatched = playbackHistoryManager.lastWatchedFlow.first()
                 if (lastWatched != null && lastWatched.progressFraction < 0.95f) {
-                    continueWatchingDisplayState.first { it != null }
-                } else {
-                    continueWatchingDisplayState.first { true }
+                    withTimeoutOrNull(150L) {
+                        continueWatchingDisplayState.first { it != null }
+                    }
                 }
+            } catch (_: Exception) {
+            } finally {
+                _isHistoryLoaded.value = true
             }
-            _isHistoryLoaded.value = true
+
+            // Step 2: Background Drive sync with defensive timeout
+            try {
+                withTimeoutOrNull(6000L) {
+                    driveWatchHistorySync.syncFromCloud(playbackHistoryManager.dataStore)
+                }
+            } catch (e: Exception) {
+                android.util.Log.w("VideoViewModel", "Background boot sync skipped/timed out: ${e.message}")
+            }
         }
     }
 
@@ -812,6 +818,12 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     suspend fun resolveMoviesFolderId(service: Drive? = null): String? = withContext(Dispatchers.IO) {
+        if (!folderManager.hasCustomMoviesOverride()) {
+            val dirs = folderManager.resolveAndCacheHierarchy(service)
+            if (!dirs?.moviesFolderId.isNullOrBlank() && dirs?.moviesFolderId != "root") {
+                return@withContext dirs?.moviesFolderId
+            }
+        }
         val cached = folderManager.getMoviesFolderId()
         if (!cached.isNullOrBlank() && cached != "root") return@withContext cached
         val status = folderManager.checkFoldersStatus().getOrNull()
@@ -819,6 +831,12 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     suspend fun resolveSeriesFolderId(service: Drive? = null): String? = withContext(Dispatchers.IO) {
+        if (!folderManager.hasCustomSeriesOverride()) {
+            val dirs = folderManager.resolveAndCacheHierarchy(service)
+            if (!dirs?.seriesFolderId.isNullOrBlank() && dirs?.seriesFolderId != "root") {
+                return@withContext dirs?.seriesFolderId
+            }
+        }
         val cached = folderManager.getSeriesFolderId()
         if (!cached.isNullOrBlank() && cached != "root") return@withContext cached
         val status = folderManager.checkFoldersStatus().getOrNull()
@@ -1653,6 +1671,8 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
 
     fun signOut() {
         authRepository.signOut {
+            folderManager.resetSessionCache()
+            driveWatchHistorySync.invalidateCache()
             viewModelScope.launch {
                 catalogCacheManager.clearCache()
             }
@@ -2059,21 +2079,34 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 val service = getDriveService()
                 if (service != null) {
-                    // Discover the best populated folder dynamically
-                    val moviesFolderId = SmartFolderResolver.findPopulatedMoviesFolder(service)
-                        ?: resolveMoviesFolderId(service)
-                    val seriesFolderId = SmartFolderResolver.findPopulatedSeriesFolder(service)
-                        ?: resolveSeriesFolderId(service)
+                    val customMoviesOverride = folderManager.hasCustomMoviesOverride()
+                    val customSeriesOverride = folderManager.hasCustomSeriesOverride()
 
-                    Log.d("VideoViewModel", "Discovered Movies Folder ID: $moviesFolderId")
-                    Log.d("VideoViewModel", "Discovered Series Folder ID: $seriesFolderId")
+                    // Resolve clotube/ directory hierarchy via DriveDirectoryManager (with root fallback)
+                    val resolvedDirs = if (!customMoviesOverride || !customSeriesOverride) {
+                        folderManager.resolveAndCacheHierarchy(service)
+                    } else null
 
-                    // Persist discovered folder IDs to prevent sticking to empty onboarding folders
-                    if (!moviesFolderId.isNullOrBlank()) {
-                        folderManager.saveCustomMoviesFolderId(moviesFolderId)
+                    val moviesFolderId = if (customMoviesOverride) {
+                        folderManager.getMoviesFolderId() ?: resolvedDirs?.moviesFolderId
+                    } else {
+                        resolvedDirs?.moviesFolderId ?: resolveMoviesFolderId(service)
                     }
-                    if (!seriesFolderId.isNullOrBlank()) {
-                        folderManager.saveCustomSeriesFolderId(seriesFolderId)
+                    val seriesFolderId = if (customSeriesOverride) {
+                        folderManager.getSeriesFolderId() ?: resolvedDirs?.seriesFolderId
+                    } else {
+                        resolvedDirs?.seriesFolderId ?: resolveSeriesFolderId(service)
+                    }
+
+                    Log.d("VideoViewModel", "Resolved Movies Folder ID: $moviesFolderId")
+                    Log.d("VideoViewModel", "Resolved Series Folder ID: $seriesFolderId")
+
+                    // Persist resolved folder IDs without marking them as manual custom overrides
+                    if (!customMoviesOverride && !moviesFolderId.isNullOrBlank()) {
+                        folderManager.saveCustomMoviesFolderId(moviesFolderId, isUserOverride = false)
+                    }
+                    if (!customSeriesOverride && !seriesFolderId.isNullOrBlank()) {
+                        folderManager.saveCustomSeriesFolderId(seriesFolderId, isUserOverride = false)
                     }
 
                     // 1. Recursive Scan for Movies

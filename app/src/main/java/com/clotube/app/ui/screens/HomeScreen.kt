@@ -762,8 +762,12 @@ fun HomeScreen(
                                             )
                                         }
                                         !isHistoryLoaded -> {
-                                            // Keep space clean / stable while initial history state resolves (avoids flashing Crime 101)
-                                            Spacer(modifier = Modifier.height(210.dp))
+                                            // Stable placeholder container during initial hydration (avoids flashing featured hero)
+                                            Box(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .height(210.dp)
+                                            )
                                         }
                                         heroMovie != null || heroSeries != null -> {
                                             HeroBillboardSection(

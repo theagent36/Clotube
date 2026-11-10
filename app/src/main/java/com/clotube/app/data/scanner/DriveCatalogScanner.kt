@@ -1,6 +1,7 @@
 package com.clotube.app.data.scanner
 
 import android.util.Log
+import com.clotube.app.data.DriveDirectoryManager
 import com.clotube.app.data.FreshBootScanResult
 import com.clotube.app.data.metadata.OnlineMetadataResolver
 import com.clotube.app.model.Episode
@@ -46,12 +47,13 @@ object DriveCatalogScanner {
         try {
             OnlineMetadataResolver.clearCache()
             val driveService = getDriveService() ?: return@withContext FreshBootScanResult(emptyList(), emptyList())
+            val dirs = DriveDirectoryManager.resolveHierarchy(driveService)
 
             // 1. Rescan Movies Folder
-            val freshMovies = scanMoviesDirect(driveService)
+            val freshMovies = scanMoviesDirect(driveService, dirs.moviesFolderId)
 
             // 2. Rescan Series Folders
-            val freshSeries = scanSeriesDirect(driveService)
+            val freshSeries = scanSeriesDirect(driveService, dirs.seriesFolderId)
 
             Log.d(TAG, "Fresh-Boot scan complete: ${freshMovies.size} movies, ${freshSeries.size} series.")
             FreshBootScanResult(movies = freshMovies, series = freshSeries)
@@ -61,19 +63,13 @@ object DriveCatalogScanner {
         }
     }
 
-    private suspend fun scanMoviesDirect(driveService: Drive): List<Movie> = withContext(Dispatchers.IO) {
+    private suspend fun scanMoviesDirect(
+        driveService: Drive,
+        resolvedMoviesFolderId: String? = null
+    ): List<Movie> = withContext(Dispatchers.IO) {
         try {
-            val folderQuery = "name = 'Movies' and mimeType = '$FOLDER_MIME' and trashed = false"
-            val folderRes = driveService.files().list()
-                .setQ(folderQuery)
-                .setFields("files(id, name)")
-                .setSupportsAllDrives(true)
-                .setIncludeItemsFromAllDrives(true)
-                .setPageSize(5)
-                .execute()
-
-            val moviesFolderId = folderRes.files?.firstOrNull()?.id
-                ?: SmartFolderResolver.findPopulatedMoviesFolder(driveService)
+            val moviesFolderId = resolvedMoviesFolderId
+                ?: DriveDirectoryManager.resolveHierarchy(driveService).moviesFolderId
                 ?: return@withContext emptyList()
 
             val fileQuery = "'$moviesFolderId' in parents and mimeType contains 'video/' and trashed = false"
@@ -107,19 +103,13 @@ object DriveCatalogScanner {
         }
     }
 
-    private suspend fun scanSeriesDirect(driveService: Drive): List<Series> = withContext(Dispatchers.IO) {
+    private suspend fun scanSeriesDirect(
+        driveService: Drive,
+        resolvedSeriesFolderId: String? = null
+    ): List<Series> = withContext(Dispatchers.IO) {
         try {
-            val seriesParentQuery = "name = 'Series' and mimeType = '$FOLDER_MIME' and trashed = false"
-            val parentFolderRes = driveService.files().list()
-                .setQ(seriesParentQuery)
-                .setFields("files(id, name)")
-                .setSupportsAllDrives(true)
-                .setIncludeItemsFromAllDrives(true)
-                .setPageSize(5)
-                .execute()
-
-            val seriesRootId = parentFolderRes.files?.firstOrNull()?.id
-                ?: SmartFolderResolver.findPopulatedSeriesFolder(driveService)
+            val seriesRootId = resolvedSeriesFolderId
+                ?: DriveDirectoryManager.resolveHierarchy(driveService).seriesFolderId
                 ?: return@withContext emptyList()
 
             val showFoldersQuery = "'$seriesRootId' in parents and mimeType = '$FOLDER_MIME' and trashed = false"

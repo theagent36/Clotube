@@ -18,16 +18,16 @@ import com.clotube.app.model.TvSeries
 import com.clotube.app.model.VideoItem
 import com.clotube.app.player.DriveMediaSourceFactory
 import com.clotube.app.viewmodel.formatTimestamp
+import com.google.api.client.http.javanet.NetHttpTransport
+import com.google.api.client.json.gson.GsonFactory
+import com.google.api.services.drive.Drive
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Locale
 import java.util.concurrent.TimeUnit
@@ -72,6 +72,8 @@ class DriveFolderManager(
 
         val KEY_MOVIES_FOLDER_ID = stringPreferencesKey("movies_folder_id")
         val KEY_SERIES_FOLDER_ID = stringPreferencesKey("series_folder_id")
+        val KEY_CUSTOM_MOVIES_OVERRIDE = booleanPreferencesKey("custom_movies_override")
+        val KEY_CUSTOM_SERIES_OVERRIDE = booleanPreferencesKey("custom_series_override")
         val KEY_ONBOARDING_COMPLETED = booleanPreferencesKey("onboarding_completed")
 
         private val EPISODE_REGEX = """(?i)(?:s|season\s*)(\d{1,2})[\s._-]*(?:e|ep|x)?(\d{1,2})""".toRegex()
@@ -186,13 +188,66 @@ class DriveFolderManager(
         prefs[KEY_ONBOARDING_COMPLETED] ?: false
     }
 
+    @Volatile
+    private var hasResolvedHierarchyThisSession: Boolean = false
+
+    private fun buildDriveService(accessToken: String): Drive {
+        return Drive.Builder(
+            NetHttpTransport(),
+            GsonFactory.getDefaultInstance()
+        ) { request ->
+            request.headers.authorization = "Bearer $accessToken"
+        }.setApplicationName("Clotube/1.0").build()
+    }
+
+    suspend fun hasCustomMoviesOverride(): Boolean = withContext(Dispatchers.IO) {
+        context.dataStore.data.first()[KEY_CUSTOM_MOVIES_OVERRIDE] ?: false
+    }
+
+    suspend fun hasCustomSeriesOverride(): Boolean = withContext(Dispatchers.IO) {
+        context.dataStore.data.first()[KEY_CUSTOM_SERIES_OVERRIDE] ?: false
+    }
+
+    fun resetSessionCache() {
+        hasResolvedHierarchyThisSession = false
+    }
+
+    suspend fun resolveAndCacheHierarchy(driveService: Drive? = null): AndroidResolvedDirectories? = withContext(Dispatchers.IO) {
+        val service = driveService ?: authRepository.getAccessToken().getOrNull()?.let { buildDriveService(it) }
+            ?: return@withContext null
+
+        return@withContext try {
+            val dirs = DriveDirectoryManager.resolveHierarchy(service)
+            val prefs = context.dataStore.data.first()
+            val moviesOverridden = prefs[KEY_CUSTOM_MOVIES_OVERRIDE] ?: false
+            val seriesOverridden = prefs[KEY_CUSTOM_SERIES_OVERRIDE] ?: false
+
+            context.dataStore.edit { mutablePrefs ->
+                if (!moviesOverridden && !dirs.moviesFolderId.isNullOrBlank() && dirs.moviesFolderId != "root") {
+                    mutablePrefs[KEY_MOVIES_FOLDER_ID] = dirs.moviesFolderId
+                }
+                if (!seriesOverridden && !dirs.seriesFolderId.isNullOrBlank() && dirs.seriesFolderId != "root") {
+                    mutablePrefs[KEY_SERIES_FOLDER_ID] = dirs.seriesFolderId
+                }
+                mutablePrefs[KEY_ONBOARDING_COMPLETED] = true
+            }
+            hasResolvedHierarchyThisSession = true
+            dirs
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed resolving Drive directory hierarchy: ${e.message}", e)
+            null
+        }
+    }
+
     /**
-     * Retrieves the strictly verified alphanumeric folderId for the root 'Movies' folder.
+     * Retrieves the strictly verified alphanumeric folderId for the Movies folder
+     * via DriveDirectoryManager (clotube/Movies with root fallback), preserving manual overrides.
      * Rejects and purges any instance of "root".
      */
     suspend fun getMoviesFolderId(): String? = withContext(Dispatchers.IO) {
         val prefs = context.dataStore.data.first()
         var moviesId = prefs[KEY_MOVIES_FOLDER_ID]
+        val isCustomOverride = prefs[KEY_CUSTOM_MOVIES_OVERRIDE] ?: false
 
         // Strict verification: "root" is NEVER a valid folder ID
         if (moviesId == "root") {
@@ -201,25 +256,28 @@ class DriveFolderManager(
             moviesId = null
         }
 
-        if (moviesId.isNullOrBlank()) {
-            val token = authRepository.getAccessToken().getOrNull() ?: return@withContext null
-            moviesId = findRootFolderIdByName("Movies", token)
-            if (!moviesId.isNullOrBlank() && moviesId != "root") {
-                saveFolderId(KEY_MOVIES_FOLDER_ID, moviesId)
-            } else {
-                moviesId = null
+        if (isCustomOverride && !moviesId.isNullOrBlank()) {
+            return@withContext moviesId
+        }
+
+        if (!hasResolvedHierarchyThisSession || moviesId.isNullOrBlank()) {
+            val resolved = resolveAndCacheHierarchy()
+            if (!resolved?.moviesFolderId.isNullOrBlank() && resolved?.moviesFolderId != "root") {
+                moviesId = resolved?.moviesFolderId
             }
         }
         moviesId
     }
 
     /**
-     * Retrieves the strictly verified alphanumeric folderId for the root 'Series' folder.
+     * Retrieves the strictly verified alphanumeric folderId for the Series folder
+     * via DriveDirectoryManager (clotube/Series with root fallback), preserving manual overrides.
      * Rejects and purges any instance of "root".
      */
     suspend fun getSeriesFolderId(): String? = withContext(Dispatchers.IO) {
         val prefs = context.dataStore.data.first()
         var seriesId = prefs[KEY_SERIES_FOLDER_ID]
+        val isCustomOverride = prefs[KEY_CUSTOM_SERIES_OVERRIDE] ?: false
 
         // Strict verification: "root" is NEVER a valid folder ID
         if (seriesId == "root") {
@@ -228,23 +286,24 @@ class DriveFolderManager(
             seriesId = null
         }
 
-        if (seriesId.isNullOrBlank()) {
-            val token = authRepository.getAccessToken().getOrNull() ?: return@withContext null
-            seriesId = findRootFolderIdByName("Series", token)
-            if (!seriesId.isNullOrBlank() && seriesId != "root") {
-                saveFolderId(KEY_SERIES_FOLDER_ID, seriesId)
-            } else {
-                seriesId = null
+        if (isCustomOverride && !seriesId.isNullOrBlank()) {
+            return@withContext seriesId
+        }
+
+        if (!hasResolvedHierarchyThisSession || seriesId.isNullOrBlank()) {
+            val resolved = resolveAndCacheHierarchy()
+            if (!resolved?.seriesFolderId.isNullOrBlank() && resolved?.seriesFolderId != "root") {
+                seriesId = resolved?.seriesFolderId
             }
         }
         seriesId
     }
 
     /**
-     * Inspects Google Drive root and local DataStore for Movies and Series folders.
+     * Inspects Google Drive hierarchy via DriveDirectoryManager and local DataStore for Movies and Series folders.
      */
     suspend fun checkFoldersStatus(): Result<DriveFoldersStatus> = withContext(Dispatchers.IO) {
-        val token = authRepository.getAccessToken().getOrNull()
+        authRepository.getAccessToken().getOrNull()
             ?: return@withContext Result.failure(IllegalStateException("User not authenticated"))
 
         val moviesId = getMoviesFolderId()
@@ -266,48 +325,19 @@ class DriveFolderManager(
     }
 
     /**
-     * Creates missing Movies and/or Series root folders in Google Drive and persists their IDs.
+     * Resolves and non-destructively creates missing Movies and Series folders under clotube/ in Google Drive.
      */
     suspend fun createMissingFolders(
         createMovies: Boolean,
         createSeries: Boolean
     ): Result<Pair<String?, String?>> = withContext(Dispatchers.IO) {
-        val token = authRepository.getAccessToken().getOrNull()
+        authRepository.getAccessToken().getOrNull()
             ?: return@withContext Result.failure(IllegalStateException("User not authenticated"))
 
-        var newMoviesId: String? = null
-        var newSeriesId: String? = null
+        val dirs = resolveAndCacheHierarchy()
+            ?: return@withContext Result.failure(Exception("Failed resolving clotube Drive directory hierarchy"))
 
-        if (createMovies) {
-            val created = createFolderOnDrive("Movies", token)
-            if (created.isSuccess) {
-                newMoviesId = created.getOrNull()
-                if (!newMoviesId.isNullOrBlank() && newMoviesId != "root") {
-                    saveFolderId(KEY_MOVIES_FOLDER_ID, newMoviesId)
-                } else {
-                    return@withContext Result.failure(Exception("Created Movies folder returned invalid ID: $newMoviesId"))
-                }
-            } else {
-                return@withContext Result.failure(created.exceptionOrNull() ?: Exception("Failed to create Movies folder"))
-            }
-        }
-
-        if (createSeries) {
-            val created = createFolderOnDrive("Series", token)
-            if (created.isSuccess) {
-                newSeriesId = created.getOrNull()
-                if (!newSeriesId.isNullOrBlank() && newSeriesId != "root") {
-                    saveFolderId(KEY_SERIES_FOLDER_ID, newSeriesId)
-                } else {
-                    return@withContext Result.failure(Exception("Created Series folder returned invalid ID: $newSeriesId"))
-                }
-            } else {
-                return@withContext Result.failure(created.exceptionOrNull() ?: Exception("Failed to create Series folder"))
-            }
-        }
-
-        context.dataStore.edit { it[KEY_ONBOARDING_COMPLETED] = true }
-        Result.success(Pair(newMoviesId, newSeriesId))
+        Result.success(Pair(dirs.moviesFolderId, dirs.seriesFolderId))
     }
 
     /**
@@ -734,107 +764,29 @@ class DriveFolderManager(
         )
     }
 
-    /**
-     * Strictly queries explicit root folders:
-     * `'root' in parents and name = '$folderName' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`
-     * Rejects any invalid or "root" ID.
-     */
-    private fun findRootFolderIdByName(folderName: String, accessToken: String): String? {
-        val query = "'root' in parents and name = '$folderName' and mimeType = '$FOLDER_MIME_TYPE' and trashed = false"
-        val url = Uri.parse(BASE_DRIVE_API).buildUpon()
-            .appendQueryParameter("q", query)
-            .appendQueryParameter("fields", "files(id, name)")
-            .appendQueryParameter("pageSize", "1")
-            .appendQueryParameter("supportsAllDrives", "true")
-            .appendQueryParameter("includeItemsFromAllDrives", "true")
-            .build()
-            .toString()
-
-        val request = Request.Builder()
-            .url(url)
-            .header("Authorization", "Bearer $accessToken")
-            .header("User-Agent", "Clotube/1.0")
-            .get()
-            .build()
-
-        return try {
-            val response = okHttpClient.newCall(request).execute()
-            response.use { res ->
-                if (!res.isSuccessful) return null
-                val body = res.body?.string().orEmpty()
-                val json = JSONObject(body)
-                val files = json.optJSONArray("files") ?: return null
-                if (files.length() > 0) {
-                    val foundId = files.getJSONObject(0).getString("id")
-                    // Reject "root" and blank IDs
-                    if (foundId.isNotBlank() && foundId != "root") {
-                        foundId
-                    } else null
-                } else null
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed finding root folder '$folderName'", e)
-            null
-        }
-    }
-
-    private fun createFolderOnDrive(folderName: String, accessToken: String): Result<String> {
-        val url = "$BASE_DRIVE_API?supportsAllDrives=true"
-        val jsonPayload = JSONObject().apply {
-            put("name", folderName)
-            put("mimeType", FOLDER_MIME_TYPE)
-            put("parents", JSONArray().apply { put("root") })
-        }
-
-        val requestBody = jsonPayload.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
-        val request = Request.Builder()
-            .url(url)
-            .header("Authorization", "Bearer $accessToken")
-            .header("User-Agent", "Clotube/1.0")
-            .post(requestBody)
-            .build()
-
-        return try {
-            val response = okHttpClient.newCall(request).execute()
-            response.use { res ->
-                if (!res.isSuccessful) {
-                    val error = res.body?.string().orEmpty()
-                    return Result.failure(Exception("Failed creating folder '$folderName': ${res.code} - $error"))
-                }
-                val body = res.body?.string().orEmpty()
-                val json = JSONObject(body)
-                val createdId = json.getString("id")
-                if (createdId.isBlank() || createdId == "root") {
-                    return Result.failure(Exception("Created folder returned invalid ID: $createdId"))
-                }
-                Log.d(TAG, "Successfully created root folder '$folderName' with id $createdId")
-                Result.success(createdId)
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Network exception creating folder '$folderName'", e)
-            Result.failure(e)
-        }
-    }
-
     suspend fun clearSavedFolderIds() = withContext(Dispatchers.IO) {
+        hasResolvedHierarchyThisSession = false
         context.dataStore.edit { prefs ->
             prefs.remove(KEY_MOVIES_FOLDER_ID)
             prefs.remove(KEY_SERIES_FOLDER_ID)
+            prefs.remove(KEY_CUSTOM_MOVIES_OVERRIDE)
+            prefs.remove(KEY_CUSTOM_SERIES_OVERRIDE)
         }
     }
 
-    suspend fun saveCustomMoviesFolderId(folderId: String) = withContext(Dispatchers.IO) {
-        saveFolderId(KEY_MOVIES_FOLDER_ID, folderId)
-    }
-
-    suspend fun saveCustomSeriesFolderId(folderId: String) = withContext(Dispatchers.IO) {
-        saveFolderId(KEY_SERIES_FOLDER_ID, folderId)
-    }
-
-    private suspend fun saveFolderId(key: Preferences.Key<String>, id: String) {
-        if (id.isBlank() || id == "root") return
+    suspend fun saveCustomMoviesFolderId(folderId: String, isUserOverride: Boolean = true) = withContext(Dispatchers.IO) {
+        if (folderId.isBlank() || folderId == "root") return@withContext
         context.dataStore.edit { prefs ->
-            prefs[key] = id
+            prefs[KEY_MOVIES_FOLDER_ID] = folderId
+            prefs[KEY_CUSTOM_MOVIES_OVERRIDE] = isUserOverride
+        }
+    }
+
+    suspend fun saveCustomSeriesFolderId(folderId: String, isUserOverride: Boolean = true) = withContext(Dispatchers.IO) {
+        if (folderId.isBlank() || folderId == "root") return@withContext
+        context.dataStore.edit { prefs ->
+            prefs[KEY_SERIES_FOLDER_ID] = folderId
+            prefs[KEY_CUSTOM_SERIES_OVERRIDE] = isUserOverride
         }
     }
 
