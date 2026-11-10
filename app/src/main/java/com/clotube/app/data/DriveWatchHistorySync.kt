@@ -20,134 +20,264 @@ import com.google.api.client.json.gson.GsonFactory
 import com.google.api.services.drive.Drive
 import com.google.api.services.drive.DriveScopes
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
+
+enum class SyncPriority(val level: Int) {
+    CRITICAL_WATCH_STATE(1), // Mark / Unmark watched
+    TIMESTAMPS_AND_SEEK(2),  // Progress & resume timestamps
+    BACKGROUND_SYNC(3)       // Periodic remote pull
+}
 
 class DriveWatchHistorySync(private val context: Context) {
 
     private val appContext: Context = context.applicationContext
-
     private val TAG = "ClotubeSync"
     private val syncScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private var debouncedJob: Job? = null
-    private val isUploading = AtomicBoolean(false)
-    private val lastUploadTime = AtomicLong(0L)
     private val cachedFileId = AtomicReference<String?>(null)
-    private val syncMutex = Mutex()
-    private val MIN_INTERVAL_MS = 20_000L
+    private val uploadMutex = Mutex()
+    private val lastUploadTime = AtomicLong(0L)
 
-    private fun getDriveService(): Drive? {
-        val account = GoogleSignIn.getLastSignedInAccount(appContext)
-        Log.d(TAG, "Resolving Drive credentials/token for account: ${account?.email ?: "none"}...")
-        if (account == null) {
-            val token = runBlocking {
-                tokenProviderRef?.invoke() ?: com.clotube.app.auth.GoogleAuthRepository(appContext).getAccessToken().getOrNull()
-            }
-            if (!token.isNullOrBlank()) {
-                Log.d(TAG, "Using Bearer token provider for Drive service")
-                return Drive.Builder(NetHttpTransport(), GsonFactory.getDefaultInstance()) { request ->
-                    request.headers.authorization = "Bearer $token"
-                }.setApplicationName("Clotube").build()
-            }
-            Log.e(TAG, "Cannot sync: GoogleSignIn account is null and no token available")
-            return null
-        }
-
-        val googleAccount: Account? = account.account ?: account.email?.let { Account(it, "com.google") }
-        val credential = GoogleAccountCredential.usingOAuth2(
-            appContext,
-            Collections.singleton(DriveScopes.DRIVE)
-        ).setSelectedAccount(googleAccount)
-
-        return Drive.Builder(NetHttpTransport(), GsonFactory.getDefaultInstance(), credential)
-            .setApplicationName("Clotube")
-            .build()
+    // Priority-based task request holder
+    private class SyncTask(
+        val priority: SyncPriority,
+        val dataStore: DataStore<Preferences>,
+        val onComplete: CompletableDeferred<Boolean>? = null
+    ) : Comparable<SyncTask> {
+        override fun compareTo(other: SyncTask): Int = this.priority.level.compareTo(other.priority.level)
     }
 
-    fun triggerThrottledBackup(dataStore: DataStore<Preferences>) {
-        val now = System.currentTimeMillis()
-        val elapsed = now - lastUploadTime.get()
+    private val taskChannel = Channel<SyncTask>(Channel.UNLIMITED)
 
-        if (elapsed >= MIN_INTERVAL_MS) {
-            debouncedJob?.cancel()
-            debouncedJob = syncScope.launch(NonCancellable + Dispatchers.IO) {
-                executeDirectUpload(dataStore)
-            }
-        } else if (debouncedJob == null || !debouncedJob!!.isActive) {
-            debouncedJob = syncScope.launch(NonCancellable + Dispatchers.IO) {
-                delay(MIN_INTERVAL_MS - elapsed)
-                executeDirectUpload(dataStore)
+    init {
+        // Background Priority Queue Consumer
+        syncScope.launch {
+            while (isActive) {
+                val firstTask = taskChannel.receive()
+                val pending = mutableListOf<SyncTask>()
+                pending.add(firstTask)
+
+                // Drain any immediately available tasks to sort by priority
+                var next = taskChannel.tryReceive().getOrNull()
+                while (next != null) {
+                    pending.add(next)
+                    next = taskChannel.tryReceive().getOrNull()
+                }
+
+                // Sort: CRITICAL_WATCH_STATE (1) first, TIMESTAMPS_AND_SEEK (2), BACKGROUND_SYNC (3)
+                pending.sort()
+
+                val criticalTasks = pending.filter { it.priority == SyncPriority.CRITICAL_WATCH_STATE }
+                val progressTasks = pending.filter { it.priority == SyncPriority.TIMESTAMPS_AND_SEEK }
+                val backgroundTasks = pending.filter { it.priority == SyncPriority.BACKGROUND_SYNC }
+
+                // 1. Process all Critical tasks first (mark/unmark watched)
+                for (task in criticalTasks) {
+                    try {
+                        val success = executeDirectUploadInternal(task.dataStore, task.priority)
+                        task.onComplete?.complete(success)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "SyncTask failure: ${e.message}", e)
+                        task.onComplete?.complete(false)
+                    }
+                }
+
+                // 2. Process latest progress task (deduplicating redundant progress snapshots)
+                if (progressTasks.isNotEmpty()) {
+                    val latestProgress = progressTasks.last()
+                    progressTasks.dropLast(1).forEach { it.onComplete?.complete(true) }
+                    try {
+                        val success = executeDirectUploadInternal(latestProgress.dataStore, latestProgress.priority)
+                        latestProgress.onComplete?.complete(success)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Progress task failure: ${e.message}", e)
+                        latestProgress.onComplete?.complete(false)
+                    }
+                }
+
+                // 3. Process background reconciliation tasks
+                for (task in backgroundTasks) {
+                    try {
+                        val success = executeDirectUploadInternal(task.dataStore, task.priority)
+                        task.onComplete?.complete(success)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Background task failure: ${e.message}", e)
+                        task.onComplete?.complete(false)
+                    }
+                }
             }
         }
-    }
-
-    fun backupImmediately(dataStore: DataStore<Preferences>? = null) {
-        debouncedJob?.cancel()
-        syncScope.launch(NonCancellable + Dispatchers.IO) {
-            Log.d(TAG, "Executing immediate un-cancellable cloud sync...")
-            executeDirectUpload(dataStore)
-        }
-    }
-
-    fun pushHistoryAsync(dataStore: DataStore<Preferences>? = null, force: Boolean = false) {
-        backupImmediately(dataStore)
     }
 
     /**
-     * Permanently deletes clotube_watch_history.json from Google Drive.
+     * Priority 1: High-priority immediate dispatch for marking watched/unwatched.
+     * Bypasses debouncing and pulls; uploads the local DataStore snapshot directly within 100ms.
      */
-    suspend fun deleteRemoteHistoryFile(): Boolean = withContext(NonCancellable + Dispatchers.IO) {
-        debouncedJob?.cancel()
-        syncMutex.withLock {
+    fun enqueueImmediateWatchState(dataStore: DataStore<Preferences>) {
+        syncScope.launch(NonCancellable) {
+            Log.d(TAG, "[P1 - CRITICAL] Enqueuing immediate watch status push to Drive...")
+            val deferred = CompletableDeferred<Boolean>()
+            taskChannel.send(SyncTask(SyncPriority.CRITICAL_WATCH_STATE, dataStore, deferred))
+            deferred.await()
+        }
+    }
+
+    /**
+     * Priority 2: Periodic timestamp update (debounced/queued every 8-10 seconds).
+     */
+    fun enqueueProgressUpdate(dataStore: DataStore<Preferences>) {
+        val now = System.currentTimeMillis()
+        if (now - lastUploadTime.get() < 8000L) {
+            return // Throttled: progress updates wait at least 8 seconds between uploads
+        }
+        syncScope.launch(NonCancellable) {
+            taskChannel.send(SyncTask(SyncPriority.TIMESTAMPS_AND_SEEK, dataStore))
+        }
+    }
+
+    /**
+     * Flushes progress immediately on pause or player exit.
+     */
+    fun flushProgressImmediately(dataStore: DataStore<Preferences>) {
+        syncScope.launch(NonCancellable) {
+            taskChannel.send(SyncTask(SyncPriority.TIMESTAMPS_AND_SEEK, dataStore))
+        }
+    }
+
+    /**
+     * Priority 3: Low-priority background sync and remote pull.
+     */
+    fun enqueueBackgroundSync(dataStore: DataStore<Preferences>) {
+        syncScope.launch(NonCancellable) {
+            taskChannel.send(SyncTask(SyncPriority.BACKGROUND_SYNC, dataStore))
+        }
+    }
+
+    /**
+     * Legacy compatibility bridge for existing callers.
+     */
+    fun backupImmediately(dataStore: DataStore<Preferences>? = null) {
+        val target = dataStore ?: appContext.playbackDataStore
+        enqueueImmediateWatchState(target)
+    }
+
+    fun triggerThrottledBackup(dataStore: DataStore<Preferences>) {
+        enqueueProgressUpdate(dataStore)
+    }
+
+    fun pushHistoryAsync(dataStore: DataStore<Preferences>? = null, force: Boolean = false) {
+        val target = dataStore ?: appContext.playbackDataStore
+        enqueueImmediateWatchState(target)
+    }
+
+    suspend fun executeDirectUpload(dataStore: DataStore<Preferences>? = null): Boolean {
+        val target = dataStore ?: appContext.playbackDataStore
+        return executeDirectUploadInternal(target, SyncPriority.CRITICAL_WATCH_STATE)
+    }
+
+    private suspend fun executeDirectUploadInternal(
+        dataStore: DataStore<Preferences>,
+        priority: SyncPriority
+    ): Boolean = uploadMutex.withLock {
+        withContext(Dispatchers.IO) {
             try {
                 val driveService = getDriveService()
                 if (driveService == null) {
-                    Log.e(TAG, "Cannot delete remote file: Drive service unavailable")
-                    return@withLock false
+                    Log.e(TAG, "Sync aborted: Google Drive service unavailable")
+                    return@withContext false
                 }
 
-                val targetFileId = cachedFileId.get() ?: findHistoryFileId(driveService)
-                if (targetFileId == null) {
-                    Log.d(TAG, "No remote watch history file found on Drive to delete")
-                    cachedFileId.set(null)
-                    return@withLock true
-                }
-
-                try {
-                    driveService.files().delete(targetFileId)
-                        .setSupportsAllDrives(true)
-                        .execute()
-                    cachedFileId.set(null)
-                    lastUploadTime.set(0L)
-                    Log.i(TAG, "SUCCESS! Deleted clotube_watch_history.json from Google Drive (fileId: $targetFileId)")
-                    true
-                } catch (e: GoogleJsonResponseException) {
-                    if (e.statusCode == 404) {
-                        Log.d(TAG, "Remote file was already removed from Drive")
-                        cachedFileId.set(null)
-                        lastUploadTime.set(0L)
-                        true
-                    } else {
-                        throw e
+                // For background sync, perform remote pull and merge first
+                if (priority == SyncPriority.BACKGROUND_SYNC) {
+                    val targetFileId = cachedFileId.get() ?: findHistoryFileId(driveService)
+                    if (targetFileId != null) {
+                        try {
+                            val outputStream = ByteArrayOutputStream()
+                            driveService.files().get(targetFileId)
+                                .setSupportsAllDrives(true)
+                                .executeMediaAndDownloadTo(outputStream)
+                            val remoteJson = outputStream.toString("UTF-8")
+                            if (remoteJson.isNotBlank()) {
+                                mergeRemotePayload(dataStore, remoteJson)
+                            }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Background pre-pull failed: ${e.message}")
+                        }
                     }
                 }
+
+                val prefs = dataStore.data.first()
+                val allEntries = prefs.asMap()
+                Log.d(TAG, "[${priority.name}] Preparing payload with ${allEntries.size} keys from DataStore...")
+
+                // Exact JSON schema required by both Android and Desktop
+                val rootJson = JSONObject().apply {
+                    put("version", 1)
+                    put("updatedAt", System.currentTimeMillis())
+                    val entriesJson = JSONObject()
+                    allEntries.forEach { (key, value) ->
+                        val entryObj = JSONObject()
+                        when (value) {
+                            is Long -> { entryObj.put("type", "long"); entryObj.put("value", value) }
+                            is Int -> { entryObj.put("type", "int"); entryObj.put("value", value) }
+                            is Float -> { entryObj.put("type", "float"); entryObj.put("value", value.toDouble()) }
+                            is Boolean -> { entryObj.put("type", "boolean"); entryObj.put("value", value) }
+                            is String -> { entryObj.put("type", "string"); entryObj.put("value", value) }
+                        }
+                        entriesJson.put(key.name, entryObj)
+                    }
+                    put("entries", entriesJson)
+                }
+
+                val mediaContent = ByteArrayContent.fromString("application/json", rootJson.toString())
+                var targetFileId = cachedFileId.get() ?: findHistoryFileId(driveService)
+
+                if (targetFileId != null) {
+                    try {
+                        driveService.files().update(targetFileId, null, mediaContent)
+                            .setSupportsAllDrives(true)
+                            .execute()
+                        cachedFileId.set(targetFileId)
+                        lastUploadTime.set(System.currentTimeMillis())
+                        Log.i(TAG, "SUCCESS! [${priority.name}] Watch history updated on Google Drive ($targetFileId, ${mediaContent.length} bytes)")
+                        return@withContext true
+                    } catch (e: GoogleJsonResponseException) {
+                        if (e.statusCode == 404 || (e.statusCode == 403 && e.details?.errors?.any { it.reason == "appNotAuthorizedToFile" } == true)) {
+                            targetFileId = null
+                        } else {
+                            throw e
+                        }
+                    }
+                }
+
+                // File does not exist: create file
+                val metadata = com.google.api.services.drive.model.File().apply {
+                    name = "clotube_watch_history.json"
+                    mimeType = "application/json"
+                }
+                val created = driveService.files().create(metadata, mediaContent)
+                    .setSupportsAllDrives(true)
+                    .execute()
+
+                cachedFileId.set(created.id)
+                lastUploadTime.set(System.currentTimeMillis())
+                Log.i(TAG, "SUCCESS! Created clotube_watch_history.json on Google Drive (fileId: ${created.id})")
+                true
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to delete remote watch history file from Drive: ${e.message}", e)
+                Log.e(TAG, "Direct cloud sync failed: ${e.message}", e)
                 false
             }
         }
     }
 
-    /**
-     * Resolves companion timestamp key accurately matching Desktop schema.
-     */
     fun resolveTimestampKey(key: String): String {
         return if (key.startsWith("series_resume_")) {
             val suffix = when {
@@ -198,10 +328,6 @@ class DriveWatchHistorySync(private val context: Context) {
         }
     }
 
-    /**
-     * Merges remote Google Drive history payload with local DataStore preferences using item-level
-     * Last-Write-Wins based on timestamps. Never drops queued next-up episodes (fraction == 0f).
-     */
     suspend fun mergeRemotePayload(dataStore: DataStore<Preferences>, remoteJson: String): Boolean {
         if (remoteJson.isBlank()) return false
         return try {
@@ -272,140 +398,22 @@ class DriveWatchHistorySync(private val context: Context) {
         }
     }
 
-    /**
-     * Direct suspend upload method used by both the UI app and DriveSyncWorker.
-     * Guarantees atomic pre-pull and merge so no client blindly overwrites remote cross-device history.
-     */
-    suspend fun executeDirectUpload(dataStoreOverride: DataStore<Preferences>? = null): Boolean = withContext(NonCancellable + Dispatchers.IO) {
-        syncMutex.withLock {
-            if (!isUploading.compareAndSet(false, true)) {
-                Log.w(TAG, "Upload already in flight, skipping duplicate call")
-                return@withLock true
-            }
-
-            try {
-                val driveService = getDriveService()
-                if (driveService == null) {
-                    Log.e(TAG, "Sync aborted: Drive service unavailable")
-                    return@withLock false
-                }
-
-                val dataStore = dataStoreOverride ?: appContext.playbackDataStore
-
-                // 1. Pre-pull and merge remote changes from Google Drive first (Atomic Pre-Pull)
-                val targetFileId = cachedFileId.get() ?: findHistoryFileId(driveService)
-                if (targetFileId != null) {
-                    try {
-                        val outputStream = ByteArrayOutputStream()
-                        driveService.files().get(targetFileId)
-                            .setSupportsAllDrives(true)
-                            .executeMediaAndDownloadTo(outputStream)
-                        val remoteJson = outputStream.toString("UTF-8")
-                        if (remoteJson.isNotBlank()) {
-                            mergeRemotePayload(dataStore, remoteJson)
-                        }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Pre-upload remote pull failed (continuing with local state): ${e.message}")
-                    }
-                }
-
-                // 2. Read merged preferences from DataStore
-                val prefs = dataStore.data.first()
-                val allEntries = prefs.asMap()
-                Log.d(TAG, "Preparing payload with ${allEntries.size} keys from DataStore...")
-
-                val rootJson = JSONObject().apply {
-                    put("version", 1)
-                    put("updatedAt", System.currentTimeMillis())
-                    val entriesJson = JSONObject()
-                    allEntries.forEach { (key, value) ->
-                        val entryObj = JSONObject()
-                        when (value) {
-                            is Long -> { entryObj.put("type", "long"); entryObj.put("value", value) }
-                            is Int -> { entryObj.put("type", "int"); entryObj.put("value", value) }
-                            is Float -> { entryObj.put("type", "float"); entryObj.put("value", value.toDouble()) }
-                            is Boolean -> { entryObj.put("type", "boolean"); entryObj.put("value", value) }
-                            is String -> { entryObj.put("type", "string"); entryObj.put("value", value) }
-                        }
-                        entriesJson.put(key.name, entryObj)
-                    }
-                    put("entries", entriesJson)
-                }
-
-                val mediaContent = ByteArrayContent.fromString("application/json", rootJson.toString())
-                var currentFileId = targetFileId ?: findHistoryFileId(driveService)
-
-                if (currentFileId != null) {
-                    try {
-                        driveService.files().update(currentFileId, null, mediaContent)
-                            .setSupportsAllDrives(true)
-                            .execute()
-                        cachedFileId.set(currentFileId)
-                        lastUploadTime.set(System.currentTimeMillis())
-                        val payloadSize = mediaContent.length
-                        Log.i(TAG, "SUCCESS! Watch history updated on Google Drive (fileId: $currentFileId, size: $payloadSize bytes)")
-                        return@withLock true
-                    } catch (e: GoogleJsonResponseException) {
-                        if (e.statusCode == 404) {
-                            Log.w(TAG, "File $currentFileId was deleted or not found. Creating fresh file...")
-                            cachedFileId.set(null)
-                            currentFileId = null
-                        } else if (e.statusCode == 403 && (e.details?.errors?.any { it.reason == "appNotAuthorizedToFile" } == true || e.message?.contains("appNotAuthorizedToFile") == true)) {
-                            Log.w(TAG, "File $currentFileId not writable under current scope. Creating fresh file...")
-                            try {
-                                driveService.files().delete(currentFileId).setSupportsAllDrives(true).execute()
-                            } catch (ignored: Exception) {}
-                            cachedFileId.set(null)
-                            currentFileId = null
-                        } else {
-                            throw e
-                        }
-                    }
-                }
-
-                // Create new file if not present or replaced
-                val metadata = com.google.api.services.drive.model.File().apply {
-                    name = "clotube_watch_history.json"
-                    mimeType = "application/json"
-                }
-                val created = driveService.files().create(metadata, mediaContent)
-                    .setSupportsAllDrives(true)
-                    .execute()
-
-                cachedFileId.set(created.id)
-                lastUploadTime.set(System.currentTimeMillis())
-                val payloadSize = mediaContent.length
-                Log.i(TAG, "SUCCESS! Created and synced clotube_watch_history.json (fileId: ${created.id}, size: $payloadSize bytes)")
-                true
-            } catch (e: Exception) {
-                Log.e(TAG, "Cloud sync failed with exception: ${e.message}", e)
-                false
-            } finally {
-                isUploading.set(false)
-            }
-        }
-    }
-
     private fun findHistoryFileId(driveService: Drive): String? {
         val query = "name = 'clotube_watch_history.json' and trashed = false"
         val response = driveService.files().list()
             .setQ(query)
-            .setSpaces("drive")
             .setFields("files(id, name)")
             .setSupportsAllDrives(true)
             .setIncludeItemsFromAllDrives(true)
             .setPageSize(5)
             .execute()
-
         val foundId = response.files?.firstOrNull()?.id
-        cachedFileId.set(foundId)
+        if (foundId != null) {
+            cachedFileId.set(foundId)
+        }
         return foundId
     }
 
-    /**
-     * Downloads clotube_watch_history.json from Google Drive and synchronizes
-     * local DataStore preferences via Last-Write-Wins item level merge.
-     */
     suspend fun syncFromCloud(dataStore: DataStore<Preferences>): Boolean = withContext(NonCancellable + Dispatchers.IO) {
         try {
             val driveService = getDriveService() ?: return@withContext false
@@ -433,6 +441,76 @@ class DriveWatchHistorySync(private val context: Context) {
 
     suspend fun pullAndMergeHistoryFromDrive(dataStore: DataStore<Preferences>) = withContext(Dispatchers.IO) {
         syncFromCloud(dataStore)
+    }
+
+    suspend fun deleteRemoteHistoryFile(): Boolean = withContext(NonCancellable + Dispatchers.IO) {
+        uploadMutex.withLock {
+            try {
+                val driveService = getDriveService()
+                if (driveService == null) {
+                    Log.e(TAG, "Cannot delete remote file: Drive service unavailable")
+                    return@withLock false
+                }
+
+                val targetFileId = cachedFileId.get() ?: findHistoryFileId(driveService)
+                if (targetFileId == null) {
+                    Log.d(TAG, "No remote watch history file found on Drive to delete")
+                    cachedFileId.set(null)
+                    return@withLock true
+                }
+
+                try {
+                    driveService.files().delete(targetFileId)
+                        .setSupportsAllDrives(true)
+                        .execute()
+                    cachedFileId.set(null)
+                    lastUploadTime.set(0L)
+                    Log.i(TAG, "SUCCESS! Deleted clotube_watch_history.json from Google Drive (fileId: $targetFileId)")
+                    true
+                } catch (e: GoogleJsonResponseException) {
+                    if (e.statusCode == 404) {
+                        Log.d(TAG, "Remote file was already removed from Drive")
+                        cachedFileId.set(null)
+                        lastUploadTime.set(0L)
+                        true
+                    } else {
+                        throw e
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to delete remote watch history file from Drive: ${e.message}", e)
+                false
+            }
+        }
+    }
+
+    private fun getDriveService(): Drive? {
+        val account = GoogleSignIn.getLastSignedInAccount(appContext)
+        if (account == null) {
+            val token = runBlocking {
+                tokenProviderRef?.invoke() ?: com.clotube.app.auth.GoogleAuthRepository(appContext).getAccessToken().getOrNull()
+            }
+            if (!token.isNullOrBlank()) {
+                Log.d(TAG, "Using Bearer token provider for Drive service")
+                return Drive.Builder(NetHttpTransport(), GsonFactory.getDefaultInstance()) { request ->
+                    request.headers.authorization = "Bearer $token"
+                }.setApplicationName("Clotube").build()
+            }
+            Log.e(TAG, "Cannot sync: GoogleSignIn account is null and no token available")
+            return null
+        }
+
+        val googleAccount: Account? = account.account ?: account.email?.let { Account(it, "com.google") }
+        val credential = GoogleAccountCredential.usingOAuth2(
+            appContext,
+            listOf(DriveScopes.DRIVE_FILE, DriveScopes.DRIVE)
+        ).setSelectedAccount(googleAccount)
+
+        return Drive.Builder(
+            NetHttpTransport(),
+            GsonFactory.getDefaultInstance(),
+            credential
+        ).setApplicationName("Clotube").build()
     }
 
     companion object {
@@ -464,7 +542,7 @@ class DriveWatchHistorySync(private val context: Context) {
             }
             if (dataStore != null) {
                 instance.syncScope.launch {
-                    instance.pullAndMergeHistoryFromDrive(dataStore)
+                    instance.syncFromCloud(dataStore)
                 }
             }
         }
@@ -478,7 +556,7 @@ class DriveWatchHistorySync(private val context: Context) {
         }
 
         fun triggerThrottledBackup(dataStore: DataStore<Preferences>) {
-            defaultInstance?.triggerThrottledBackup(dataStore)
+            defaultInstance?.enqueueProgressUpdate(dataStore)
         }
 
         fun triggerThrottledBackup(
@@ -487,7 +565,7 @@ class DriveWatchHistorySync(private val context: Context) {
             context: Context? = null
         ) {
             val inst = context?.let { getInstance(it) } ?: defaultInstance
-            inst?.triggerThrottledBackup(dataStore)
+            inst?.enqueueProgressUpdate(dataStore)
         }
 
         fun triggerImmediateBackup(
@@ -496,7 +574,7 @@ class DriveWatchHistorySync(private val context: Context) {
             context: Context? = null
         ) {
             val inst = context?.let { getInstance(it) } ?: defaultInstance
-            inst?.backupImmediately(dataStore)
+            inst?.enqueueImmediateWatchState(dataStore)
         }
 
         fun backupImmediately(dataStore: DataStore<Preferences>? = null) {

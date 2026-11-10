@@ -6,6 +6,8 @@ import android.content.res.Configuration
 import androidx.compose.ui.platform.LocalContext
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -17,6 +19,8 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.geometry.Offset
@@ -32,6 +36,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material3.*
+import androidx.compose.material3.ripple
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.pulltorefresh.PullToRefreshDefaults
 import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
@@ -39,6 +44,7 @@ import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.firstOrNull
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -47,18 +53,25 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.clotube.app.util.triggerClickHaptic
 import com.clotube.app.util.triggerNavigationHaptic
 import com.clotube.app.model.Episode
 import com.clotube.app.model.Series
 import com.clotube.app.model.TvSeries
 import com.clotube.app.data.DownloadStatus
 import com.clotube.app.ui.components.ClotubeVideoPlayer
+import org.videolan.libvlc.MediaPlayer
 import com.clotube.app.ui.components.EpisodeItemRow
 import com.clotube.app.ui.components.SeasonTabChip
 import com.clotube.app.ui.components.shimmerEffect
+import com.clotube.app.ui.theme.*
+import com.clotube.app.ui.theme.AppleTvMotion
+import com.clotube.app.ui.theme.appleTvPressable
 import com.clotube.app.viewmodel.VideoViewModel
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -86,9 +99,62 @@ fun SeriesDetailScreen(
     val coroutineScope = rememberCoroutineScope()
     val listState = rememberLazyListState()
 
+    val toggleFullscreen: () -> Unit = {
+        activity?.let { act ->
+            act.requestedOrientation = if (isLandscape) {
+                ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            } else {
+                ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            }
+        }
+    }
+
     val playbackHistoryManager = viewModel.playbackHistoryManager
+
+    val allEpisodes = remember(series.id) {
+        series.seasons.flatMap { it.episodes }
+    }
+
+    // Match autoPlayEpisodeId by ID, or fallback to SxxExx match if ID format differs
+    val initialAutoPlayEpisode = remember(series.id) {
+        if (!autoPlayEpisodeId.isNullOrBlank()) {
+            series.seasons.flatMap { it.episodes }.firstOrNull { it.id == autoPlayEpisodeId }
+                ?: series.seasons.flatMap { it.episodes }.firstOrNull { it.displayTitle.contains(autoPlayEpisodeId, ignoreCase = true) }
+                ?: activePlayingEpisode
+        } else activePlayingEpisode
+    }
+
+    // 1. Immediately determine the best initial season containing episodes (prevents opening on Season 2 if empty)
+    val defaultSeasonNumber = remember(series.id) {
+        initialAutoPlayEpisode?.seasonNumber
+            ?: series.seasons.firstOrNull { it.episodes.isNotEmpty() }?.seasonNumber
+            ?: series.seasons.firstOrNull()?.seasonNumber
+            ?: 1
+    }
+
+    // 2. Localize selected season state to this series instance
+    var currentSeasonNumber by rememberSaveable(series.id) {
+        mutableIntStateOf(defaultSeasonNumber)
+    }
+
+    // PREVENT RECOMPOSITION RESET: Key strictly to seriesId
     var activeEpisode by remember(series.id) {
-        mutableStateOf<Episode?>(activePlayingEpisode)
+        val initialEp = if (!autoPlayEpisodeId.isNullOrBlank()) {
+            series.seasons.flatMap { it.episodes }.firstOrNull { it.id == autoPlayEpisodeId }
+        } else activePlayingEpisode
+        mutableStateOf<Episode?>(initialEp)
+    }
+
+    // Also handle late catalog hydration if allEpisodes finishes loading after screen entry
+    LaunchedEffect(autoPlayEpisodeId, allEpisodes.size) {
+        if (activeEpisode == null && !autoPlayEpisodeId.isNullOrBlank() && allEpisodes.isNotEmpty()) {
+            val matched = allEpisodes.firstOrNull { it.id == autoPlayEpisodeId }
+                ?: allEpisodes.firstOrNull { it.displayTitle.contains(autoPlayEpisodeId, ignoreCase = true) }
+            if (matched != null) {
+                currentSeasonNumber = matched.seasonNumber
+                activeEpisode = matched
+            }
+        }
     }
     var initialResumePositionMs by remember(series.id) {
         mutableLongStateOf(initialPositionMs)
@@ -99,77 +165,46 @@ fun SeriesDetailScreen(
 
     DisposableEffect(series.id) {
         onDispose {
+            activeEpisode = null
             viewModel.stopAndReleaseCurrentPlayer()
         }
     }
 
-    LaunchedEffect(series.id, series.seasons) {
-        val allEps = series.seasons.flatMap { it.episodes }
-        val lastWatched = viewModel.getLastWatchedEpisode(series) ?: allEps.firstOrNull()
-        if (lastWatched != null) {
-            targetResumeEpisode = lastWatched
-            val pos = viewModel.playbackHistoryManager.getResumePosition(lastWatched.id)
-            targetResumePosMs = if (initialPositionMs > 0L && targetResumeEpisode?.id == autoPlayEpisodeId) initialPositionMs else pos
-            val savedProgress = viewModel.playbackHistoryManager.getProgressSync(lastWatched.id)
-            targetDurationMs = when {
-                lastWatched.durationMs > 0L -> lastWatched.durationMs
-                savedProgress != null && savedProgress.durationMs > 0L -> savedProgress.durationMs
-                else -> 0L
-            }
+    LaunchedEffect(series.id) {
+        val autoEp = initialAutoPlayEpisode
+        if (autoEp != null) {
+            currentSeasonNumber = autoEp.seasonNumber
         }
-    }
-
-    var hasHandledAutoPlay by remember(series.id, autoPlayEpisodeId) {
-        mutableStateOf(false)
     }
 
     LaunchedEffect(activePlayingEpisode) {
         if (activePlayingEpisode != null && activePlayingEpisode != activeEpisode) {
+            currentSeasonNumber = activePlayingEpisode.seasonNumber
             activeEpisode = activePlayingEpisode
         }
     }
 
-    fun playEpisode(episode: Episode, seekPositionMs: Long = 0L) {
-        viewModel.stopAndReleaseCurrentPlayer()
-        initialResumePositionMs = seekPositionMs
-        targetResumePosMs = seekPositionMs
-        targetResumeEpisode = episode
-        targetDurationMs = episode.durationMs
-        activeEpisode = episode
-        onEpisodeSelectedWithPosition(episode, seekPositionMs)
+    fun startEpisodePlayback(targetEpisode: Episode, startPosMs: Long = 0L) {
+        if (activePlayingEpisode?.id == targetEpisode.id || activeEpisode?.id == targetEpisode.id) {
+            // Already active; do nothing to avoid teardown cycle
+            return
+        }
+        currentSeasonNumber = targetEpisode.seasonNumber
+        activeEpisode = targetEpisode
+        initialResumePositionMs = startPosMs
+        onEpisodeSelectedWithPosition(targetEpisode, startPosMs)
     }
 
-    // Hardware BackHandler: If in landscape, revert to portrait without closing player; else close player or navigate back
-    BackHandler {
+    // Hardware BackHandler: If in landscape, revert to portrait without closing player; else navigate back
+    BackHandler(enabled = true) {
         if (isLandscape) {
             activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-        } else if (activeEpisode != null) {
-            viewModel.stopAndReleaseCurrentPlayer()
-            viewModel.clearActiveEpisode()
-            activeEpisode = null
-            initialResumePositionMs = 0L
-            onClosePlayer()
         } else {
-            viewModel.stopAndReleaseCurrentPlayer()
-            onBackClick()
+            onBackClick() // Pops backstack to previous screen (HomeScreen)
         }
     }
 
-    // 1. Immediately determine the best initial season containing episodes (prevents opening on Season 2 if empty)
-    val defaultSeasonNumber = remember(series.id, series.seasons) {
-        series.seasons.firstOrNull { it.episodes.isNotEmpty() }?.seasonNumber
-            ?: series.seasons.firstOrNull()?.seasonNumber
-            ?: 1
-    }
-
-    // 2. Localize selected season state to this series instance
-    var currentSeasonNumber by rememberSaveable(series.id) {
-        mutableIntStateOf(defaultSeasonNumber)
-    }
-
-    val allSeriesEpisodes = remember(series) {
-        series.seasons.flatMap { it.episodes }
-    }
+    val allSeriesEpisodes = allEpisodes
 
     var lastScrolledEpisodeId by rememberSaveable(series.id) { mutableStateOf<String?>(null) }
     val seasonRowState = rememberLazyListState()
@@ -202,41 +237,39 @@ fun SeriesDetailScreen(
         // 2. Prevent redundant auto-scrolls for the same episode
         if (lastScrolledEpisodeId == targetEpisode.id) return@LaunchedEffect
 
-        // 3. Wait for the season episodes to compose in layout
+        // 3. Wait for the season episodes to compose in layout, scroll once
         snapshotFlow {
             val season = series.seasons.firstOrNull { it.seasonNumber == currentSeasonNumber }
             val episodes = season?.episodes ?: emptyList()
             val epIdx = episodes.indexOfFirst { it.id == targetEpisode.id }
             episodes.isNotEmpty() to epIdx
-        }.collect { (hasEpisodes, epIndex) ->
-            if (hasEpisodes && epIndex != -1) {
-                // Layout indices:
-                // Index 0: series_metadata_section (Title & Up Next card)
-                // Index 1: sticky_season_selector_bar (Sticky season tabs)
-                // Index 2 + epIndex: Target episode card
+        }.firstOrNull { (hasEpisodes, epIndex) -> hasEpisodes && epIndex != -1 }?.let { (_, epIndex) ->
+            // Layout indices:
+            // Index 0: series_metadata_section (Title & Up Next card)
+            // Index 1: sticky_season_selector_bar (Sticky season tabs)
+            // Index 2 + epIndex: Target episode card
 
-                // Small delay to allow Compose layout measurement to complete
-                kotlinx.coroutines.delay(120L)
+            // Small delay to allow Compose layout measurement to complete
+            kotlinx.coroutines.delay(120L)
 
-                if (epIndex <= 0) {
-                    // For Episode 1, scroll to the sticky header so Episode 1 docks directly beneath it
-                    listState.animateScrollToItem(
-                        index = 1,
-                        scrollOffset = 0
-                    )
-                } else {
-                    // For Episode 2+, target the preceding item with a positive offset.
-                    // This scrolls the previous card up behind the sticky bar, placing the target episode
-                    // completely in view right below the season bar with zero clipping.
-                    val precedingCardOffsetPx = with(density) { 34.dp.roundToPx() }
-                    listState.animateScrollToItem(
-                        index = 1 + epIndex,
-                        scrollOffset = precedingCardOffsetPx
-                    )
-                }
-
-                lastScrolledEpisodeId = targetEpisode.id
+            if (epIndex <= 0) {
+                // For Episode 1, scroll to the sticky header so Episode 1 docks directly beneath it
+                listState.animateScrollToItem(
+                    index = 1,
+                    scrollOffset = 0
+                )
+            } else {
+                // For Episode 2+, target the preceding item with a positive offset.
+                // This scrolls the previous card up behind the sticky bar, placing the target episode
+                // completely in view right below the season bar with zero clipping.
+                val precedingCardOffsetPx = with(density) { 34.dp.roundToPx() }
+                listState.animateScrollToItem(
+                    index = 1 + epIndex,
+                    scrollOffset = precedingCardOffsetPx
+                )
             }
+
+            lastScrolledEpisodeId = targetEpisode.id
         }
     }
 
@@ -256,33 +289,7 @@ fun SeriesDetailScreen(
         }
     }
 
-    // Trigger auto-play on entry if coming from Continue Watching
-    LaunchedEffect(series.id, series.seasons, autoPlayEpisodeId) {
-        if (!hasHandledAutoPlay && !autoPlayEpisodeId.isNullOrBlank()) {
-            val allEpisodes = series.seasons.flatMap { it.episodes }
-            val targetEpisode = allEpisodes.firstOrNull { it.id == autoPlayEpisodeId }
 
-            if (targetEpisode != null) {
-                viewModel.stopAndReleaseCurrentPlayer()
-                // 1. Align active season tab with the target episode
-                viewModel.selectedSeasonNumber.value = targetEpisode.seasonNumber
-                currentSeasonNumber = targetEpisode.seasonNumber
-
-                // 2. Resolve resume position from DataStore
-                val resumePos = if (initialResumePositionMs > 0L) {
-                    initialResumePositionMs
-                } else {
-                    viewModel.playbackHistoryManager.getResumePosition(targetEpisode.id)
-                }
-                initialResumePositionMs = resumePos
-
-                // 3. Mount ClotubeVideoPlayer
-                activeEpisode = targetEpisode
-                onEpisodeSelectedWithPosition(targetEpisode, resumePos)
-                hasHandledAutoPlay = true
-            }
-        }
-    }
 
     var lastWatchedEpisode by remember(series.id) { mutableStateOf<Episode?>(null) }
     var hasCheckedLastWatched by remember(series.id) { mutableStateOf(false) }
@@ -341,7 +348,7 @@ fun SeriesDetailScreen(
     Column(
         modifier = modifier
             .fillMaxSize()
-            .background(Color(0xFF07090E))
+            .background(CanvasDeep)
     ) {
 
         // ========================================================
@@ -349,7 +356,7 @@ fun SeriesDetailScreen(
         // ========================================================
         Box(
             modifier = if (isLandscape) {
-                if (activeEpisode != null) {
+                if (activeEpisode != null || activePlayingEpisode != null) {
                     Modifier
                         .fillMaxSize()
                         .background(Color.Black)
@@ -367,95 +374,68 @@ fun SeriesDetailScreen(
                     .background(Color.Black)
             }
         ) {
-            if (activeEpisode != null) {
-                val currentEpisodeList = activeSeason?.episodes ?: emptyList()
-                val currentIndex = currentEpisodeList.indexOfFirst { it.id == activeEpisode!!.id }
+            val currentPlaying = activeEpisode ?: activePlayingEpisode
+            Crossfade(
+                targetState = currentPlaying,
+                animationSpec = tween(280, easing = AppleTvMotion.SmoothOutEasing),
+                label = "topViewportCrossfade"
+            ) { targetPlaying ->
+                if (targetPlaying != null) {
+                    key(targetPlaying.id) {
+                        val currentEpisodeList = activeSeason?.episodes ?: emptyList()
+                        val currentIndex = currentEpisodeList.indexOfFirst { it.id == targetPlaying.id }
 
-                val prevEpisode = if (currentIndex > 0) currentEpisodeList[currentIndex - 1] else null
-                val nextEpisode = if (currentIndex != -1 && currentIndex < currentEpisodeList.lastIndex) {
-                    currentEpisodeList[currentIndex + 1]
-                } else if (currentIndex != -1 && currentIndex == currentEpisodeList.lastIndex) {
-                    val currentSeasonIdx = series.seasons.indexOfFirst { it.seasonNumber == currentSeasonNumber }
-                    if (currentSeasonIdx != -1 && currentSeasonIdx < series.seasons.lastIndex) {
-                        series.seasons[currentSeasonIdx + 1].episodes.firstOrNull()
-                    } else null
-                } else null
+                        val prevEpisode = if (currentIndex > 0) currentEpisodeList[currentIndex - 1] else null
+                        val nextEpisode = if (currentIndex != -1 && currentIndex < currentEpisodeList.lastIndex) {
+                            currentEpisodeList[currentIndex + 1]
+                        } else if (currentIndex != -1 && currentIndex == currentEpisodeList.lastIndex) {
+                            val currentSeasonIdx = series.seasons.indexOfFirst { it.seasonNumber == currentSeasonNumber }
+                            if (currentSeasonIdx != -1 && currentSeasonIdx < series.seasons.lastIndex) {
+                                series.seasons[currentSeasonIdx + 1].episodes.firstOrNull()
+                            } else null
+                        } else null
 
-                ClotubeVideoPlayer(
-                    episode = activeEpisode!!,
-                    viewModel = viewModel,
-                    seriesId = series.id,
-                    initialPositionMs = initialResumePositionMs,
-                    startPositionMs = initialResumePositionMs,
-                    nextEpisode = nextEpisode,
-                    onPlayerCreated = { epPlayer ->
-                        viewModel.registerActivePlayer(epPlayer)
-                    },
-                    onPreviousEpisode = prevEpisode?.let { ep ->
-                        {
-                            coroutineScope.launch {
-                                val resumePos = playbackHistoryManager.getResumePosition(ep.id)
-                                playEpisode(ep, seekPositionMs = resumePos)
-                            }
-                        }
-                    },
-                    onNextEpisode = nextEpisode?.let { ep ->
-                        {
-                            coroutineScope.launch {
-                                val resumePos = playbackHistoryManager.getResumePosition(ep.id)
-                                playEpisode(ep, seekPositionMs = resumePos)
-                            }
-                        }
-                    },
-                    onClosePlayer = {
-                        viewModel.stopAndReleaseCurrentPlayer()
-                        viewModel.clearActiveEpisode()
-                        activeEpisode = null
-                        initialResumePositionMs = 0L
-                        onClosePlayer()
-                    },
-                    modifier = Modifier.fillMaxSize()
-                )
-            } else {
-                val fallbackEp = targetResumeEpisode
-                    ?: upNextEpisode
-                    ?: lastWatchedEpisode
-                    ?: series.seasons.firstOrNull { it.episodes.isNotEmpty() }?.episodes?.firstOrNull()
-                    ?: allSeriesEpisodes.firstOrNull()
-
-                if (fallbackEp != null) {
-                    SeriesResumeHeaderCard(
-                        series = series,
-                        episode = fallbackEp,
-                        currentPositionMs = targetResumePosMs,
-                        durationMs = targetDurationMs,
-                        onBackClick = {
-                            view.triggerNavigationHaptic()
-                            if (isLandscape) {
-                                activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-                            } else {
-                                onBackClick()
-                            }
-                        },
-                        onResumeClick = { ep, seekPos ->
-                            coroutineScope.launch {
-                                val resumePos = if (seekPos > 0L) seekPos else playbackHistoryManager.getResumePosition(ep.id)
-                                playEpisode(ep, seekPositionMs = resumePos)
-                            }
-                        }
-                    )
+                        ClotubeVideoPlayer(
+                            episode = targetPlaying,
+                            viewModel = viewModel,
+                            seriesId = series.id,
+                            initialPositionMs = initialResumePositionMs,
+                            startPositionMs = initialResumePositionMs,
+                            nextEpisode = nextEpisode,
+                            onPlayerCreated = { epPlayer: MediaPlayer ->
+                                viewModel.registerActivePlayer(epPlayer)
+                            },
+                            onPreviousEpisode = prevEpisode?.let { ep ->
+                                { startEpisodePlayback(ep) }
+                            },
+                            onNextEpisode = nextEpisode?.let { ep ->
+                                { startEpisodePlayback(ep) }
+                            },
+                            onClosePlayer = {
+                                if (isLandscape) {
+                                    activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                                } else {
+                                    onBackClick() // Navigates back to the previous screen
+                                }
+                            },
+                            onToggleFullscreen = toggleFullscreen,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    }
                 } else {
-                    Box(modifier = Modifier.fillMaxSize()) {
-                        if (!series.posterUrl.isNullOrBlank()) {
-                            coil.compose.AsyncImage(
-                                model = series.posterUrl,
-                                contentDescription = series.title,
-                                contentScale = androidx.compose.ui.layout.ContentScale.Crop,
-                                modifier = Modifier.fillMaxSize()
-                            )
-                        }
-                        IconButton(
-                            onClick = {
+                    val fallbackEp = targetResumeEpisode
+                        ?: upNextEpisode
+                        ?: lastWatchedEpisode
+                        ?: series.seasons.firstOrNull { it.episodes.isNotEmpty() }?.episodes?.firstOrNull()
+                        ?: allEpisodes.firstOrNull()
+
+                    if (fallbackEp != null) {
+                        SeriesResumeHeaderCard(
+                            series = series,
+                            episode = fallbackEp,
+                            currentPositionMs = targetResumePosMs,
+                            durationMs = targetDurationMs,
+                            onBackClick = {
                                 view.triggerNavigationHaptic()
                                 if (isLandscape) {
                                     activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
@@ -463,19 +443,30 @@ fun SeriesDetailScreen(
                                     onBackClick()
                                 }
                             },
-                            modifier = Modifier
-                                .padding(horizontal = 12.dp, vertical = 8.dp)
-                                .size(36.dp)
-                                .clip(RoundedCornerShape(18.dp))
-                                .background(Color(0x80000000))
-                        ) {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
-                                contentDescription = "Back",
-                                tint = Color.White,
-                                modifier = Modifier.size(20.dp)
-                            )
-                        }
+                            onResumeClick = { ep, pos ->
+                                startEpisodePlayback(ep, pos)
+                            }
+                        )
+                    } else {
+                        StaticSeriesBackdropHeader(
+                            series = series,
+                            onBackClick = {
+                                view.triggerNavigationHaptic()
+                                if (isLandscape) {
+                                    activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                                } else {
+                                    onBackClick()
+                                }
+                            },
+                            onStartWatchingClick = {
+                                view.triggerClickHaptic()
+                                val firstEp = allEpisodes.firstOrNull()
+                                    ?: series.seasons.firstOrNull { it.episodes.isNotEmpty() }?.episodes?.firstOrNull()
+                                if (firstEp != null) {
+                                    startEpisodePlayback(firstEp)
+                                }
+                            }
+                        )
                     }
                 }
             }
@@ -484,7 +475,7 @@ fun SeriesDetailScreen(
         // ========================================================
         // 2. SCROLLABLE CONTENT WITH PINNED SEASON HEADER
         // ========================================================
-        if (!isLandscape || activeEpisode == null) {
+        if (!isLandscape || (activeEpisode == null && activePlayingEpisode == null)) {
             var isSeriesRefreshing by remember { mutableStateOf(false) }
             val seriesPullRefreshState = rememberPullToRefreshState()
             val seriesHaptic = LocalHapticFeedback.current
@@ -521,8 +512,8 @@ fun SeriesDetailScreen(
                     PullToRefreshDefaults.Indicator(
                         state = seriesPullRefreshState,
                         isRefreshing = isSeriesRefreshing,
-                        color = Color(0xFF00E5FF), // Clotube Cyan Accent
-                        containerColor = Color(0xFF161B26), // Dark Acrylic Bubble
+                        color = AccentBlue,
+                        containerColor = SurfaceElevated,
                         modifier = Modifier.align(Alignment.TopCenter)
                     )
                 },
@@ -530,6 +521,12 @@ fun SeriesDetailScreen(
                     .fillMaxWidth()
                     .weight(1f)
             ) {
+                val currentUserEmail = remember(series.id) {
+                    viewModel.getSelectedGoogleAccountName().orEmpty().ifBlank {
+                        viewModel.uiState.value.userEmail.orEmpty()
+                    }
+                }
+
                 LazyColumn(
                     state = listState,
                     modifier = Modifier.fillMaxSize(),
@@ -595,79 +592,70 @@ fun SeriesDetailScreen(
                 ) {
                     val upNextToDisplay = upNextEpisode
                     if (upNextToDisplay != null) {
+                        val upNextInteractionSource = remember { MutableInteractionSource() }
                         Surface(
                             shape = RoundedCornerShape(12.dp),
-                            color = Color(0xFF111722),
-                            border = BorderStroke(1.dp, Color(0xFF1B2433)),
-                            modifier = Modifier.fillMaxWidth()
+                            color = SurfaceDefault,
+                            border = BorderStroke(1.dp, SurfaceBorder),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .appleTvPressable(upNextInteractionSource, pressedScale = 0.97f)
+                                .clip(RoundedCornerShape(12.dp))
+                                .clickable(
+                                    interactionSource = upNextInteractionSource,
+                                    indication = ripple(bounded = true)
+                                ) {
+                                    startEpisodePlayback(upNextToDisplay)
+                                }
                         ) {
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(12.dp),
+                                    .padding(horizontal = 14.dp, vertical = 10.dp),
                                 horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Column(modifier = Modifier.weight(1f)) {
-                                    Row(
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                    ) {
-                                        Box(
-                                            modifier = Modifier
-                                                .background(Color(0xFF162536), RoundedCornerShape(4.dp))
-                                                .padding(horizontal = 6.dp, vertical = 2.dp)
-                                        ) {
-                                            Text(
-                                                text = "S${upNextToDisplay.seasonNumber.toString().padStart(2, '0')}:E${upNextToDisplay.episodeNumber.toString().padStart(2, '0')}",
-                                                color = Color(0xFF00E5FF),
-                                                fontSize = 10.sp,
-                                                fontWeight = FontWeight.Bold
-                                            )
-                                        }
-                                        Text(
-                                            text = "Up Next",
-                                            color = Color(0xFF8899A6),
-                                            fontSize = 11.sp
-                                        )
-                                    }
-
-                                    Spacer(modifier = Modifier.height(4.dp))
-
                                     Text(
-                                        text = upNextToDisplay.displayTitle,
-                                        color = Color.White,
-                                        fontSize = 13.sp,
+                                        text = "UP NEXT",
+                                        color = Color(0xFF64748B),
+                                        fontSize = 11.sp,
                                         fontWeight = FontWeight.SemiBold,
-                                        maxLines = 1
+                                        letterSpacing = 0.8.sp
                                     )
 
-                                    Spacer(modifier = Modifier.height(2.dp))
+                                    Spacer(modifier = Modifier.height(3.dp))
+
+                                    val epIndex = "E${upNextToDisplay.episodeNumber.toString().padStart(2, '0')}"
+                                    val fullTitle = "$epIndex • ${upNextToDisplay.displayTitle}"
 
                                     Text(
-                                        text = "${upNextToDisplay.formattedDuration} • ${upNextToDisplay.fileSize}",
-                                        color = Color(0xFF6B7A90),
-                                        fontSize = 11.sp
+                                        text = fullTitle,
+                                        color = Color.White,
+                                        fontSize = 14.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        maxLines = 1,
+                                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
                                     )
                                 }
 
-                                IconButton(
-                                    onClick = {
-                                        coroutineScope.launch {
-                                            val resumePos = playbackHistoryManager.getResumePosition(upNextToDisplay.id)
-                                            playEpisode(upNextToDisplay, seekPositionMs = resumePos)
-                                        }
-                                    },
+                                Spacer(modifier = Modifier.width(12.dp))
+
+                                Box(
                                     modifier = Modifier
-                                        .size(40.dp)
-                                        .clip(androidx.compose.foundation.shape.CircleShape)
-                                        .background(Color(0xFF00E5FF))
+                                        .size(34.dp)
+                                        .clip(CircleShape)
+                                        .background(AccentBlue)
+                                        .clickable {
+                                            startEpisodePlayback(upNextToDisplay)
+                                        },
+                                    contentAlignment = Alignment.Center
                                 ) {
                                     Icon(
                                         imageVector = Icons.Rounded.PlayArrow,
                                         contentDescription = "Play Next",
-                                        tint = Color(0xFF07090E),
-                                        modifier = Modifier.size(24.dp)
+                                        tint = Color.White,
+                                        modifier = Modifier.size(20.dp)
                                     )
                                 }
                             }
@@ -682,8 +670,8 @@ fun SeriesDetailScreen(
             stickyHeader(key = "sticky_season_selector_bar") {
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
-                    color = Color(0xFF07090E),
-                    shadowElevation = 6.dp
+                    color = CanvasDeep,
+                    shadowElevation = 4.dp
                 ) {
                     Column(modifier = Modifier.fillMaxWidth()) {
                         if (isLoadingEpisodes && (series.seasons.isEmpty() || series.seasons.all { it.episodes.isEmpty() })) {
@@ -693,7 +681,7 @@ fun SeriesDetailScreen(
                                 state = seasonRowState,
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                                    .padding(horizontal = 16.dp, vertical = 8.dp),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
@@ -733,7 +721,7 @@ fun SeriesDetailScreen(
                             }
                         }
 
-                        HorizontalDivider(color = Color(0xFF1A2230), thickness = 1.dp)
+                        HorizontalDivider(color = SurfaceBorder, thickness = 0.5.dp)
                     }
                 }
             }
@@ -761,10 +749,9 @@ fun SeriesDetailScreen(
             } else {
                 items(activeSeason.episodes, key = { episode -> "${currentSeasonNumber}_${episode.id}" }) { episode ->
                     val downloadRecord by viewModel.downloadRepository.getDownloadRecord(episode.id).collectAsState(initial = null)
-                    val userEmail = viewModel.uiState.collectAsState().value.userEmail.orEmpty()
-                    val isWatchedLocal = remember(userEmail, episode.id) {
-                        if (userEmail.isNotBlank()) {
-                            com.clotube.app.data.AndroidWatchHistoryManager.isEpisodeWatched(context, userEmail, episode.id)
+                    val isWatchedLocal = remember(currentUserEmail, episode.id) {
+                        if (currentUserEmail.isNotBlank()) {
+                            com.clotube.app.data.AndroidWatchHistoryManager.isEpisodeWatched(context, currentUserEmail, episode.id)
                         } else false
                     }
                     val isWatchedFlow by viewModel.playbackHistoryManager.isEpisodeWatched(episode.id).collectAsState(initial = false)
@@ -777,10 +764,7 @@ fun SeriesDetailScreen(
                         seriesTitle = series.title,
                         isPlayingThis = isOngoing,
                         onEpisodeClick = {
-                            coroutineScope.launch {
-                                val resumePos = playbackHistoryManager.getResumePosition(episode.id)
-                                playEpisode(episode, seekPositionMs = resumePos)
-                            }
+                            startEpisodePlayback(episode)
                         },
                         onStartDownload = {
                             coroutineScope.launch {
@@ -857,59 +841,61 @@ fun SeriesDetailScreen(
 ) {
     val effectiveAutoPlayId = autoPlayEpisodeId ?: initialEpisodeId
     val context = androidx.compose.ui.platform.LocalContext.current
-    val uiState by viewModel.uiState.collectAsState()
     val seriesList by viewModel.seriesList.collectAsState()
 
-    val cachedSeries = remember(seriesId, effectiveAutoPlayId, seriesList, uiState.tvSeriesList) {
-        val diskCatalog = com.clotube.app.viewmodel.loadCatalogFromDisk(context)
-        val byEpId = if (!effectiveAutoPlayId.isNullOrBlank()) {
-            seriesList.find { s -> s.seasons.any { it.episodes.any { ep -> ep.id == effectiveAutoPlayId } } }
-                ?: uiState.tvSeriesList.find { s -> s.seasons.any { it.episodes.any { ep -> ep.id == effectiveAutoPlayId } } }
-                ?: diskCatalog.find { s -> s.seasons.any { it.episodes.any { ep -> ep.id == effectiveAutoPlayId } } }
-        } else null
-
-        byEpId
-            ?: (initialSeries?.takeIf { it.seasons.any { s -> s.episodes.isNotEmpty() } })
-            ?: seriesList.find { it.id == seriesId && seriesId.isNotEmpty() && it.seasons.any { s -> s.episodes.isNotEmpty() } }
-            ?: uiState.tvSeriesList.find { it.id == seriesId && seriesId.isNotEmpty() && it.seasons.any { s -> s.episodes.isNotEmpty() } }
-            ?: (if (seriesId.isNotEmpty()) viewModel.getSeriesById(seriesId)?.takeIf { it.seasons.any { s -> s.episodes.isNotEmpty() } } else null)
-            ?: (if (seriesId.isNotEmpty()) diskCatalog.find { it.id == seriesId && it.seasons.any { s -> s.episodes.isNotEmpty() } } else null)
+    val resolvedSeries = remember(seriesId, seriesList, initialSeries, effectiveAutoPlayId) {
+        seriesList.firstOrNull { it.id == seriesId && seriesId.isNotEmpty() }
+            ?: (if (!effectiveAutoPlayId.isNullOrBlank()) {
+                seriesList.find { s -> s.seasons.any { it.episodes.any { ep -> ep.id == effectiveAutoPlayId } } }
+            } else null)
             ?: initialSeries
-            ?: seriesList.find { it.id == seriesId && seriesId.isNotEmpty() }
-            ?: uiState.tvSeriesList.find { it.id == seriesId && seriesId.isNotEmpty() }
-            ?: (if (seriesId.isNotEmpty()) viewModel.getSeriesById(seriesId) else null)
-            ?: (if (seriesId.isNotEmpty()) diskCatalog.find { it.id == seriesId } else null)
-            ?: seriesList.firstOrNull()
-            ?: uiState.tvSeriesList.firstOrNull()
-            ?: diskCatalog.firstOrNull()
     }
 
-    var currentSeries by remember(seriesId) { mutableStateOf(cachedSeries) }
-
-    LaunchedEffect(cachedSeries) {
-        if (currentSeries == null && cachedSeries != null) {
-            currentSeries = cachedSeries
-        }
+    val fallbackSeries = remember(seriesId, effectiveAutoPlayId) {
+        val sTitle = seriesList.find { it.id == seriesId }?.title ?: "TV Series"
+        val epId = effectiveAutoPlayId.orEmpty().ifBlank { "ep_fallback" }
+        val fallbackEp = Episode(
+            id = epId,
+            seriesTitle = sTitle,
+            displayTitle = "Episode 1",
+            seasonNumber = 1,
+            episodeNumber = 1,
+            thumbnailUrl = "",
+            durationFormatted = ""
+        )
+        TvSeries(
+            id = seriesId.ifBlank { "series_fallback" },
+            title = sTitle,
+            posterUrl = "",
+            backdropUrl = "",
+            seasons = listOf(
+                com.clotube.app.model.Season(
+                    id = "season_1",
+                    seasonNumber = 1,
+                    episodes = if (!effectiveAutoPlayId.isNullOrBlank()) listOf(fallbackEp) else emptyList()
+                )
+            )
+        )
     }
 
-    val hasLoadedEpisodes = remember(cachedSeries, currentSeries) {
-        (currentSeries ?: cachedSeries)?.seasons?.any { it.episodes.isNotEmpty() } == true
+    val targetSeries = resolvedSeries ?: fallbackSeries
+
+    val hasLoadedEpisodes = remember(targetSeries.seasons) {
+        targetSeries.seasons.any { it.episodes.isNotEmpty() }
     }
 
     var isLoadingEpisodes by remember(seriesId) {
         mutableStateOf(!hasLoadedEpisodes)
     }
 
-    LaunchedEffect(currentSeries) {
-        if (currentSeries?.seasons?.any { it.episodes.isNotEmpty() } == true) {
+    LaunchedEffect(hasLoadedEpisodes) {
+        if (hasLoadedEpisodes) {
             isLoadingEpisodes = false
         }
     }
 
     LaunchedEffect(seriesId, effectiveAutoPlayId) {
-        val needsFetch = currentSeries == null ||
-            currentSeries?.seasons.isNullOrEmpty() ||
-            currentSeries?.seasons?.all { it.episodes.isEmpty() } == true
+        val needsFetch = targetSeries.seasons.isEmpty() || targetSeries.seasons.all { it.episodes.isEmpty() }
 
         if (needsFetch) {
             isLoadingEpisodes = true
@@ -924,13 +910,10 @@ fun SeriesDetailScreen(
                             ?: ""
                     }
                     if (effectiveId.isNotBlank()) {
-                        val freshShow = seriesRepo.getShowDetails(effectiveId, currentSeries?.title)
+                        val freshShow = seriesRepo.getShowDetails(effectiveId, targetSeries.title)
                         if (freshShow.seasons.any { it.episodes.isNotEmpty() }) {
-                            currentSeries = freshShow
                             viewModel.updateSeriesInCatalog(freshShow)
                             com.clotube.app.viewmodel.saveShowToDisk(context, freshShow)
-                        } else if (freshShow.seasons.isNotEmpty()) {
-                            currentSeries = freshShow
                         }
                     }
                 } catch (e: Exception) {
@@ -944,54 +927,16 @@ fun SeriesDetailScreen(
         }
     }
 
-    val fallbackSeries = remember(effectiveAutoPlayId, seriesId, uiState.lastWatchedMedia) {
-        if (!effectiveAutoPlayId.isNullOrBlank()) {
-            val lastWatched = uiState.lastWatchedMedia
-            val sNum = lastWatched?.seasonNumber?.coerceAtLeast(1) ?: 1
-            val eNum = lastWatched?.episodeNumber?.coerceAtLeast(1) ?: 1
-            val sTitle = lastWatched?.seriesTitle?.ifBlank { null } ?: "The Mentalist"
-            val epTitle = lastWatched?.formattedDisplayTitle ?: "Episode $eNum"
-            val durMs = lastWatched?.durationMs ?: 0L
-            val durFormatted = if (durMs > 0L) {
-                String.format(java.util.Locale.US, "%02d:%02d", (durMs / 1000) / 60, (durMs / 1000) % 60)
-            } else ""
-            val fallbackEp = Episode(
-                id = effectiveAutoPlayId,
-                seriesTitle = sTitle,
-                displayTitle = epTitle,
-                seasonNumber = sNum,
-                episodeNumber = eNum,
-                thumbnailUrl = (lastWatched?.thumbnailUrl ?: lastWatched?.backdropUrl).orEmpty(),
-                durationFormatted = durFormatted
-            )
-            TvSeries(
-                id = seriesId.ifBlank { "series_fallback" },
-                title = sTitle,
-                posterUrl = lastWatched?.thumbnailUrl.orEmpty(),
-                backdropUrl = lastWatched?.backdropUrl.orEmpty(),
-                seasons = listOf(
-                    com.clotube.app.model.Season(
-                        id = "season_$sNum",
-                        seasonNumber = sNum,
-                        episodes = listOf(fallbackEp)
-                    )
-                )
-            )
+    // PREVENT RECOMPOSITION RESET: Key strictly to seriesId
+    var activePlayingEpisode by remember(seriesId) {
+        val initialEp = if (!effectiveAutoPlayId.isNullOrBlank()) {
+            targetSeries.seasons.flatMap { it.episodes }.firstOrNull { it.id == effectiveAutoPlayId }
         } else null
+        mutableStateOf<Episode?>(initialEp)
     }
 
-    val targetSeries = currentSeries ?: cachedSeries ?: fallbackSeries
-
-    var activePlayingEpisode by rememberSaveable(seriesId, effectiveAutoPlayId) {
-        mutableStateOf<Episode?>(
-            if (!effectiveAutoPlayId.isNullOrBlank() && targetSeries != null) {
-                targetSeries.seasons.flatMap { it.episodes }.find { it.id == effectiveAutoPlayId }
-            } else null
-        )
-    }
-
-    LaunchedEffect(targetSeries, effectiveAutoPlayId) {
-        if (activePlayingEpisode == null && !effectiveAutoPlayId.isNullOrBlank() && targetSeries != null) {
+    LaunchedEffect(seriesId, targetSeries.seasons.size) {
+        if (activePlayingEpisode == null && !effectiveAutoPlayId.isNullOrBlank()) {
             val found = targetSeries.seasons.flatMap { it.episodes }.find { it.id == effectiveAutoPlayId }
             if (found != null) {
                 activePlayingEpisode = found
@@ -999,56 +944,41 @@ fun SeriesDetailScreen(
         }
     }
 
-    var currentInitialPositionMs by rememberSaveable(seriesId, effectiveAutoPlayId) {
+    var currentInitialPositionMs by rememberSaveable(seriesId) {
         mutableLongStateOf(if (effectiveAutoPlayId != null) initialPositionMs else 0L)
     }
 
-    if (targetSeries != null) {
-        SeriesDetailScreen(
-            series = targetSeries,
-            viewModel = viewModel,
-            activePlayingEpisode = activePlayingEpisode,
-            initialPositionMs = currentInitialPositionMs,
-            autoPlayEpisodeId = effectiveAutoPlayId,
-            onEpisodeSelected = { ep ->
-                currentInitialPositionMs = 0L
-                viewModel.stopAndReleaseCurrentPlayer()
-                viewModel.selectEpisode(ep)
-                activePlayingEpisode = ep
-            },
-            onEpisodeSelectedWithPosition = { ep, seekPos ->
-                currentInitialPositionMs = seekPos
-                viewModel.stopAndReleaseCurrentPlayer()
-                viewModel.selectEpisode(ep)
-                activePlayingEpisode = ep
-            },
-            onClosePlayer = {
-                viewModel.stopAndReleaseCurrentPlayer()
-                viewModel.clearActiveEpisode()
-                activePlayingEpisode = null
-            },
-            onBackClick = {
-                viewModel.stopAndReleaseCurrentPlayer()
-                if (activePlayingEpisode != null) {
-                    viewModel.clearActiveEpisode()
-                    activePlayingEpisode = null
-                } else {
-                    onNavigateBack()
-                }
-            },
-            isLoadingEpisodes = isLoadingEpisodes,
-            modifier = Modifier.fillMaxSize()
-        )
-    } else {
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(Color(0xFF07090E)),
-            contentAlignment = Alignment.Center
-        ) {
-            CircularProgressIndicator(color = Color(0xFF00E5FF))
-        }
-    }
+    SeriesDetailScreen(
+        series = targetSeries,
+        viewModel = viewModel,
+        activePlayingEpisode = activePlayingEpisode,
+        initialPositionMs = currentInitialPositionMs,
+        autoPlayEpisodeId = effectiveAutoPlayId,
+        onEpisodeSelected = { ep ->
+            if (activePlayingEpisode?.id == ep.id) return@SeriesDetailScreen
+            currentInitialPositionMs = 0L
+            activePlayingEpisode = ep
+        },
+        onEpisodeSelectedWithPosition = { ep, seekPos ->
+            if (activePlayingEpisode?.id == ep.id) return@SeriesDetailScreen
+            currentInitialPositionMs = seekPos
+            activePlayingEpisode = ep
+        },
+        onClosePlayer = {
+            activePlayingEpisode = null
+            viewModel.clearActiveEpisode()
+            viewModel.stopAndReleaseCurrentPlayer()
+            onNavigateBack()
+        },
+        onBackClick = {
+            activePlayingEpisode = null
+            viewModel.clearActiveEpisode()
+            viewModel.stopAndReleaseCurrentPlayer()
+            onNavigateBack()
+        },
+        isLoadingEpisodes = isLoadingEpisodes,
+        modifier = Modifier.fillMaxSize()
+    )
 }
 
 /**
@@ -1088,58 +1018,40 @@ fun Modifier.shimmerEffect(): Modifier {
 }
 
 /**
- * Up Next banner shimmer skeleton matching the loaded Up Next card geometry.
- * Height ~88.dp, RoundedCornerShape(16.dp), left placeholder bars for badge/title/metadata,
- * and a 48.dp circular shimmer placeholder on the right for the cyan Play button.
+ * Up Next banner shimmer skeleton matching the compact loaded Up Next card geometry.
  */
 @Composable
 fun UpNextCardSkeleton(modifier: Modifier = Modifier) {
     Surface(
-        shape = RoundedCornerShape(16.dp),
-        color = Color(0xFF111722),
-        border = BorderStroke(1.dp, Color(0xFF1B2433)),
+        shape = RoundedCornerShape(12.dp),
+        color = SurfaceDefault,
+        border = BorderStroke(1.dp, SurfaceBorder),
         modifier = modifier
             .fillMaxWidth()
-            .height(88.dp)
+            .height(58.dp)
     ) {
         Row(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(14.dp),
+                .padding(horizontal = 14.dp, vertical = 10.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
             Column(
                 modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(6.dp)
+                verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Box(
-                        modifier = Modifier
-                            .width(52.dp)
-                            .height(14.dp)
-                            .clip(RoundedCornerShape(4.dp))
-                            .shimmerEffect()
-                    )
-                    Box(
-                        modifier = Modifier
-                            .width(44.dp)
-                            .height(14.dp)
-                            .clip(RoundedCornerShape(4.dp))
-                            .shimmerEffect()
-                    )
-                }
                 Box(
                     modifier = Modifier
-                        .width(160.dp)
-                        .height(16.dp)
-                        .clip(RoundedCornerShape(4.dp))
+                        .width(48.dp)
+                        .height(11.dp)
+                        .clip(RoundedCornerShape(3.dp))
                         .shimmerEffect()
                 )
                 Box(
                     modifier = Modifier
-                        .width(100.dp)
-                        .height(12.dp)
+                        .width(140.dp)
+                        .height(14.dp)
                         .clip(RoundedCornerShape(4.dp))
                         .shimmerEffect()
                 )
@@ -1149,7 +1061,7 @@ fun UpNextCardSkeleton(modifier: Modifier = Modifier) {
 
             Box(
                 modifier = Modifier
-                    .size(48.dp)
+                    .size(34.dp)
                     .clip(CircleShape)
                     .shimmerEffect()
             )
@@ -1159,23 +1071,23 @@ fun UpNextCardSkeleton(modifier: Modifier = Modifier) {
 
 /**
  * Season selector row shimmer skeleton displaying 4 rounded pill boxes
- * (width = 105.dp, height = 38.dp, RoundedCornerShape(10.dp)) with 8.dp horizontal spacing.
+ * (width = 86.dp, height = 34.dp, RoundedCornerShape(20.dp)) with 8.dp horizontal spacing.
  */
 @Composable
 fun SeasonSelectorRowSkeleton(modifier: Modifier = Modifier) {
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 10.dp),
+            .padding(horizontal = 16.dp, vertical = 8.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         repeat(4) {
             Box(
                 modifier = Modifier
-                    .width(105.dp)
-                    .height(38.dp)
-                    .clip(RoundedCornerShape(10.dp))
+                    .width(86.dp)
+                    .height(34.dp)
+                    .clip(RoundedCornerShape(20.dp))
                     .shimmerEffect()
             )
         }
@@ -1184,31 +1096,31 @@ fun SeasonSelectorRowSkeleton(modifier: Modifier = Modifier) {
 
 /**
  * Single episode item shimmer card matching the exact dimensions of EpisodeItemRow:
- * fillMaxWidth, RoundedCornerShape(14.dp), padding(horizontal = 16.dp, vertical = 6.dp),
- * 16:9 thumbnail box (130.dp x 76.dp), middle info bars, and two 32.dp action squares.
+ * fillMaxWidth, RoundedCornerShape(12.dp), padding(horizontal = 16.dp, vertical = 4.dp),
+ * 16:9 thumbnail box (118.dp width), middle info bars, and right 34.dp action button.
  */
 @Composable
 fun EpisodeItemSkeleton(modifier: Modifier = Modifier) {
     Surface(
-        shape = RoundedCornerShape(14.dp),
-        color = Color(0xFF131822),
-        border = BorderStroke(1.dp, Color(0xFF1E2638)),
+        shape = RoundedCornerShape(12.dp),
+        color = SurfaceDefault,
+        border = BorderStroke(1.dp, SurfaceBorder),
         modifier = modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 6.dp)
+            .padding(horizontal = 16.dp, vertical = 4.dp)
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(12.dp),
+                .padding(10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             // Left: 16:9 thumbnail box
             Box(
                 modifier = Modifier
-                    .width(130.dp)
-                    .height(76.dp)
-                    .clip(RoundedCornerShape(10.dp))
+                    .width(118.dp)
+                    .aspectRatio(16f / 9f)
+                    .clip(RoundedCornerShape(8.dp))
                     .shimmerEffect()
             )
 
@@ -1219,14 +1131,14 @@ fun EpisodeItemSkeleton(modifier: Modifier = Modifier) {
                 modifier = Modifier
                     .weight(1f)
                     .padding(end = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp)
+                verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
-                // Small bar for S01:E01 code
+                // Small bar for E01 index
                 Box(
                     modifier = Modifier
-                        .width(60.dp)
-                        .height(12.dp)
-                        .clip(RoundedCornerShape(4.dp))
+                        .width(28.dp)
+                        .height(11.dp)
+                        .clip(RoundedCornerShape(3.dp))
                         .shimmerEffect()
                 )
 
@@ -1234,51 +1146,28 @@ fun EpisodeItemSkeleton(modifier: Modifier = Modifier) {
                 Box(
                     modifier = Modifier
                         .width(140.dp)
-                        .height(16.dp)
+                        .height(14.dp)
                         .clip(RoundedCornerShape(4.dp))
                         .shimmerEffect()
                 )
 
-                // Two small inline bars for file size and 1080p FHD badge
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .width(48.dp)
-                            .height(12.dp)
-                            .clip(RoundedCornerShape(4.dp))
-                            .shimmerEffect()
-                    )
-                    Box(
-                        modifier = Modifier
-                            .width(48.dp)
-                            .height(12.dp)
-                            .clip(RoundedCornerShape(4.dp))
-                            .shimmerEffect()
-                    )
-                }
+                // Small bar for duration
+                Box(
+                    modifier = Modifier
+                        .width(36.dp)
+                        .height(11.dp)
+                        .clip(RoundedCornerShape(3.dp))
+                        .shimmerEffect()
+                )
             }
 
-            // Right: Two 32.dp rounded square shimmer placeholders (RoundedCornerShape(8.dp))
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                Box(
-                    modifier = Modifier
-                        .size(32.dp)
-                        .clip(RoundedCornerShape(8.dp))
-                        .shimmerEffect()
-                )
-                Box(
-                    modifier = Modifier
-                        .size(32.dp)
-                        .clip(RoundedCornerShape(8.dp))
-                        .shimmerEffect()
-                )
-            }
+            // Right: Single 34.dp download circle placeholder
+            Box(
+                modifier = Modifier
+                    .size(34.dp)
+                    .clip(CircleShape)
+                    .shimmerEffect()
+            )
         }
     }
 }
@@ -1292,6 +1181,114 @@ fun SeriesEpisodesSkeleton(modifier: Modifier = Modifier) {
     Column(modifier = modifier.fillMaxWidth()) {
         repeat(5) {
             EpisodeItemSkeleton()
+        }
+    }
+}
+
+@Composable
+fun StaticSeriesBackdropHeader(
+    series: Series,
+    onBackClick: () -> Unit,
+    onStartWatchingClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val displayArtworkUrl = series.backdropUrl?.ifBlank { null }
+        ?: series.posterUrl?.ifBlank { null }
+        ?: ""
+
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .clickable { onStartWatchingClick() }
+    ) {
+        // 1. Full-Bleed Artwork
+        if (displayArtworkUrl.isNotBlank()) {
+            coil.compose.AsyncImage(
+                model = displayArtworkUrl,
+                contentDescription = series.title,
+                contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+
+        // 2. High-Contrast Gradient Scrim
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.verticalGradient(
+                        colorStops = arrayOf(
+                            0.0f to Color(0x66000000),
+                            0.30f to Color(0x20000000),
+                            0.65f to Color(0xD9070A0F),
+                            1.0f to Color(0xFC070A0F)
+                        )
+                    )
+                )
+        )
+
+        // 3. Top Action Bar (Back Button)
+        Row(
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(
+                onClick = onBackClick,
+                modifier = Modifier.size(40.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
+                    contentDescription = "Back",
+                    tint = Color.White,
+                    modifier = Modifier.size(22.dp)
+                )
+            }
+        }
+
+        // 4. Center / Bottom Content: Title + "Start Watching" Button
+        Column(
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .padding(start = 20.dp, end = 20.dp, bottom = 20.dp)
+        ) {
+            Text(
+                text = series.title,
+                style = MaterialTheme.typography.titleLarge.copy(
+                    fontSize = 22.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White
+                ),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            Button(
+                onClick = onStartWatchingClick,
+                colors = ButtonDefaults.buttonColors(containerColor = AccentBlue),
+                shape = RoundedCornerShape(10.dp),
+                contentPadding = PaddingValues(horizontal = 20.dp, vertical = 10.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.PlayArrow,
+                    contentDescription = "Start Watching",
+                    tint = Color.White,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "Start Watching",
+                    style = MaterialTheme.typography.labelLarge.copy(
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color.White
+                    )
+                )
+            }
         }
     }
 }

@@ -25,6 +25,8 @@ class TokenRepository(private val context: Context) {
     @Volatile
     var recoveryIntentLauncher: ((Intent) -> Unit)? = null
 
+    suspend fun forceRefreshToken(): String = getValidAccessToken(forceRefresh = true)
+
     suspend fun getValidAccessToken(forceRefresh: Boolean = false): String = withContext(Dispatchers.IO) {
         val now = System.currentTimeMillis()
         if (!forceRefresh && lastKnownToken.isNotBlank() && (now - lastTokenFetchTimeMs < 50 * 60 * 1000L)) {

@@ -26,6 +26,7 @@ import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import com.clotube.app.model.Episode
 import com.clotube.app.model.Series
+import com.clotube.app.ui.theme.*
 
 @Composable
 fun SeriesResumeHeaderCard(
@@ -94,16 +95,13 @@ fun SeriesResumeHeaderCard(
         ) {
             IconButton(
                 onClick = onBackClick,
-                modifier = Modifier
-                    .size(36.dp)
-                    .clip(CircleShape)
-                    .background(Color(0x80000000))
+                modifier = Modifier.size(40.dp)
             ) {
                 Icon(
                     imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
                     contentDescription = "Back",
                     tint = Color.White,
-                    modifier = Modifier.size(20.dp)
+                    modifier = Modifier.size(22.dp)
                 )
             }
 
@@ -114,7 +112,7 @@ fun SeriesResumeHeaderCard(
             ) {
                 Text(
                     text = "• OTT DIRECT STREAM",
-                    color = Color(0xFF00E5FF),
+                    color = AccentBlue,
                     fontSize = 10.sp,
                     fontWeight = FontWeight.Bold
                 )
@@ -138,8 +136,8 @@ fun SeriesResumeHeaderCard(
                 // Tag Pill
                 Box(
                     modifier = Modifier
-                        .background(Color(0xCC0E1A2B), RoundedCornerShape(6.dp))
-                        .border(BorderStroke(1.dp, Color(0xFF00E5FF).copy(alpha = 0.5f)), RoundedCornerShape(6.dp))
+                        .background(SurfaceElevated, RoundedCornerShape(6.dp))
+                        .border(BorderStroke(1.dp, SurfaceBorder), RoundedCornerShape(6.dp))
                         .padding(horizontal = 8.dp, vertical = 3.dp)
                 ) {
                     Row(
@@ -149,12 +147,12 @@ fun SeriesResumeHeaderCard(
                         Icon(
                             imageVector = Icons.Rounded.History,
                             contentDescription = null,
-                            tint = Color(0xFF00E5FF),
+                            tint = AccentBlue,
                             modifier = Modifier.size(11.dp)
                         )
                         Text(
                             text = if (isResume) "CONTINUE WATCHING" else "START WATCHING",
-                            color = Color(0xFF00E5FF),
+                            color = AccentBlue,
                             fontSize = 9.sp,
                             fontWeight = FontWeight.Bold,
                             letterSpacing = 0.5.sp
@@ -168,7 +166,7 @@ fun SeriesResumeHeaderCard(
                 if (series.title.isNotBlank()) {
                     Text(
                         text = series.title,
-                        color = Color(0xFF00E5FF),
+                        color = Color(0xFF94A3B8),
                         fontSize = 12.sp,
                         fontWeight = FontWeight.SemiBold,
                         maxLines = 1,
@@ -204,7 +202,7 @@ fun SeriesResumeHeaderCard(
                 } else if (durationMs > 0L) {
                     durFormatted
                 } else {
-                    "${episode.fileSizeFormatted} • 1080p FHD"
+                    "1080p FHD"
                 }
 
                 Text(
@@ -220,8 +218,8 @@ fun SeriesResumeHeaderCard(
             Button(
                 onClick = { onResumeClick(episode, currentPositionMs) },
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = Color(0xFF00E5FF),
-                    contentColor = Color(0xFF07090E)
+                    containerColor = Color.White,
+                    contentColor = CanvasDeep
                 ),
                 shape = RoundedCornerShape(20.dp),
                 contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
@@ -230,13 +228,13 @@ fun SeriesResumeHeaderCard(
                 Icon(
                     imageVector = Icons.Rounded.PlayArrow,
                     contentDescription = null,
-                    tint = Color(0xFF07090E),
+                    tint = CanvasDeep,
                     modifier = Modifier.size(18.dp)
                 )
                 Spacer(modifier = Modifier.width(4.dp))
                 Text(
                     text = if (isResume) "Resume Watching" else "Start Watching",
-                    color = Color(0xFF07090E),
+                    color = CanvasDeep,
                     fontSize = 11.sp,
                     fontWeight = FontWeight.Bold
                 )
@@ -256,7 +254,7 @@ fun SeriesResumeHeaderCard(
                     modifier = Modifier
                         .fillMaxWidth(progressFraction.coerceIn(0.02f, 1f))
                         .fillMaxHeight()
-                        .background(Color(0xFF00E5FF))
+                        .background(AccentBlue)
                 )
             }
         }

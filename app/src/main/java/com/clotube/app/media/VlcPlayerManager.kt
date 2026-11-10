@@ -110,12 +110,18 @@ class VlcPlayerManager(
 
     fun attachLayout(layout: VLCVideoLayout) {
         try {
-            mediaPlayer.detachViews()
-            // Parameter 4 (textureView) = true: Enables TextureView so video scales dynamically in Compose
-            mediaPlayer.attachViews(layout, null, true, true)
-            mediaPlayer.videoScale = MediaPlayer.ScaleType.SURFACE_BEST_FIT
-            mediaPlayer.aspectRatio = "16:9"
-            Log.d(TAG, "Attached VLC layout with TextureView and SURFACE_BEST_FIT")
+            if (!mediaPlayer.isReleased) {
+                mediaPlayer.detachViews()
+                // Parameter 4 (textureView) = true: Enables TextureView so video scales dynamically in Compose
+                mediaPlayer.attachViews(layout, null, true, true)
+                try {
+                    mediaPlayer.videoScale = MediaPlayer.ScaleType.SURFACE_BEST_FIT
+                } catch (_: Throwable) {}
+                try {
+                    mediaPlayer.aspectRatio = "16:9"
+                } catch (_: Throwable) {}
+                Log.d(TAG, "Attached VLC layout with TextureView and SURFACE_BEST_FIT")
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Error attaching VLC layout: ${e.message}")
         }
@@ -123,7 +129,9 @@ class VlcPlayerManager(
 
     fun detachLayout() {
         try {
-            mediaPlayer.detachViews()
+            if (!mediaPlayer.isReleased) {
+                mediaPlayer.detachViews()
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Error detaching VLC layout: ${e.message}")
         }
@@ -209,6 +217,7 @@ class VlcPlayerManager(
     fun seekTo(positionMs: Long) {
         pendingSeekJob?.cancel()
         pendingStartPositionMs = 0L
+        if (mediaPlayer.isReleased) return
         val isEndedOrEof = isPlaybackEnded || (!mediaPlayer.isPlaying && (mediaPlayer.time == -1L || (mediaPlayer.length > 0L && mediaPlayer.time >= mediaPlayer.length - 1500L)))
         val currentFileId = activeFileId
         if (isEndedOrEof && currentFileId != null) {
@@ -228,17 +237,23 @@ class VlcPlayerManager(
 
     fun setSpeed(speed: Float) {
         userSelectedPlaybackSpeed = speed
-        mediaPlayer.rate = speed
+        if (!mediaPlayer.isReleased) {
+            try { mediaPlayer.rate = speed } catch (_: Throwable) {}
+        }
     }
 
     fun setSubtitleTrack(trackId: Int) {
         userSelectedSpuTrackId = trackId
-        mediaPlayer.spuTrack = trackId
+        if (!mediaPlayer.isReleased) {
+            try { mediaPlayer.spuTrack = trackId } catch (_: Throwable) {}
+        }
     }
 
     fun setAudioTrack(trackId: Int) {
         userSelectedAudioTrackId = trackId
-        mediaPlayer.audioTrack = trackId
+        if (!mediaPlayer.isReleased) {
+            try { mediaPlayer.audioTrack = trackId } catch (_: Throwable) {}
+        }
     }
 
     fun release() {

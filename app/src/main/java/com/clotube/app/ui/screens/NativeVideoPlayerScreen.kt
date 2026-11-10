@@ -1,5 +1,8 @@
 package com.clotube.app.ui.screens
 
+import android.app.Activity
+import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.fillMaxSize
@@ -14,6 +17,8 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.viewModelScope
 import com.clotube.app.ui.components.ClotubeVideoPlayer
 import com.clotube.app.viewmodel.VideoViewModel
@@ -26,6 +31,10 @@ fun NativeVideoPlayerScreen(
     viewModel: VideoViewModel,
     onNavigateBack: () -> Unit
 ) {
+    val context = LocalContext.current
+    val activity = context as? Activity
+    val configuration = LocalConfiguration.current
+    val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
     val coroutineScope = rememberCoroutineScope()
     val movie = remember(fileId) { viewModel.getMovieById(fileId) }
     val movieTitle = remember(movie) {
@@ -33,6 +42,16 @@ fun NativeVideoPlayerScreen(
     }
     var resumePositionMs by remember { mutableLongStateOf(0L) }
     var isReadyToPlay by remember { mutableStateOf(false) }
+
+    val toggleFullscreen: () -> Unit = {
+        activity?.let { act ->
+            act.requestedOrientation = if (isLandscape) {
+                ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            } else {
+                ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            }
+        }
+    }
 
     // 1. Resolve resume position from DataStore before mounting player
     LaunchedEffect(fileId) {
@@ -113,7 +132,11 @@ fun NativeVideoPlayerScreen(
     }
 
     BackHandler {
-        handleExit()
+        if (isLandscape) {
+            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        } else {
+            handleExit()
+        }
     }
 
     if (isReadyToPlay) {
@@ -122,7 +145,14 @@ fun NativeVideoPlayerScreen(
             movie = movie,
             viewModel = viewModel,
             startPositionMs = resumePositionMs,
-            onClosePlayer = handleExit,
+            onClosePlayer = {
+                if (isLandscape) {
+                    activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                } else {
+                    handleExit()
+                }
+            },
+            onToggleFullscreen = toggleFullscreen,
             modifier = Modifier
                 .fillMaxSize()
                 .background(Color.Black)

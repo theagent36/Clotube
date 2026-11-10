@@ -129,7 +129,7 @@ class TokenRefreshProvider(
         if (fileId.isBlank()) return ""
         val token = accessToken.trim()
         return if (token.isNotBlank()) {
-            "$DRIVE_BASE_STREAM_URL$fileId$DRIVE_STREAM_PARAMS&access_token=$token"
+            "$DRIVE_BASE_STREAM_URL$fileId$DRIVE_STREAM_PARAMS"
         } else {
             "http://127.0.0.1:${LocalStreamProxy.PORT}/stream?fileId=$fileId"
         }

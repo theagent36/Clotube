@@ -6,8 +6,10 @@ import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandHorizontally
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkHorizontally
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -44,6 +46,8 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.clotube.app.ui.theme.AppleTvMotion
+import com.clotube.app.ui.theme.appleTvPressable
 import com.clotube.app.util.triggerTabTickHaptic
 import com.clotube.app.viewmodel.NavigationTab
 
@@ -164,6 +168,7 @@ private fun ClassyBottomBarItem(
 
     Box(
         modifier = Modifier
+            .appleTvPressable(interactionSource, pressedScale = 0.92f)
             .height(42.dp)
             .clip(RoundedCornerShape(21.dp))
             .background(containerColor)
@@ -193,8 +198,8 @@ private fun ClassyBottomBarItem(
 
             AnimatedVisibility(
                 visible = isSelected,
-                enter = fadeIn(animationSpec = tween(150)),
-                exit = fadeOut(animationSpec = tween(100))
+                enter = expandHorizontally(animationSpec = AppleTvMotion.fluidSpring()) + fadeIn(),
+                exit = shrinkHorizontally(animationSpec = AppleTvMotion.fluidSpring()) + fadeOut()
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Spacer(modifier = Modifier.width(8.dp))
@@ -264,6 +269,7 @@ fun ClassyBottomBar(
 
                     Box(
                         modifier = Modifier
+                            .appleTvPressable(interactionSource, pressedScale = 0.92f)
                             .height(42.dp)
                             .clip(RoundedCornerShape(21.dp))
                             .background(containerColor)
@@ -296,8 +302,8 @@ fun ClassyBottomBar(
 
                             AnimatedVisibility(
                                 visible = isSelected,
-                                enter = fadeIn(animationSpec = tween(150)),
-                                exit = fadeOut(animationSpec = tween(100))
+                                enter = expandHorizontally(animationSpec = AppleTvMotion.fluidSpring()) + fadeIn(),
+                                exit = shrinkHorizontally(animationSpec = AppleTvMotion.fluidSpring()) + fadeOut()
                             ) {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     Spacer(modifier = Modifier.width(8.dp))

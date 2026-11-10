@@ -1,21 +1,53 @@
 package com.clotube.app.ui.components
 
-import androidx.compose.animation.core.*
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.outlined.FileDownload
+import androidx.compose.material.icons.outlined.FileDownloadDone
 import androidx.compose.material.icons.rounded.Check
-import androidx.compose.material.icons.rounded.FileDownload
 import androidx.compose.material.icons.rounded.PlayArrow
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.ripple
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -30,6 +62,12 @@ import com.clotube.app.data.DownloadStatus
 import com.clotube.app.data.OfflineMediaRecord
 import com.clotube.app.data.PlaybackHistoryManager
 import com.clotube.app.model.Episode
+import com.clotube.app.ui.theme.AccentBlue
+import com.clotube.app.ui.theme.AppleTvMotion
+import com.clotube.app.ui.theme.SurfaceBorder
+import com.clotube.app.ui.theme.SurfaceDefault
+import com.clotube.app.ui.theme.SurfaceElevated
+import com.clotube.app.ui.theme.appleTvPressable
 import com.clotube.app.util.triggerClickHaptic
 import com.clotube.app.viewmodel.VideoViewModel
 import kotlinx.coroutines.launch
@@ -56,16 +94,18 @@ fun EpisodeItemRow(
     val coroutineScope = rememberCoroutineScope()
 
     val userEmail = remember { com.google.android.gms.auth.api.signin.GoogleSignIn.getLastSignedInAccount(context)?.email.orEmpty() }
-    val isWatchedExplicit = remember(userEmail, episode.id) {
-        if (userEmail.isNotBlank()) {
-            com.clotube.app.data.AndroidWatchHistoryManager.isEpisodeWatched(context, userEmail, episode.id)
-        } else false
-    }
+
+    // Reactive watch state with optimistic override for zero-latency tap response
+    var optimisticWatched by remember(episode.id) { mutableStateOf<Boolean?>(null) }
     val isWatchedFromFlow by (playbackHistoryManager?.isEpisodeWatched(episode.id)
         ?: remember(episode.id) { kotlinx.coroutines.flow.flowOf(false) })
-        .collectAsState(initial = false)
+        .collectAsState(initial = isWatched)
 
-    val effectiveWatched = isWatched || isWatchedExplicit || isWatchedFromFlow
+    LaunchedEffect(isWatchedFromFlow) {
+        optimisticWatched = null
+    }
+
+    val effectiveWatched = optimisticWatched ?: isWatchedFromFlow
 
     val downloadRepo = remember(context) { DownloadRepository(context) }
     val recordState by downloadRepo.getDownloadRecord(episode.id).collectAsState(initial = null)
@@ -81,7 +121,6 @@ fun EpisodeItemRow(
             status == DownloadStatus.DOWNLOADING ||
             status == DownloadStatus.QUEUED
 
-    // Infinite transition for pulsing "NOW PLAYING" indicator
     val infiniteTransition = rememberInfiniteTransition(label = "now_playing_pulse")
     val pulseAlpha by infiniteTransition.animateFloat(
         initialValue = 0.4f,
@@ -93,33 +132,44 @@ fun EpisodeItemRow(
         label = "pulse_alpha"
     )
 
+    val rowBgColor by animateColorAsState(
+        targetValue = if (isPlayingThis) SurfaceElevated else SurfaceDefault,
+        animationSpec = AppleTvMotion.fluidSpring(),
+        label = "episode_row_bg"
+    )
+    val rowBorderColor by animateColorAsState(
+        targetValue = if (isPlayingThis) AccentBlue else SurfaceBorder,
+        animationSpec = AppleTvMotion.fluidSpring(),
+        label = "episode_row_border"
+    )
+    val rowInteractionSource = remember { MutableInteractionSource() }
+
     Surface(
         modifier = modifier
             .fillMaxWidth()
+            .appleTvPressable(rowInteractionSource, pressedScale = 0.97f)
             .clip(RoundedCornerShape(12.dp))
-            .clickable { onEpisodeClick() },
+            .clickable(
+                interactionSource = rowInteractionSource,
+                indication = ripple(bounded = true)
+            ) { onEpisodeClick() },
         shape = RoundedCornerShape(12.dp),
-        color = if (isPlayingThis) Color(0xFF0E1A2B) else Color(0xFF131822),
-        // Active Blue Outline
-        border = if (isPlayingThis) {
-            BorderStroke(1.5.dp, Color(0xFF00E5FF))
-        } else {
-            BorderStroke(1.dp, Color(0xFF1E2638))
-        }
+        color = rowBgColor,
+        border = BorderStroke(1.dp, rowBorderColor)
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(12.dp),
+                .padding(10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // 1. Episode Thumbnail with Active Indicator Overlay
+            // 1. Thumbnail with bottom progress line
             Box(
                 modifier = Modifier
-                    .width(116.dp)
-                    .height(68.dp)
+                    .width(118.dp)
+                    .aspectRatio(16f / 9f)
                     .clip(RoundedCornerShape(8.dp))
-                    .background(Color(0xFF080B11)),
+                    .background(SurfaceElevated),
                 contentAlignment = Alignment.Center
             ) {
                 if (episode.thumbnailUrl.isNotBlank()) {
@@ -131,14 +181,16 @@ fun EpisodeItemRow(
                     )
                 }
 
-                // Thumbnail dark scrim
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .background(Color(0x40000000))
+                        .background(
+                            Brush.verticalGradient(
+                                colors = listOf(Color.Transparent, Color(0x66000000))
+                            )
+                        )
                 )
 
-                // Play / Equalizer Icon
                 if (isPlayingThis) {
                     Row(
                         horizontalArrangement = Arrangement.spacedBy(3.dp),
@@ -152,186 +204,170 @@ fun EpisodeItemRow(
                 } else {
                     Box(
                         modifier = Modifier
-                            .size(28.dp)
-                            .clip(RoundedCornerShape(14.dp))
-                            .background(Color(0x99000000)),
+                            .size(26.dp)
+                            .clip(CircleShape)
+                            .background(Color(0x66000000)),
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(
                             imageVector = Icons.Rounded.PlayArrow,
                             contentDescription = "Play",
-                            tint = Color.White,
+                            tint = Color.White.copy(alpha = 0.9f),
                             modifier = Modifier.size(16.dp)
                         )
                     }
                 }
 
-                // Duration badge
-                if (episode.formattedDuration.isNotBlank()) {
+                if (effectiveWatched) {
                     Box(
                         modifier = Modifier
-                            .align(Alignment.BottomEnd)
-                            .padding(4.dp)
-                            .background(Color(0xCC000000), RoundedCornerShape(4.dp))
-                            .padding(horizontal = 4.dp, vertical = 2.dp)
-                    ) {
-                        Text(
-                            text = episode.formattedDuration,
-                            color = Color(0xFFECEFF1),
-                            fontSize = 9.sp,
-                            fontWeight = FontWeight.Medium
-                        )
-                    }
+                            .fillMaxWidth()
+                            .height(2.5.dp)
+                            .align(Alignment.BottomCenter)
+                            .background(AccentBlue)
+                    )
                 }
             }
 
             Spacer(modifier = Modifier.width(12.dp))
 
-            // 2. Metadata: Tags, Title, and Technical details
+            // 2. Center Metadata
             Column(
                 modifier = Modifier
                     .weight(1f)
                     .padding(end = 8.dp)
             ) {
-                // Header Row: Season/Episode Pill + NOW PLAYING Badge
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    val sFormatted = episode.seasonNumber.toString().padStart(2, '0')
-                    val eFormatted = episode.episodeNumber.toString().padStart(2, '0')
+                val epIndex = "E${episode.episodeNumber.toString().padStart(2, '0')}"
+                Text(
+                    text = epIndex,
+                    color = if (isPlayingThis) AccentBlue else Color(0xFF94A3B8),
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold
+                )
 
-                    Text(
-                        text = "S$sFormatted:E$eFormatted",
-                        color = Color(0xFF00E5FF),
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold
-                    )
+                Spacer(modifier = Modifier.height(2.dp))
 
-                    if (isPlayingThis) {
-                        Text(
-                            text = "•",
-                            color = Color(0xFF00E5FF).copy(alpha = 0.5f),
-                            fontSize = 10.sp
-                        )
-
-                        // "NOW PLAYING" Glowing Label
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(4.dp)
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(6.dp)
-                                    .clip(RoundedCornerShape(3.dp))
-                                    .background(Color(0xFF00E5FF).copy(alpha = pulseAlpha))
-                            )
-                            Text(
-                                text = "NOW PLAYING",
-                                color = Color(0xFF00E5FF),
-                                fontSize = 10.sp,
-                                fontWeight = FontWeight.ExtraBold,
-                                letterSpacing = 0.6.sp
-                            )
-                        }
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(4.dp))
-
-                // Episode Title
                 Text(
                     text = episode.displayTitle,
-                    color = if (isPlayingThis) Color(0xFF00E5FF) else Color.White,
-                    fontSize = 13.sp,
-                    fontWeight = if (isPlayingThis) FontWeight.SemiBold else FontWeight.Normal,
+                    color = Color.White,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
 
-                Spacer(modifier = Modifier.height(6.dp))
+                Spacer(modifier = Modifier.height(4.dp))
 
-                // Bottom Specs: File Size & Resolution
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    if (episode.fileSize.isNotBlank()) {
-                        Text(
-                            text = episode.fileSize,
-                            color = Color(0xFF7E8D9F),
-                            fontSize = 11.sp
-                        )
-                    }
-
-                    Box(
-                        modifier = Modifier
-                            .background(Color(0xFF1E2838), RoundedCornerShape(4.dp))
-                            .padding(horizontal = 5.dp, vertical = 2.dp)
-                    ) {
-                        Text(
-                            text = episode.resolution.ifBlank { "1080p FHD" },
-                            color = Color(0xFF64B5F6),
-                            fontSize = 9.sp,
-                            fontWeight = FontWeight.Medium
-                        )
+                val durationText = remember(episode.durationFormatted, episode.durationMs) {
+                    if (episode.durationMs > 0L) {
+                        val mins = (episode.durationMs / 1000L) / 60L
+                        if (mins > 0L) "${mins}m" else episode.durationFormatted
+                    } else {
+                        val parts = episode.durationFormatted.split(":")
+                        if (parts.size >= 2) {
+                            val mins = parts[parts.size - 2].toIntOrNull()
+                            if (mins != null && mins > 0) "${mins}m" else episode.durationFormatted
+                        } else {
+                            episode.durationFormatted.ifBlank { "42m" }
+                        }
                     }
                 }
+
+                Text(
+                    text = durationText,
+                    color = Color(0xFF64748B),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Normal
+                )
             }
 
-            // 3. Action Buttons: Checkmark / Watched & Download
+            // 3. Right Rail Actions: [Mark as Watched Checkbox] + [Download Button]
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                // Completed indicator
-                Box(
+                // THEMED MARK AS WATCHED CHECKBOX BUTTON
+                val checkInteractionSource = remember { MutableInteractionSource() }
+                val checkBgColor by animateColorAsState(
+                    targetValue = if (effectiveWatched) AccentBlue.copy(alpha = 0.16f) else Color.Transparent,
+                    animationSpec = AppleTvMotion.tactileSpring(),
+                    label = "check_bg"
+                )
+                val checkBorderColor by animateColorAsState(
+                    targetValue = if (effectiveWatched) AccentBlue else SurfaceBorder,
+                    animationSpec = AppleTvMotion.tactileSpring(),
+                    label = "check_border"
+                )
+                val checkIconTint by animateColorAsState(
+                    targetValue = if (effectiveWatched) AccentBlue else Color(0xFF64748B),
+                    animationSpec = AppleTvMotion.tactileSpring(),
+                    label = "check_tint"
+                )
+
+                Surface(
                     modifier = Modifier
                         .size(32.dp)
+                        .appleTvPressable(checkInteractionSource, pressedScale = 0.88f)
                         .clip(RoundedCornerShape(8.dp))
-                        .background(if (effectiveWatched) Color(0xFF16322A) else Color(0xFF181F2C))
-                        .clickable {
+                        .clickable(
+                            interactionSource = checkInteractionSource,
+                            indication = ripple(bounded = true)
+                        ) {
+                            val nextState = !effectiveWatched
+                            optimisticWatched = nextState
                             view.triggerClickHaptic()
+
                             if (onToggleWatched != null) {
                                 onToggleWatched()
                             } else {
                                 coroutineScope.launch {
-                                    playbackHistoryManager?.toggleEpisodeWatched(
-                                        episode = episode,
+                                    playbackHistoryManager?.setEpisodeWatched(
                                         seriesId = seriesId,
-                                        seriesTitle = seriesTitle
-                                    )
+                                        seriesTitle = seriesTitle,
+                                        episode = episode,
+                                        isWatched = nextState,
+                                        userEmail = userEmail
+                                    ) ?: run {
+                                        if (userEmail.isNotBlank()) {
+                                            com.clotube.app.data.AndroidWatchHistoryManager.setEpisodeWatched(
+                                                context = context,
+                                                email = userEmail,
+                                                fileId = episode.id,
+                                                isWatched = nextState
+                                            )
+                                        }
+                                    }
                                 }
                             }
                         },
-                    contentAlignment = Alignment.Center
+                    shape = RoundedCornerShape(8.dp),
+                    color = checkBgColor,
+                    border = BorderStroke(1.dp, checkBorderColor)
                 ) {
-                    Icon(
-                        imageVector = Icons.Rounded.Check,
-                        contentDescription = if (effectiveWatched) "Mark as Unwatched" else "Mark as Watched",
-                        tint = if (effectiveWatched) Color(0xFF00E676) else Color(0xFF4C5D75),
-                        modifier = Modifier.size(16.dp)
-                    )
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = Icons.Rounded.Check,
+                            contentDescription = if (effectiveWatched) "Mark as unwatched" else "Mark as watched",
+                            tint = checkIconTint,
+                            modifier = Modifier.size(17.dp)
+                        )
+                    }
                 }
 
-                // Download action
-                Box(
-                    modifier = Modifier
-                        .size(32.dp)
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(Color(0xFF181F2C))
-                        .clickable {
-                            view.triggerClickHaptic()
-                            if (isActionCancelOrDelete) onCancelDownload() else onStartDownload()
-                        },
-                    contentAlignment = Alignment.Center
+                // DOWNLOAD BUTTON
+                IconButton(
+                    onClick = {
+                        view.triggerClickHaptic()
+                        if (isActionCancelOrDelete) onCancelDownload() else onStartDownload()
+                    },
+                    modifier = Modifier.size(36.dp)
                 ) {
                     when (status) {
                         DownloadStatus.COMPLETED -> {
                             Icon(
-                                imageVector = Icons.Default.CheckCircle,
+                                imageVector = Icons.Outlined.FileDownloadDone,
                                 contentDescription = "Downloaded",
-                                tint = Color(0xFF00E5FF),
+                                tint = AccentBlue,
                                 modifier = Modifier.size(18.dp)
                             )
                         }
@@ -339,23 +375,23 @@ fun EpisodeItemRow(
                             CircularProgressIndicator(
                                 progress = { effectiveRecord?.progressFraction ?: 0f },
                                 modifier = Modifier.size(18.dp),
-                                color = Color(0xFF00E5FF),
+                                color = AccentBlue,
                                 strokeWidth = 2.dp
                             )
                         }
                         DownloadStatus.QUEUED -> {
                             CircularProgressIndicator(
                                 modifier = Modifier.size(18.dp),
-                                color = Color(0xFF8E99A8),
+                                color = Color(0xFF64748B),
                                 strokeWidth = 2.dp
                             )
                         }
                         else -> {
                             Icon(
-                                imageVector = Icons.Rounded.FileDownload,
+                                imageVector = Icons.Outlined.FileDownload,
                                 contentDescription = "Download",
-                                tint = Color(0xFF4C5D75),
-                                modifier = Modifier.size(16.dp)
+                                tint = Color(0xFF64748B),
+                                modifier = Modifier.size(18.dp)
                             )
                         }
                     }
@@ -388,11 +424,7 @@ fun EpisodeItemRow(
     onEpisodeClick = onEpisodeClick,
     onStartDownload = onStartDownload,
     onCancelDownload = onCancelDownload,
-    isWatched = com.clotube.app.data.AndroidWatchHistoryManager.isEpisodeWatched(
-        androidx.compose.ui.platform.LocalContext.current,
-        viewModel.uiState.value.userEmail.orEmpty(),
-        episode.id
-    ),
+    isWatched = false,
     isDownloading = isDownloading,
     isDownloaded = isDownloaded,
     downloadRecord = downloadRecord,
@@ -411,6 +443,6 @@ fun AnimatedEqualizerBar(
             .width(3.dp)
             .height((16 * heightFraction * progress.coerceIn(0.3f, 1.0f)).dp)
             .clip(RoundedCornerShape(1.5.dp))
-            .background(Color(0xFF00E5FF))
+            .background(AccentBlue)
     )
 }

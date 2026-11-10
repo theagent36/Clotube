@@ -6,6 +6,7 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -27,6 +28,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -44,8 +46,14 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.clotube.app.util.triggerClickHaptic
 import com.clotube.app.model.Season
+import com.clotube.app.ui.theme.AccentBlue
+import com.clotube.app.ui.theme.AppleTvMotion
+import com.clotube.app.ui.theme.CanvasDeep
+import com.clotube.app.ui.theme.SurfaceBorder
+import com.clotube.app.ui.theme.SurfaceDefault
+import com.clotube.app.ui.theme.appleTvPressable
+import com.clotube.app.util.triggerClickHaptic
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -55,35 +63,38 @@ fun SeasonTabChip(
     isCompleted: Boolean,
     onSelect: () -> Unit,
     onMarkComplete: () -> Unit,
-    onMarkIncomplete: () -> Unit
+    onMarkIncomplete: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
     val view = LocalView.current
     var isMenuOpen by remember { mutableStateOf(false) }
     val haptic = LocalHapticFeedback.current
+    val interactionSource = remember { MutableInteractionSource() }
 
-    // Smooth color transitions
+    // Smooth theme transitions
     val chipBgColor by animateColorAsState(
-        targetValue = if (isSelected) Color(0xFF00E5FF) else Color(0xFF131722),
+        targetValue = if (isSelected) Color.White else SurfaceDefault,
+        animationSpec = AppleTvMotion.fluidSpring(),
         label = "chipBgColor"
     )
     val titleTextColor by animateColorAsState(
-        targetValue = if (isSelected) Color(0xFF07090E) else Color(0xFFF1F5F9),
+        targetValue = if (isSelected) CanvasDeep else Color(0xFF94A3B8),
+        animationSpec = AppleTvMotion.fluidSpring(),
         label = "titleTextColor"
     )
-    val subtitleTextColor by animateColorAsState(
-        targetValue = if (isSelected) Color(0xFF0F172A).copy(alpha = 0.8f) else Color(0xFF78859E),
-        label = "subtitleTextColor"
-    )
 
-    Box {
+    Box(modifier = modifier) {
         Surface(
-            shape = RoundedCornerShape(24.dp),
+            shape = RoundedCornerShape(20.dp),
             color = chipBgColor,
-            border = if (isSelected) null else BorderStroke(1.dp, Color(0xFF232A3B)),
+            border = if (isSelected) null else BorderStroke(1.dp, SurfaceBorder),
             modifier = Modifier
-                .padding(end = 10.dp)
-                .clip(RoundedCornerShape(24.dp))
+                .padding(end = 8.dp)
+                .appleTvPressable(interactionSource, pressedScale = 0.94f)
+                .clip(RoundedCornerShape(20.dp))
                 .combinedClickable(
+                    interactionSource = interactionSource,
+                    indication = ripple(bounded = true),
                     onClick = onSelect,
                     onLongClick = {
                         haptic.performHapticFeedback(HapticFeedbackType.LongPress)
@@ -92,38 +103,30 @@ fun SeasonTabChip(
                 )
         ) {
             Row(
-                modifier = Modifier.padding(horizontal = 18.dp, vertical = 9.dp),
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = season.seasonTitle.ifBlank { "Season ${season.seasonNumber}" },
+                    text = "Season ${season.seasonNumber}",
                     fontSize = 13.sp,
-                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.SemiBold,
+                    fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
                     color = titleTextColor
                 )
 
-                Spacer(Modifier.width(6.dp))
-
-                Text(
-                    text = "(${season.episodes.size})",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = subtitleTextColor
-                )
-
+                // Season Completed Badge
                 if (isCompleted) {
-                    Spacer(Modifier.width(8.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
                     Icon(
                         imageVector = Icons.Rounded.CheckCircle,
                         contentDescription = "Season Completed",
-                        tint = if (isSelected) Color(0xFF07090E) else Color(0xFF00E5FF),
+                        tint = Color(0xFF00E5FF),
                         modifier = Modifier.size(15.dp)
                     )
                 }
             }
         }
 
-        // LUXURY FLOATING CONTEXT MENU
+        // Context Menu (Long-press to mark/unmark entire season)
         MaterialTheme(
             shapes = MaterialTheme.shapes.copy(extraSmall = RoundedCornerShape(18.dp))
         ) {

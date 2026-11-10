@@ -11,101 +11,104 @@ import android.util.Log
 
 class ClotubeAudioFocusManager(
     context: Context,
-    private var onPausePlayback: () -> Unit = {},
-    private var onResumePlayback: () -> Unit = {}
+    private var onPausePlayback: (() -> Unit)? = null,
+    private var onResumePlayback: (() -> Unit)? = null
 ) {
-    private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
     private val mainHandler = Handler(Looper.getMainLooper())
     private var audioFocusRequest: AudioFocusRequest? = null
-    private var hasAudioFocus = false
-    private var resumeOnFocusGain = false
+    @Volatile
+    private var isReleased = false
+
+    private val focusChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
+        if (isReleased) return@OnAudioFocusChangeListener
+        mainHandler.post {
+            if (isReleased) return@post
+            try {
+                when (focusChange) {
+                    AudioManager.AUDIOFOCUS_LOSS,
+                    AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+                    AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                        Log.d("ClotubeAudioFocus", "Audio focus lost ($focusChange). Pausing playback safely.")
+                        onPausePlayback?.invoke()
+                    }
+                    AudioManager.AUDIOFOCUS_GAIN -> {
+                        Log.d("ClotubeAudioFocus", "Audio focus gained. Resuming playback safely.")
+                        onResumePlayback?.invoke()
+                    }
+                }
+            } catch (t: Throwable) {
+                Log.w("ClotubeAudioFocus", "Safe focus change notice: ${t.message}")
+            }
+        }
+    }
 
     fun setPlaybackCallbacks(
         onPause: () -> Unit,
         onResume: () -> Unit
     ) {
+        if (isReleased) return
         this.onPausePlayback = onPause
         this.onResumePlayback = onResume
     }
 
     fun cancelPendingResume() {
-        resumeOnFocusGain = false
-    }
-
-    private val focusChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
-        mainHandler.post {
-            Log.d("ClotubeAudioFocus", "onAudioFocusChange: $focusChange")
-            when (focusChange) {
-                AudioManager.AUDIOFOCUS_LOSS -> {
-                    // Permanent loss (another app started playback)
-                    hasAudioFocus = false
-                    resumeOnFocusGain = false
-                    onPausePlayback()
-                }
-                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
-                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
-                    // Temporary loss (incoming phone call ringing or voice notification)
-                    hasAudioFocus = false
-                    resumeOnFocusGain = true
-                    onPausePlayback()
-                }
-                AudioManager.AUDIOFOCUS_GAIN -> {
-                    // Call ended or rejected; regain audio focus
-                    hasAudioFocus = true
-                    if (resumeOnFocusGain) {
-                        resumeOnFocusGain = false
-                        onResumePlayback()
-                    }
-                }
-            }
-        }
+        // Safe no-op when focus callbacks are handled atomically
     }
 
     fun requestAudioFocus(): Boolean {
-        if (hasAudioFocus) return true
+        if (isReleased || audioManager == null) return false
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val playbackAttributes = AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                    .build()
 
-        val result = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val playbackAttributes = AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_MEDIA)
-                .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
-                .build()
+                val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                    .setAudioAttributes(playbackAttributes)
+                    .setAcceptsDelayedFocusGain(false)
+                    .setOnAudioFocusChangeListener(focusChangeListener, mainHandler)
+                    .build()
 
-            val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                .setAudioAttributes(playbackAttributes)
-                .setAcceptsDelayedFocusGain(true)
-                .setOnAudioFocusChangeListener(focusChangeListener, mainHandler)
-                .build()
-
-            audioFocusRequest = request
-            audioManager.requestAudioFocus(request)
-        } else {
-            @Suppress("DEPRECATION")
-            audioManager.requestAudioFocus(
-                focusChangeListener,
-                AudioManager.STREAM_MUSIC,
-                AudioManager.AUDIOFOCUS_GAIN
-            )
+                audioFocusRequest = request
+                audioManager.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager.requestAudioFocus(
+                    focusChangeListener,
+                    AudioManager.STREAM_MUSIC,
+                    AudioManager.AUDIOFOCUS_GAIN
+                ) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+            }
+        } catch (t: Throwable) {
+            Log.w("ClotubeAudioFocus", "Request focus error: ${t.message}")
+            false
         }
-
-        hasAudioFocus = (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED)
-        return hasAudioFocus
     }
 
-    fun abandonAudioFocus() {
-        resumeOnFocusGain = false
-        if (!hasAudioFocus && audioFocusRequest == null) return
-        hasAudioFocus = false
+    fun abandonFocus() {
+        isReleased = true
+        mainHandler.removeCallbacksAndMessages(null)
+        onPausePlayback = null
+        onResumePlayback = null
 
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                audioFocusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
+                audioFocusRequest?.let { audioManager?.abandonAudioFocusRequest(it) }
                 audioFocusRequest = null
             } else {
                 @Suppress("DEPRECATION")
-                audioManager.abandonAudioFocus(focusChangeListener)
+                audioManager?.abandonAudioFocus(focusChangeListener)
             }
-        } catch (e: Exception) {
-            Log.e("ClotubeAudioFocus", "Error abandoning audio focus: ${e.message}")
-        }
+        } catch (_: Throwable) {}
+    }
+
+    fun abandonAudioFocus() {
+        abandonFocus()
+    }
+
+    fun release() {
+        abandonFocus()
     }
 }

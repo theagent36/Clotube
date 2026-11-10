@@ -410,7 +410,7 @@ class DriveRepository(
             id = folderId,
             title = cleanTitle,
             genreFormatted = genre,
-            totalSeasonsFormatted = "Tap to explore",
+            totalSeasonsFormatted = "TV Series",
             seasons = emptyList(), // Shallow!
             thumbnailUrl = finalThumb,
             backdropUrl = seriesMeta.posterUrl.ifBlank { finalThumb },

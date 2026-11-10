@@ -210,6 +210,7 @@ data class ContinueWatchingDisplayData(
     val episodeNumber: Int = 0,
     val episodeTitle: String = displayTitle
 ) : Serializable {
+    val episodeId: String get() = mediaId
     fun toContinueWatchingData(): ContinueWatchingData {
         val ep = Episode(
             id = mediaId,
@@ -306,6 +307,13 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         DriveCatalogScanner.driveServiceProvider = { getDriveService() }
+        com.clotube.app.media.DriveStreamEngine.initialize { forceRefresh ->
+            if (forceRefresh) {
+                tokenRepository.forceRefreshToken()
+            } else {
+                tokenRepository.getValidAccessToken()
+            }
+        }
     }
 
     /**
@@ -416,7 +424,12 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun getStreamUrlForEpisode(episodeId: String): String {
-        return "http://127.0.0.1:${com.clotube.app.data.LocalStreamProxy.PORT}/stream?fileId=$episodeId"
+        val downloaded = downloadRepository.getLocalFileIfDownloaded(episodeId)
+        return if (downloaded != null && downloaded.exists()) {
+            downloaded.toURI().toString()
+        } else {
+            com.clotube.app.media.DriveStreamEngine.getStreamUrl(episodeId)
+        }
     }
 
     suspend fun getFreshGoogleDriveAccessToken(forceRefresh: Boolean = false): String {
@@ -459,15 +472,19 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
     fun stopAndReleaseCurrentPlayer() {
         val playerToRelease = activeMediaPlayer
         activeMediaPlayer = null
-        if (playerToRelease != null) {
+        if (playerToRelease != null && !playerToRelease.isReleased) {
             try {
                 playerToRelease.setEventListener(null)
-                if (playerToRelease.isPlaying) {
-                    playerToRelease.stop()
-                } else {
-                    playerToRelease.stop()
-                }
-                playerToRelease.detachViews()
+                try {
+                    if (playerToRelease.isPlaying) {
+                        playerToRelease.stop()
+                    } else {
+                        playerToRelease.stop()
+                    }
+                } catch (_: Throwable) {}
+                try {
+                    playerToRelease.detachViews()
+                } catch (_: Throwable) {}
                 if (playerToRelease != vlcPlayerManager.mediaPlayer) {
                     playerToRelease.release()
                 }
@@ -476,10 +493,12 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
         try {
-            if (vlcPlayerManager.mediaPlayer.isPlaying) {
-                vlcPlayerManager.mediaPlayer.stop()
+            if (!vlcPlayerManager.mediaPlayer.isReleased) {
+                if (vlcPlayerManager.mediaPlayer.isPlaying) {
+                    vlcPlayerManager.mediaPlayer.stop()
+                }
+                vlcPlayerManager.mediaPlayer.detachViews()
             }
-            vlcPlayerManager.mediaPlayer.detachViews()
         } catch (_: Exception) {}
     }
 
@@ -511,8 +530,8 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         val currentIndex = _currentEpisodeIndex.value
         val currentEp = _episodeList.value.getOrNull(currentIndex)
         if (currentEp != null) {
-            val curPos = mediaPlayer.time
-            val dur = mediaPlayer.length
+            val curPos = try { if (!mediaPlayer.isReleased) mediaPlayer.time else 0L } catch (_: Throwable) { 0L }
+            val dur = try { if (!mediaPlayer.isReleased) mediaPlayer.length else 0L } catch (_: Throwable) { 0L }
             if (dur > 0L && curPos > 0L) {
                 viewModelScope.launch {
                     val resolvedSId = getSeriesIdForEpisode(currentEp.id, currentEp.seriesTitle)
@@ -552,7 +571,8 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
 
     fun playPreviousEpisode() {
         if (!hasPrevious) return
-        if (mediaPlayer.time > 5000L) {
+        val time = try { if (!mediaPlayer.isReleased) mediaPlayer.time else 0L } catch (_: Throwable) { 0L }
+        if (time > 5000L) {
             vlcPlayerManager.seekTo(0L)
             return
         }
@@ -560,8 +580,8 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         val currentIndex = _currentEpisodeIndex.value
         val currentEp = _episodeList.value.getOrNull(currentIndex)
         if (currentEp != null) {
-            val curPos = mediaPlayer.time
-            val dur = mediaPlayer.length
+            val curPos = time
+            val dur = try { if (!mediaPlayer.isReleased) mediaPlayer.length else 0L } catch (_: Throwable) { 0L }
             if (dur > 0L && curPos > 0L) {
                 viewModelScope.launch {
                     val resolvedSId = getSeriesIdForEpisode(currentEp.id, currentEp.seriesTitle)
@@ -606,14 +626,14 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         vlcPlayerManager.onAppPause()
         try {
             activeMediaPlayer?.let { player ->
-                if (player.isPlaying) {
+                if (!player.isReleased && player.isPlaying) {
                     player.pause()
                 }
             }
-            if (mediaPlayer.isPlaying) {
+            if (!mediaPlayer.isReleased && mediaPlayer.isPlaying) {
                 mediaPlayer.pause()
             }
-        } catch (_: Exception) {}
+        } catch (_: Throwable) {}
     }
 
     fun getSelectedGoogleAccountName(): String? {

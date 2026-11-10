@@ -5,6 +5,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
@@ -16,6 +17,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -123,6 +125,10 @@ import kotlinx.coroutines.launch
 import com.clotube.app.ui.components.ShimmerCategoryRow
 import com.clotube.app.ui.components.ShimmerHeroBillboard
 import com.clotube.app.ui.components.ShimmerMediaSection
+import androidx.compose.material3.ripple
+import com.clotube.app.ui.theme.AppleTvMotion
+import com.clotube.app.ui.theme.appleTvClickable
+import com.clotube.app.ui.theme.appleTvPressable
 import com.clotube.app.ui.theme.BackgroundDeep
 import com.clotube.app.ui.theme.BadgeBackground
 import com.clotube.app.ui.theme.BadgeBorder
@@ -141,6 +147,14 @@ import com.clotube.app.viewmodel.ContinueWatchingDisplayData
 import com.clotube.app.model.Episode
 import com.clotube.app.model.Movie
 import com.clotube.app.model.Series
+import com.clotube.app.ui.theme.CanvasDeep
+import com.clotube.app.ui.theme.SurfaceBorder
+import com.clotube.app.ui.theme.AccentPrimary
+import com.clotube.app.ui.theme.AccentBlue
+import com.clotube.app.ui.theme.AccentGlow
+import com.clotube.app.ui.theme.TextPrimary
+import com.clotube.app.ui.theme.TextSecondary
+import com.clotube.app.ui.theme.TextTertiary
 import com.clotube.app.ui.theme.PillShape
 import com.clotube.app.ui.theme.PrimaryAccent
 import com.clotube.app.ui.theme.SecondaryAccent
@@ -182,32 +196,37 @@ fun HomeFilterChipsRow(
     ) {
         HomeCatalogFilter.values().forEach { filter ->
             val isSelected = selectedFilter == filter
-            FilterChip(
-                selected = isSelected,
-                onClick = { onFilterSelected(filter) },
-                label = {
-                    Text(
-                        text = filter.title,
-                        fontSize = 12.sp,
-                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium
-                    )
-                },
-                shape = RoundedCornerShape(20.dp),
-                colors = FilterChipDefaults.filterChipColors(
-                    containerColor = Color(0xFF131822),
-                    labelColor = Color(0xFF90A4AE),
-                    selectedContainerColor = Color(0xFF1976D2),
-                    selectedLabelColor = Color.White
-                ),
-                border = FilterChipDefaults.filterChipBorder(
-                    enabled = true,
-                    selected = isSelected,
-                    borderColor = Color(0xFF222C3D),
-                    selectedBorderColor = Color(0xFF1976D2),
-                    borderWidth = 1.dp,
-                    selectedBorderWidth = 1.dp
-                )
+            val backgroundColor by animateColorAsState(
+                targetValue = if (isSelected) Color.White else SurfaceDefault,
+                animationSpec = AppleTvMotion.fluidSpring(),
+                label = "filterChipBackground_${filter.name}"
             )
+            val textColor by animateColorAsState(
+                targetValue = if (isSelected) Color(0xFF08090D) else TextSecondary,
+                animationSpec = AppleTvMotion.fluidSpring(),
+                label = "filterChipText_${filter.name}"
+            )
+            val interactionSource = remember { MutableInteractionSource() }
+            Surface(
+                modifier = Modifier
+                    .appleTvPressable(interactionSource, pressedScale = 0.94f)
+                    .clip(RoundedCornerShape(20.dp))
+                    .clickable(
+                        interactionSource = interactionSource,
+                        indication = ripple(bounded = true)
+                    ) { onFilterSelected(filter) },
+                shape = RoundedCornerShape(20.dp),
+                color = backgroundColor,
+                border = if (isSelected) null else BorderStroke(1.dp, SurfaceBorder)
+            ) {
+                Text(
+                    text = filter.title,
+                    fontSize = 12.sp,
+                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                    color = textColor,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                )
+            }
         }
     }
 }
@@ -294,128 +313,129 @@ fun HomeScreen(
 
     Box(modifier = Modifier.fillMaxSize()) {
         Scaffold(
-        containerColor = BackgroundDeep,
+        containerColor = CanvasDeep,
         topBar = {
             if (uiState.currentTab == NavigationTab.LIBRARY) {
                 TopAppBar(
                     modifier = Modifier.statusBarsPadding(),
                     windowInsets = WindowInsets(0, 0, 0, 0),
                     colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = SurfaceDefault,
-                    titleContentColor = TextHighEmphasis
-                ),
-                title = {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(end = 20.dp)
-                    ) {
-                        Text(
-                            text = "Clotube",
-                            fontSize = 20.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = TextHighEmphasis
-                        )
-                        Spacer(modifier = Modifier.width(10.dp))
-                        // Modern Compact Pill Search Bar
-                        BasicTextField(
-                            value = uiState.searchQuery,
-                            onValueChange = { viewModel.onSearchQueryChanged(it) },
+                        containerColor = CanvasDeep,
+                        titleContentColor = Color.White
+                    ),
+                    title = {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
                             modifier = Modifier
-                                .weight(1f)
-                                .height(40.dp)
-                                .background(Color(0xFF1E2230), RoundedCornerShape(20.dp))
-                                .padding(horizontal = 12.dp),
-                            singleLine = true,
-                            textStyle = TextStyle(
-                                color = TextHighEmphasis,
-                                fontSize = 13.sp,
-                                fontWeight = FontWeight.Normal
-                            ),
-                            cursorBrush = SolidColor(PrimaryAccent),
-                            decorationBox = { innerTextField ->
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    modifier = Modifier.fillMaxSize()
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Search,
-                                        contentDescription = "Search",
-                                        tint = Color(0xFF94A3B8),
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Box(modifier = Modifier.weight(1f)) {
-                                        if (uiState.searchQuery.isEmpty()) {
-                                            Text(
-                                                text = "Search movies, series...",
-                                                fontSize = 13.sp,
-                                                color = Color(0xFF64748B)
-                                            )
-                                        }
-                                        innerTextField()
-                                    }
-                                    if (uiState.searchQuery.isNotEmpty()) {
-                                        IconButton(
-                                            onClick = { viewModel.onSearchQueryChanged("") },
-                                            modifier = Modifier.size(24.dp)
-                                        ) {
-                                            Icon(
-                                                imageVector = Icons.Default.Close,
-                                                contentDescription = "Clear search",
-                                                tint = Color(0xFF94A3B8),
-                                                modifier = Modifier.size(16.dp)
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        )
-                    }
-                },
-                actions = {
-                    // Profile / Sign-in Avatar on far right
-                    Box(modifier = Modifier.padding(start = 8.dp, end = 12.dp)) {
-                        IconButton(
-                            onClick = {
-                                if (uiState.isSignedIn || currentUser != null) {
-                                    showAccountDialog = true
-                                } else {
-                                    if (activity != null) {
-                                        com.clotube.app.auth.GoogleAuthManager.launchGoogleSignIn(activity, signInLauncher)
-                                    } else {
-                                        com.clotube.app.auth.GoogleAuthManager.launchGoogleSignIn(context, signInLauncher)
-                                    }
-                                }
-                            },
-                            modifier = Modifier
-                                .size(38.dp)
-                                .clip(CircleShape)
-                                .border(1.5.dp, if (uiState.isSignedIn || currentUser != null) PrimaryAccent else BorderOutline, CircleShape)
+                                .fillMaxWidth()
+                                .padding(end = 10.dp)
                         ) {
-                            val photo = currentUser?.photoUrl ?: uiState.userAvatarUrl
-                            if ((uiState.isSignedIn || currentUser != null) && photo != null) {
-                                AsyncImage(
-                                    model = photo,
-                                    contentDescription = "Profile",
-                                    modifier = Modifier
-                                        .size(32.dp)
-                                        .clip(CircleShape),
-                                    contentScale = ContentScale.Crop
-                                )
-                            } else {
-                                Icon(
-                                    imageVector = Icons.Default.AccountCircle,
-                                    contentDescription = if (uiState.isSignedIn || currentUser != null) "Profile" else "Sign In",
-                                    tint = if (uiState.isSignedIn || currentUser != null) SecondaryAccent else TextMuted,
-                                    modifier = Modifier.size(24.dp)
-                                )
+                            Text(
+                                text = "Clotube",
+                                fontSize = 22.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = Color.White
+                            )
+                            Spacer(modifier = Modifier.width(12.dp))
+                            // Modern Compact Pill Search Bar
+                            BasicTextField(
+                                value = uiState.searchQuery,
+                                onValueChange = { viewModel.onSearchQueryChanged(it) },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(40.dp)
+                                    .background(SurfaceElevated, RoundedCornerShape(20.dp))
+                                    .border(1.dp, SurfaceBorder, RoundedCornerShape(20.dp))
+                                    .padding(horizontal = 12.dp),
+                                singleLine = true,
+                                textStyle = TextStyle(
+                                    color = Color.White,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Normal
+                                ),
+                                cursorBrush = SolidColor(AccentBlue),
+                                decorationBox = { innerTextField ->
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.fillMaxSize()
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Search,
+                                            contentDescription = "Search",
+                                            tint = Color(0xFF64748B),
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Box(modifier = Modifier.weight(1f)) {
+                                            if (uiState.searchQuery.isEmpty()) {
+                                                Text(
+                                                    text = "Search movies, series...",
+                                                    fontSize = 13.sp,
+                                                    color = Color(0xFF64748B)
+                                                )
+                                            }
+                                            innerTextField()
+                                        }
+                                        if (uiState.searchQuery.isNotEmpty()) {
+                                            IconButton(
+                                                onClick = { viewModel.onSearchQueryChanged("") },
+                                                modifier = Modifier.size(24.dp)
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Default.Close,
+                                                    contentDescription = "Clear search",
+                                                    tint = Color(0xFF94A3B8),
+                                                    modifier = Modifier.size(16.dp)
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            )
+                        }
+                    },
+                    actions = {
+                        // Profile / Sign-in Avatar on far right
+                        Box(modifier = Modifier.padding(start = 4.dp, end = 12.dp)) {
+                            IconButton(
+                                onClick = {
+                                    if (uiState.isSignedIn || currentUser != null) {
+                                        showAccountDialog = true
+                                    } else {
+                                        if (activity != null) {
+                                            com.clotube.app.auth.GoogleAuthManager.launchGoogleSignIn(activity, signInLauncher)
+                                        } else {
+                                            com.clotube.app.auth.GoogleAuthManager.launchGoogleSignIn(context, signInLauncher)
+                                        }
+                                    }
+                                },
+                                modifier = Modifier
+                                    .size(36.dp)
+                                    .clip(CircleShape)
+                                    .border(1.dp, SurfaceBorder, CircleShape)
+                            ) {
+                                val photo = currentUser?.photoUrl ?: uiState.userAvatarUrl
+                                if ((uiState.isSignedIn || currentUser != null) && photo != null) {
+                                    AsyncImage(
+                                        model = photo,
+                                        contentDescription = "Profile",
+                                        modifier = Modifier
+                                            .size(34.dp)
+                                            .clip(CircleShape),
+                                        contentScale = ContentScale.Crop
+                                    )
+                                } else {
+                                    Icon(
+                                        imageVector = Icons.Default.AccountCircle,
+                                        contentDescription = if (uiState.isSignedIn || currentUser != null) "Profile" else "Sign In",
+                                        tint = if (uiState.isSignedIn || currentUser != null) AccentBlue else Color(0xFF94A3B8),
+                                        modifier = Modifier.size(24.dp)
+                                    )
+                                }
                             }
                         }
                     }
-                }
-            )
+                )
             }
         },
         bottomBar = {
@@ -555,8 +575,8 @@ fun HomeScreen(
                         PullToRefreshDefaults.Indicator(
                             state = pullRefreshState,
                             isRefreshing = isRefreshing,
-                            color = Color(0xFF00E5FF), // Clotube Cyan Accent
-                            containerColor = Color(0xFF161B26), // Dark Acrylic Bubble
+                            color = AccentBlue,
+                            containerColor = SurfaceElevated,
                             modifier = Modifier.align(Alignment.TopCenter)
                         )
                     },
@@ -564,7 +584,18 @@ fun HomeScreen(
                         .fillMaxWidth()
                         .weight(1f)
                 ) {
-                    when (uiState.selectedFilter) {
+                    AnimatedContent(
+                        targetState = uiState.selectedFilter,
+                        transitionSpec = {
+                            (fadeIn(animationSpec = tween(280, easing = AppleTvMotion.SmoothOutEasing)) +
+                                scaleIn(initialScale = 0.97f, animationSpec = tween(320, easing = AppleTvMotion.SmoothOutEasing)))
+                                .togetherWith(
+                                    fadeOut(animationSpec = tween(150))
+                                )
+                        },
+                        label = "homeFilterContentSwitch"
+                    ) { currentFilter ->
+                        when (currentFilter) {
                         HomeCatalogFilter.MOVIES.title -> {
                             // Full-screen 2-column Grid of All Movies (Continue Watching hidden)
                             if (displayMovies.isEmpty()) {
@@ -597,18 +628,18 @@ fun HomeScreen(
                                 )
                             } else {
                                 LazyVerticalGrid(
-                                    columns = GridCells.Fixed(2),
+                                    columns = GridCells.Fixed(3),
                                     modifier = Modifier.fillMaxSize(),
-                                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 110.dp),
-                                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                                    contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 8.dp, bottom = 110.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                    verticalArrangement = Arrangement.spacedBy(14.dp)
                                 ) {
                                     items(
                                         items = displayMovies,
                                         key = { it.id },
-                                        contentType = { "movie_grid_card" }
+                                        contentType = { "movie_poster_card" }
                                     ) { movie ->
-                                        MovieCard(
+                                        MoviePosterCard(
                                             movie = movie,
                                             onClick = {
                                                 if (onPlayMovie != null) {
@@ -625,7 +656,7 @@ fun HomeScreen(
                         }
 
                         HomeCatalogFilter.TV_SERIES.title -> {
-                            // Full-screen 2-column Grid of All TV Series (Continue Watching hidden)
+                            // Full-screen Cinematic List of All TV Series (Continue Watching hidden)
                             if (displaySeries.isEmpty()) {
                                 CatalogEmptyView(
                                     title = if (searchQuery.isNotBlank()) "No Matching Series Found" else "No TV Series Found",
@@ -655,21 +686,21 @@ fun HomeScreen(
                                     }
                                 )
                             } else {
-                                LazyVerticalGrid(
-                                    columns = GridCells.Fixed(2),
+                                LazyColumn(
                                     modifier = Modifier.fillMaxSize(),
                                     contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 110.dp),
-                                    horizontalArrangement = Arrangement.spacedBy(12.dp),
                                     verticalArrangement = Arrangement.spacedBy(12.dp)
                                 ) {
                                     items(
                                         items = displaySeries,
                                         key = { it.id },
-                                        contentType = { "series_grid_card" }
+                                        contentType = { "series_row_card" }
                                     ) { series ->
-                                        SeriesCard(
+                                        SeriesRowCard(
                                             series = series,
-                                            onClick = { onSeriesSelected(series) },
+                                            onClick = {
+                                                onNavigateToSeriesDetail?.invoke(series.id, null) ?: onSeriesSelected(series)
+                                            },
                                             modifier = Modifier.fillMaxWidth()
                                         )
                                     }
@@ -696,15 +727,23 @@ fun HomeScreen(
                                             ContinueWatchingCard(
                                                 data = item,
                                                 onResumeClick = {
-                                                    if (item.isSeries && !item.seriesId.isNullOrBlank()) {
-                                                        if (onNavigateToSeriesDetail != null) {
-                                                            onNavigateToSeriesDetail(item.seriesId, item.mediaId)
-                                                        } else if (onResumePlayback != null) {
-                                                            onResumePlayback(item.mediaId, item.displayTitle, item.seriesId, item.currentPositionMs)
-                                                        } else {
-                                                            val matchedSeries = uiState.tvSeriesList.find { it.id == item.seriesId }
-                                                            if (matchedSeries != null) {
-                                                                onSeriesSelected(matchedSeries)
+                                                    if (item.isSeries) {
+                                                        val targetSeriesId = item.seriesId?.trim()?.ifBlank { null }
+                                                            ?: uiState.tvSeriesList.firstOrNull { s -> s.seasons.any { season -> season.episodes.any { ep -> ep.id == item.mediaId } } }?.id
+                                                            ?: viewModel.getSeriesIdForEpisode(item.mediaId, item.seriesTitle.ifBlank { item.displayHeader })
+                                                            ?: viewModel.getDefaultSeriesId()
+                                                            ?: ""
+
+                                                        if (targetSeriesId.isNotBlank()) {
+                                                            if (onNavigateToSeriesDetail != null) {
+                                                                onNavigateToSeriesDetail(targetSeriesId, item.episodeId)
+                                                            } else if (onResumePlayback != null) {
+                                                                onResumePlayback(item.mediaId, item.displayTitle, targetSeriesId, item.currentPositionMs)
+                                                            } else {
+                                                                val matchedSeries = uiState.tvSeriesList.find { it.id == targetSeriesId }
+                                                                if (matchedSeries != null) {
+                                                                    onSeriesSelected(matchedSeries)
+                                                                }
                                                             }
                                                         }
                                                     } else {
@@ -754,8 +793,8 @@ fun HomeScreen(
                                 if (displayMovies.isNotEmpty()) {
                                     item(key = "home_movies_preview") {
                                         SectionHeader(
-                                            title = "Movies",
-                                            subtitle = "${displayMovies.size} raw videos in 'Movies' folder"
+                                            title = "Trending Movies",
+                                            onSeeAllClick = { viewModel.selectFilter(HomeCatalogFilter.MOVIES.title) }
                                         )
                                         LazyRow(
                                             modifier = Modifier.fillMaxWidth(),
@@ -789,8 +828,8 @@ fun HomeScreen(
                                             Spacer(modifier = Modifier.height(14.dp))
                                         }
                                         SectionHeader(
-                                            title = "TV Series & Shows",
-                                            subtitle = "${displaySeries.size} multi-season shows in 'Series' folder"
+                                            title = "Popular Series",
+                                            onSeeAllClick = { viewModel.selectFilter(HomeCatalogFilter.TV_SERIES.title) }
                                         )
                                         LazyRow(
                                             modifier = Modifier.fillMaxWidth(),
@@ -849,6 +888,7 @@ fun HomeScreen(
                         }
                     }
                 }
+            }
             }
         }
     }
@@ -1048,25 +1088,14 @@ private fun HeroBillboardSection(
                     modifier = Modifier
                         .align(Alignment.TopStart)
                         .padding(12.dp)
-                        .background(Color.Black.copy(alpha = 0.75f), RoundedCornerShape(8.dp))
-                        .border(1.dp, Color(0xFF2F80ED), RoundedCornerShape(8.dp))
-                        .padding(horizontal = 8.dp, vertical = 4.dp)
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            imageVector = Icons.Default.History,
-                            contentDescription = null,
-                            tint = Color(0xFF2F80ED),
-                            modifier = Modifier.size(13.dp)
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(
-                            text = "CONTINUE WATCHING",
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.ExtraBold,
-                            color = Color(0xFF2F80ED)
-                        )
-                    }
+                    Text(
+                        text = "CONTINUE WATCHING",
+                        color = Color(0xFF94A3B8),
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 1.sp
+                    )
                 }
             }
 
@@ -1115,18 +1144,18 @@ private fun HeroBillboardSection(
                     )
 
                     Spacer(modifier = Modifier.height(6.dp))
-                    // 3.dp Electric Blue progress bar
+                    // Sleek 2.5.dp progress track using AccentBlue over track
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(3.dp)
-                            .background(Color.White.copy(alpha = 0.25f), RoundedCornerShape(1.5.dp))
+                            .height(2.5.dp)
+                            .background(Color(0x26FFFFFF), RoundedCornerShape(1.5.dp))
                     ) {
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth(progressFraction.coerceIn(0f, 1f))
                                 .fillMaxHeight()
-                                .background(Color(0xFF2F80ED), RoundedCornerShape(1.5.dp))
+                                .background(AccentBlue, RoundedCornerShape(1.5.dp))
                         )
                     }
                 }
@@ -1144,37 +1173,37 @@ private fun HeroBillboardSection(
                                     onResume(lastWatched)
                                 }
                             },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2F80ED)),
+                            colors = ButtonDefaults.buttonColors(containerColor = AccentBlue),
                             shape = PillShape,
                             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
                         ) {
                             Icon(
                                 imageVector = Icons.Default.PlayArrow,
                                 contentDescription = null,
-                                tint = TextHighEmphasis,
+                                tint = Color.White,
                                 modifier = Modifier.size(18.dp)
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             val buttonText = if (progressFraction >= 0.95f) "Watch Again" else if (progressFraction <= 0.01f) "Watch Now" else "Resume"
-                            Text(buttonText, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            Text(buttonText, fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color.White)
                         }
                     } else {
                         Button(
                             onClick = {
                                 if (movie != null) onWatchMovie() else onWatchSeries()
                             },
-                            colors = ButtonDefaults.buttonColors(containerColor = PrimaryAccent),
+                            colors = ButtonDefaults.buttonColors(containerColor = AccentBlue),
                             shape = PillShape,
                             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
                         ) {
                             Icon(
                                 imageVector = Icons.Default.PlayArrow,
                                 contentDescription = null,
-                                tint = TextHighEmphasis,
+                                tint = Color.White,
                                 modifier = Modifier.size(18.dp)
                             )
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Watch Now", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            Text("Watch Now", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color.White)
                         }
                     }
 
@@ -1188,16 +1217,18 @@ private fun HeroBillboardSection(
                             }
                         },
                         shape = PillShape,
+                        border = BorderStroke(1.dp, SurfaceBorder),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
                         contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
                     ) {
                         Icon(
                             imageVector = Icons.Default.Info,
                             contentDescription = null,
-                            tint = SecondaryAccent,
+                            tint = TextSecondary,
                             modifier = Modifier.size(16.dp)
                         )
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("Details", fontSize = 12.sp, color = TextHighEmphasis)
+                        Text("Details", fontSize = 12.sp, color = Color.White)
                     }
 
                     if (isResumeMode && onRemoveResume != null) {
@@ -1224,26 +1255,42 @@ private fun HeroBillboardSection(
 @Composable
 private fun SectionHeader(
     title: String,
-    subtitle: String
+    subtitle: String? = null,
+    onSeeAllClick: (() -> Unit)? = null,
+    modifier: Modifier = Modifier
 ) {
     Row(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 4.dp),
+            .padding(horizontal = 16.dp, vertical = 6.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
         Column {
             Text(
                 text = title,
-                fontSize = 16.sp,
+                fontSize = 18.sp,
                 fontWeight = FontWeight.Bold,
-                color = TextHighEmphasis
+                color = Color.White
             )
+            if (!subtitle.isNullOrBlank()) {
+                Text(
+                    text = subtitle,
+                    fontSize = 11.sp,
+                    color = TextSecondary
+                )
+            }
+        }
+        if (onSeeAllClick != null) {
             Text(
-                text = subtitle,
-                fontSize = 11.sp,
-                color = TextMuted
+                text = "See All",
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = AccentBlue,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(4.dp))
+                    .clickable { onSeeAllClick() }
+                    .padding(horizontal = 6.dp, vertical = 4.dp)
             )
         }
     }
@@ -1259,14 +1306,20 @@ fun MovieCard(
     onClick: () -> Unit,
     modifier: Modifier = Modifier.width(220.dp)
 ) {
+    val interactionSource = remember { MutableInteractionSource() }
     Card(
         modifier = modifier
             .aspectRatio(16f / 9f)
+            .appleTvPressable(interactionSource, pressedScale = 0.96f)
             .clip(RoundedCornerShape(14.dp))
-            .clickable(onClick = onClick),
+            .clickable(
+                interactionSource = interactionSource,
+                indication = ripple(bounded = true),
+                onClick = onClick
+            ),
         shape = RoundedCornerShape(14.dp),
-        colors = CardDefaults.cardColors(containerColor = CardContainer),
-        border = androidx.compose.foundation.BorderStroke(1.dp, BorderOutline)
+        colors = CardDefaults.cardColors(containerColor = SurfaceDefault),
+        border = BorderStroke(1.dp, SurfaceBorder)
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
             // Layer 1 (Base): Coil AsyncImage with downsampling & HARDWARE bitmap
@@ -1284,45 +1337,26 @@ fun MovieCard(
                 modifier = Modifier.fillMaxSize()
             )
 
-            // Layer 2 (Top Chips):
-            // Anchored to Alignment.TopStart: Clean quality badge
-            val badgeText = movie.resolutionBadge.ifBlank { "HD" }
-            Box(
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .padding(8.dp)
-                    .background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(6.dp))
-                    .border(0.5.dp, BorderOutline, RoundedCornerShape(6.dp))
-                    .padding(horizontal = 6.dp, vertical = 2.dp)
-            ) {
-                Text(
-                    text = badgeText,
-                    fontSize = 9.sp,
-                    fontWeight = FontWeight.ExtraBold,
-                    color = SecondaryAccent
-                )
-            }
-
-            // Anchored to Alignment.TopEnd: Duration tag
+            // Duration tag anchored to TopEnd (resolution / 1080p FHD pill tag removed)
             if (movie.durationFormatted.isNotBlank() && movie.durationFormatted != "00:00") {
                 Box(
                     modifier = Modifier
                         .align(Alignment.TopEnd)
                         .padding(8.dp)
                         .background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(6.dp))
-                        .border(0.5.dp, BorderOutline, RoundedCornerShape(6.dp))
+                        .border(0.5.dp, SurfaceBorder, RoundedCornerShape(6.dp))
                         .padding(horizontal = 6.dp, vertical = 2.dp)
                 ) {
                     Text(
                         text = movie.durationFormatted,
                         fontSize = 9.sp,
                         fontWeight = FontWeight.SemiBold,
-                        color = TextHighEmphasis
+                        color = Color.White
                     )
                 }
             }
 
-            // Layer 3 (Bottom Scrim Gradient): covers lower 45–50% of card height
+            // Layer 3 (Bottom Scrim Gradient): covers lower 50% of card height
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1358,22 +1392,24 @@ fun MovieCard(
 
                 Spacer(modifier = Modifier.height(2.dp))
 
-                // 2. Secondary Line (Genre)
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    val genreText = movie.genreFormatted.ifBlank { "Movie" }
-
-                    Text(
-                        text = genreText,
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.Normal,
-                        color = Color(0xFF94A3B8),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
+                // 2. Secondary Line (Display runtime / genre, no "Movie • Cinema")
+                val durationText = movie.durationFormatted.takeIf { it.isNotBlank() && it != "00:00" }
+                val genreClean = movie.genreFormatted.replace("Movie • Cinema", "").trim().trim('•').trim()
+                val metaText = when {
+                    durationText != null && genreClean.isNotBlank() -> "$durationText • $genreClean"
+                    durationText != null -> durationText
+                    genreClean.isNotBlank() -> genreClean
+                    else -> "Movie"
                 }
+
+                Text(
+                    text = metaText,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Normal,
+                    color = TextSecondary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
             }
 
             // Layer 5 (Watch Progress Bar flush against bottom edge):
@@ -1381,15 +1417,15 @@ fun MovieCard(
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(3.dp)
+                        .height(2.5.dp)
                         .align(Alignment.BottomCenter)
-                        .background(Color.White.copy(alpha = 0.25f))
+                        .background(Color(0x26FFFFFF))
                 ) {
                     Box(
                         modifier = Modifier
                             .fillMaxWidth(movie.watchProgressFraction.coerceIn(0f, 1f))
                             .fillMaxHeight()
-                            .background(Color(0xFF2F80ED))
+                            .background(AccentBlue)
                     )
                 }
             }
@@ -1403,6 +1439,150 @@ private fun MovieCarouselCard(
     onClick: () -> Unit
 ) = MovieCard(movie = video, onClick = onClick)
 
+private fun extractYearFromTitle(title: String): String? {
+    val match = Regex("""\b(19\d\d|20\d\d)\b""").find(title)
+    return match?.value
+}
+
+/**
+ * 2:3 Vertical Portrait Poster Movie Card for the 3-column Movies Catalog Grid.
+ * Displays a full-bleed poster canvas, 30% bottom subtle shadow scrim, optional 4K HDR tag,
+ * and clean title/year typography directly below the poster card.
+ */
+@Composable
+fun MoviePosterCard(
+    movie: VideoItem,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val is4k = movie.resolutionBadge.contains("4K", ignoreCase = true) ||
+               movie.resolutionBadge.contains("2160", ignoreCase = true) ||
+               movie.width >= 3840 ||
+               (movie.hdrBadge != null && movie.resolutionBadge.contains("UHD", ignoreCase = true))
+
+    val yearText = extractYearFromTitle(movie.displayTitle)
+        ?: movie.durationFormatted.takeIf { it.isNotBlank() && it != "00:00" }
+        ?: ""
+
+    val interactionSource = remember { MutableInteractionSource() }
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .appleTvPressable(interactionSource, pressedScale = 0.96f)
+            .clickable(
+                interactionSource = interactionSource,
+                indication = ripple(bounded = false),
+                onClick = onClick
+            )
+    ) {
+        // 2:3 Portrait Poster Card
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(2f / 3f)
+                .clip(RoundedCornerShape(10.dp)),
+            shape = RoundedCornerShape(10.dp),
+            colors = CardDefaults.cardColors(containerColor = SurfaceDefault),
+            border = BorderStroke(0.5.dp, SurfaceBorder)
+        ) {
+            Box(modifier = Modifier.fillMaxSize()) {
+                // Full bleed AsyncImage with ContentScale.Crop
+                AsyncImage(
+                    model = ImageRequest.Builder(LocalContext.current)
+                        .data(movie.thumbnailUrl)
+                        .crossfade(150)
+                        .size(width = 300, height = 450)
+                        .bitmapConfig(Bitmap.Config.HARDWARE)
+                        .memoryCacheKey("poster_${movie.id}_${movie.thumbnailUrl.hashCode()}")
+                        .diskCacheKey("poster_${movie.id}_${movie.thumbnailUrl.hashCode()}")
+                        .build(),
+                    contentDescription = movie.displayTitle,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
+
+                // Subtle vertical shadow on bottom 30% of image
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .fillMaxHeight(0.30f)
+                        .align(Alignment.BottomCenter)
+                        .background(
+                            Brush.verticalGradient(
+                                colors = listOf(
+                                    Color.Transparent,
+                                    Color.Black.copy(alpha = 0.60f)
+                                )
+                            )
+                        )
+                )
+
+                // Quality Tag: Display ONLY if 4K (translucent tag "4K HDR", font size 8.sp, top-right corner)
+                if (is4k) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(6.dp)
+                            .background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(4.dp))
+                            .border(0.5.dp, SurfaceBorder, RoundedCornerShape(4.dp))
+                            .padding(horizontal = 4.dp, vertical = 2.dp)
+                    ) {
+                        Text(
+                            text = "4K HDR",
+                            color = Color.White,
+                            fontSize = 8.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+
+                // Bottom Watch Progress Bar flush against bottom edge
+                if (movie.watchProgressFraction > 0.02f) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(2.5.dp)
+                            .align(Alignment.BottomCenter)
+                            .background(Color(0x26FFFFFF))
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth(movie.watchProgressFraction.coerceIn(0f, 1f))
+                                .fillMaxHeight()
+                                .background(AccentBlue)
+                        )
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(6.dp))
+
+        // Title: 12.sp, Medium, Color.White, maxLines = 1, ellipsis
+        Text(
+            text = movie.displayTitle,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium,
+            color = Color.White,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+
+        // Year: 10.sp, Normal, Color(#64748B)
+        if (yearText.isNotBlank()) {
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = yearText,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Normal,
+                color = Color(0xFF64748B),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
 /**
  * 16:9 Cinematic TV Series Card with internal scrim gradient overlay.
  * Title and metadata are rendered directly inside the thumbnail canvas on a bottom scrim.
@@ -1413,17 +1593,22 @@ fun SeriesCard(
     onClick: () -> Unit,
     modifier: Modifier = Modifier.width(220.dp)
 ) {
+    val interactionSource = remember { MutableInteractionSource() }
     Card(
         modifier = modifier
             .aspectRatio(16f / 9f)
+            .appleTvPressable(interactionSource, pressedScale = 0.96f)
             .clip(RoundedCornerShape(14.dp))
-            .clickable(onClick = onClick),
+            .clickable(
+                interactionSource = interactionSource,
+                indication = ripple(bounded = true),
+                onClick = onClick
+            ),
         shape = RoundedCornerShape(14.dp),
-        colors = CardDefaults.cardColors(containerColor = CardContainer),
-        border = androidx.compose.foundation.BorderStroke(1.dp, BorderOutline)
+        colors = CardDefaults.cardColors(containerColor = SurfaceDefault),
+        border = BorderStroke(1.dp, SurfaceBorder)
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
-            // Layer 1 (Base): Coil AsyncImage with downsampling & HARDWARE bitmap
             val thumbUrl = series.thumbnailUrl.ifBlank { series.backdropUrl ?: series.posterUrl ?: "" }
             AsyncImage(
                 model = ImageRequest.Builder(LocalContext.current)
@@ -1439,42 +1624,33 @@ fun SeriesCard(
                 contentScale = ContentScale.Crop
             )
 
-            // Layer 2 (Top Chips):
-            // Anchored to Alignment.TopStart: "OTT SERIES" badge
-            Box(
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .padding(8.dp)
-                    .background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(6.dp))
-                    .border(0.5.dp, BorderOutline, RoundedCornerShape(6.dp))
-                    .padding(horizontal = 6.dp, vertical = 2.dp)
-            ) {
-                Text(
-                    text = "OTT SERIES",
-                    fontSize = 9.sp,
-                    fontWeight = FontWeight.ExtraBold,
-                    color = SecondaryAccent
-                )
+            // Season count tag anchored to TopEnd ("OTT SERIES" and "Tap to explore" removed)
+            val seasonDisplay = when {
+                series.seasons.isNotEmpty() -> if (series.seasons.size == 1) "1 Season" else "${series.seasons.size} Seasons"
+                !series.totalSeasonsFormatted.contains("explore", ignoreCase = true) &&
+                series.totalSeasonsFormatted.isNotBlank() &&
+                series.totalSeasonsFormatted != "TV Series" -> series.totalSeasonsFormatted
+                else -> null
+            }
+            if (seasonDisplay != null) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(8.dp)
+                        .background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(6.dp))
+                        .border(0.5.dp, SurfaceBorder, RoundedCornerShape(6.dp))
+                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                ) {
+                    Text(
+                        text = seasonDisplay,
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color.White
+                    )
+                }
             }
 
-            // Anchored to Alignment.TopEnd: Season count tag (pre-calculated totalSeasonsFormatted)
-            Box(
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(8.dp)
-                    .background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(6.dp))
-                    .border(0.5.dp, BorderOutline, RoundedCornerShape(6.dp))
-                    .padding(horizontal = 6.dp, vertical = 2.dp)
-            ) {
-                Text(
-                    text = series.totalSeasonsFormatted,
-                    fontSize = 9.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = TextHighEmphasis
-                )
-            }
-
-            // Layer 3 (Bottom Scrim Gradient): covers lower 45–50% of card height
+            // Layer 3 (Bottom Scrim Gradient): covers lower 50% of card height
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1498,7 +1674,6 @@ fun SeriesCard(
                     .fillMaxWidth()
                     .padding(horizontal = 10.dp, vertical = 8.dp)
             ) {
-                // 1. Title Text
                 Text(
                     text = series.title,
                     fontSize = 12.sp,
@@ -1510,25 +1685,23 @@ fun SeriesCard(
 
                 Spacer(modifier = Modifier.height(2.dp))
 
-                // 2. Secondary Line (Total Episodes & Genre)
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    val genreText = series.genreFormatted.ifBlank { "TV Series" }
-                    val totalEps = series.seasons.sumOf { it.episodes.size }
-                    val secondaryText = if (totalEps > 0) "$genreText • $totalEps Episodes" else genreText
+                // Secondary Line (Total Episodes & Genre)
+                val totalEps = series.totalEpisodes
+                val epText = if (totalEps > 0) "$totalEps Episodes" else ""
+                val genreClean = series.genreFormatted.replace("OTT SERIES", "").trim().trim('•').trim()
+                val metaParts = listOfNotNull(
+                    epText.ifBlank { null },
+                    genreClean.takeIf { it.isNotBlank() && it != "TV Series" }
+                ).ifEmpty { listOf(series.totalSeasonsFormatted) }
 
-                    Text(
-                        text = secondaryText,
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.Normal,
-                        color = Color(0xFF94A3B8),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
+                Text(
+                    text = metaParts.joinToString(" • "),
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Normal,
+                    color = TextSecondary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
             }
 
             // Layer 5 (Watch Progress Bar flush against bottom edge):
@@ -1536,15 +1709,15 @@ fun SeriesCard(
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(3.dp)
+                        .height(2.5.dp)
                         .align(Alignment.BottomCenter)
-                        .background(Color.White.copy(alpha = 0.25f))
+                        .background(Color(0x26FFFFFF))
                 ) {
                     Box(
                         modifier = Modifier
                             .fillMaxWidth(series.watchProgressFraction.coerceIn(0f, 1f))
                             .fillMaxHeight()
-                            .background(Color(0xFF2F80ED))
+                            .background(AccentBlue)
                     )
                 }
             }
@@ -1564,14 +1737,19 @@ fun MovieOverlayCard(
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val interactionSource = remember { MutableInteractionSource() }
     Surface(
         modifier = modifier
             .aspectRatio(16f / 9f)
+            .appleTvPressable(interactionSource, pressedScale = 0.96f)
             .clip(RoundedCornerShape(12.dp))
-            .clickable { onClick() },
+            .clickable(
+                interactionSource = interactionSource,
+                indication = ripple(bounded = true)
+            ) { onClick() },
         shape = RoundedCornerShape(12.dp),
-        color = Color(0xFF111722),
-        border = BorderStroke(1.dp, Color(0xFF1E2838))
+        color = SurfaceDefault,
+        border = BorderStroke(1.dp, SurfaceBorder)
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
             // Background Artwork
@@ -1584,40 +1762,22 @@ fun MovieOverlayCard(
                 )
             }
 
-            // Top Badges
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(6.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
+            // Top Badges (1080p FHD badge removed)
+            if (movie.formattedDuration.isNotBlank() && movie.formattedDuration != "00:00") {
                 Box(
                     modifier = Modifier
-                        .background(Color(0xCC00838F), RoundedCornerShape(4.dp))
+                        .align(Alignment.TopEnd)
+                        .padding(6.dp)
+                        .background(Color(0xCC000000), RoundedCornerShape(4.dp))
+                        .border(0.5.dp, SurfaceBorder, RoundedCornerShape(4.dp))
                         .padding(horizontal = 5.dp, vertical = 2.dp)
                 ) {
                     Text(
-                        text = "1080p FHD",
-                        color = Color(0xFFE0F7FA),
+                        text = movie.formattedDuration,
+                        color = Color.White,
                         fontSize = 9.sp,
-                        fontWeight = FontWeight.Bold
+                        fontWeight = FontWeight.Medium
                     )
-                }
-
-                if (movie.formattedDuration.isNotBlank()) {
-                    Box(
-                        modifier = Modifier
-                            .background(Color(0xCC000000), RoundedCornerShape(4.dp))
-                            .padding(horizontal = 4.dp, vertical = 2.dp)
-                    ) {
-                        Text(
-                            text = movie.formattedDuration,
-                            color = Color.White,
-                            fontSize = 9.sp,
-                            fontWeight = FontWeight.Medium
-                        )
-                    }
                 }
             }
 
@@ -1647,11 +1807,20 @@ fun MovieOverlayCard(
                         overflow = TextOverflow.Ellipsis
                     )
                     Spacer(modifier = Modifier.height(1.dp))
+                    val durationText = movie.formattedDuration.takeIf { it.isNotBlank() && it != "00:00" }
+                    val genreClean = movie.genre.replace("Movie • Cinema", "").trim().trim('•').trim()
+                    val metaText = when {
+                        durationText != null && genreClean.isNotBlank() -> "$durationText • $genreClean"
+                        durationText != null -> durationText
+                        genreClean.isNotBlank() -> genreClean
+                        else -> "Movie"
+                    }
                     Text(
-                        text = "Movie • Cinema",
-                        color = Color(0xFF8B9BB4),
+                        text = metaText,
+                        color = TextSecondary,
                         fontSize = 9.sp,
-                        maxLines = 1
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
             }
@@ -1672,14 +1841,19 @@ fun SeriesOverlayCard(
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val interactionSource = remember { MutableInteractionSource() }
     Surface(
         modifier = modifier
             .aspectRatio(16f / 9f)
+            .appleTvPressable(interactionSource, pressedScale = 0.96f)
             .clip(RoundedCornerShape(12.dp))
-            .clickable { onClick() },
+            .clickable(
+                interactionSource = interactionSource,
+                indication = ripple(bounded = true)
+            ) { onClick() },
         shape = RoundedCornerShape(12.dp),
-        color = Color(0xFF111722),
-        border = BorderStroke(1.dp, Color(0xFF1E2838))
+        color = SurfaceDefault,
+        border = BorderStroke(1.dp, SurfaceBorder)
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
             // Background Artwork
@@ -1693,34 +1867,22 @@ fun SeriesOverlayCard(
                 )
             }
 
-            // Top Badges
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(6.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
+            // Top Badges ("OTT SERIES" and "Tap to explore" removed)
+            val seasonDisplay = when {
+                series.seasons.isNotEmpty() -> if (series.seasons.size == 1) "1 Season" else "${series.seasons.size} Seasons"
+                else -> null
+            }
+            if (seasonDisplay != null) {
                 Box(
                     modifier = Modifier
-                        .background(Color(0xCC00838F), RoundedCornerShape(4.dp))
+                        .align(Alignment.TopEnd)
+                        .padding(6.dp)
+                        .background(Color(0xCC000000), RoundedCornerShape(4.dp))
+                        .border(0.5.dp, SurfaceBorder, RoundedCornerShape(4.dp))
                         .padding(horizontal = 5.dp, vertical = 2.dp)
                 ) {
                     Text(
-                        text = "OTT SERIES",
-                        color = Color(0xFFE0F7FA),
-                        fontSize = 9.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-
-                Box(
-                    modifier = Modifier
-                        .background(Color(0xCC000000), RoundedCornerShape(4.dp))
-                        .padding(horizontal = 4.dp, vertical = 2.dp)
-                ) {
-                    Text(
-                        text = "${series.seasons.size} Seasons",
+                        text = seasonDisplay,
                         color = Color.White,
                         fontSize = 9.sp,
                         fontWeight = FontWeight.Medium
@@ -1754,14 +1916,284 @@ fun SeriesOverlayCard(
                         overflow = TextOverflow.Ellipsis
                     )
                     Spacer(modifier = Modifier.height(1.dp))
+                    val totalEps = series.totalEpisodes
+                    val epText = if (totalEps > 0) "$totalEps Episodes" else ""
+                    val genreClean = series.genre.replace("OTT SERIES", "").trim().trim('•').trim()
+                    val metaParts = listOfNotNull(
+                        epText.ifBlank { null },
+                        genreClean.takeIf { it.isNotBlank() && it != "TV Series" }
+                    ).ifEmpty { listOf("${series.seasons.size} Seasons") }
+
                     Text(
-                        text = "${series.genre} • ${series.totalEpisodes} Episodes",
-                        color = Color(0xFF8B9BB4),
+                        text = metaParts.joinToString(" • "),
+                        color = TextSecondary,
                         fontSize = 9.sp,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
                 }
+            }
+        }
+    }
+}
+
+/**
+ * 2:3 Vertical Portrait Poster Movie Card for Domain Movie model.
+ */
+@Composable
+fun MoviePosterCard(
+    movie: Movie,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val is4k = movie.resolution.contains("4K", ignoreCase = true) ||
+               movie.resolution.contains("2160", ignoreCase = true)
+
+    val yearText = extractYearFromTitle(movie.title)
+        ?: movie.formattedDuration.takeIf { it.isNotBlank() && it != "00:00" }
+        ?: ""
+
+    val interactionSource = remember { MutableInteractionSource() }
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .appleTvPressable(interactionSource, pressedScale = 0.96f)
+            .clickable(
+                interactionSource = interactionSource,
+                indication = ripple(bounded = false),
+                onClick = onClick
+            )
+    ) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(2f / 3f)
+                .clip(RoundedCornerShape(10.dp)),
+            shape = RoundedCornerShape(10.dp),
+            colors = CardDefaults.cardColors(containerColor = SurfaceDefault),
+            border = BorderStroke(0.5.dp, SurfaceBorder)
+        ) {
+            Box(modifier = Modifier.fillMaxSize()) {
+                if (!movie.thumbnailUrl.isNullOrBlank()) {
+                    AsyncImage(
+                        model = ImageRequest.Builder(LocalContext.current)
+                            .data(movie.thumbnailUrl)
+                            .crossfade(150)
+                            .size(width = 300, height = 450)
+                            .bitmapConfig(Bitmap.Config.HARDWARE)
+                            .build(),
+                        contentDescription = movie.title,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .fillMaxHeight(0.30f)
+                        .align(Alignment.BottomCenter)
+                        .background(
+                            Brush.verticalGradient(
+                                colors = listOf(
+                                    Color.Transparent,
+                                    Color.Black.copy(alpha = 0.60f)
+                                )
+                            )
+                        )
+                )
+
+                if (is4k) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(6.dp)
+                            .background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(4.dp))
+                            .border(0.5.dp, SurfaceBorder, RoundedCornerShape(4.dp))
+                            .padding(horizontal = 4.dp, vertical = 2.dp)
+                    ) {
+                        Text(
+                            text = "4K HDR",
+                            color = Color.White,
+                            fontSize = 8.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(6.dp))
+
+        Text(
+            text = movie.title,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium,
+            color = Color.White,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+
+        if (yearText.isNotBlank()) {
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = yearText,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Normal,
+                color = Color(0xFF64748B),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+/**
+ * Full-width Cinematic Horizontal Series Card for TV Series Catalog.
+ * Height: 120.dp
+ * Left 40%: Series Backdrop with right-edge blending gradient
+ * Right 60%: Title in 16.sp, seasons count & total episodes, and genre in #94A3B8.
+ */
+@Composable
+fun SeriesRowCard(
+    series: TvSeries,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    Card(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(120.dp)
+            .appleTvPressable(interactionSource, pressedScale = 0.96f)
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(
+                interactionSource = interactionSource,
+                indication = ripple(bounded = true),
+                onClick = onClick
+            ),
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(containerColor = SurfaceDefault),
+        border = BorderStroke(0.5.dp, SurfaceBorder)
+    ) {
+        Row(modifier = Modifier.fillMaxSize()) {
+            // Left 40%: Series Backdrop
+            Box(
+                modifier = Modifier
+                    .weight(0.40f)
+                    .fillMaxHeight()
+            ) {
+                val thumbUrl = series.backdropUrl?.ifBlank { null }
+                    ?: series.thumbnailUrl.ifBlank { null }
+                    ?: series.posterUrl.orEmpty()
+
+                AsyncImage(
+                    model = ImageRequest.Builder(LocalContext.current)
+                        .data(thumbUrl)
+                        .crossfade(150)
+                        .size(width = 360, height = 240)
+                        .bitmapConfig(Bitmap.Config.HARDWARE)
+                        .memoryCacheKey("series_row_${series.id}_${thumbUrl.hashCode()}")
+                        .diskCacheKey("series_row_${series.id}_${thumbUrl.hashCode()}")
+                        .build(),
+                    contentDescription = series.title,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
+
+                // Right edge gradient to blend seamlessly into card surface
+                Box(
+                    modifier = Modifier
+                        .fillMaxHeight()
+                        .width(28.dp)
+                        .align(Alignment.CenterEnd)
+                        .background(
+                            Brush.horizontalGradient(
+                                colors = listOf(Color.Transparent, SurfaceDefault)
+                            )
+                        )
+                )
+
+                if (series.watchProgressFraction > 0.02f) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(2.5.dp)
+                            .align(Alignment.BottomCenter)
+                            .background(Color(0x26FFFFFF))
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth(series.watchProgressFraction.coerceIn(0f, 1f))
+                                .fillMaxHeight()
+                                .background(AccentBlue)
+                        )
+                    }
+                }
+            }
+
+            // Right 60%: Series Details
+            Column(
+                modifier = Modifier
+                    .weight(0.60f)
+                    .fillMaxHeight()
+                    .padding(horizontal = 14.dp, vertical = 12.dp),
+                verticalArrangement = Arrangement.Center
+            ) {
+                // Title in 16.sp
+                Text(
+                    text = series.title,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+
+                Spacer(modifier = Modifier.height(6.dp))
+
+                // Seasons count & total episodes count in #94A3B8
+                val totalEps = series.totalEpisodes
+                val epText = if (totalEps > 0) "$totalEps Episodes" else ""
+                val cleanSeason = when {
+                    series.seasons.isNotEmpty() -> if (series.seasons.size == 1) "1 Season" else "${series.seasons.size} Seasons"
+                    !series.totalSeasonsFormatted.contains("explore", ignoreCase = true) &&
+                    series.totalSeasonsFormatted.isNotBlank() &&
+                    series.totalSeasonsFormatted != "TV Series" -> series.totalSeasonsFormatted
+                    else -> "TV Series"
+                }
+
+                val countParts = listOfNotNull(cleanSeason, epText.ifBlank { null })
+                val countText = countParts.joinToString(" • ")
+
+                Text(
+                    text = countText,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Normal,
+                    color = TextSecondary, // #94A3B8
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+
+                Spacer(modifier = Modifier.height(6.dp))
+
+                // Genre tags in #94A3B8
+                val genreClean = series.genreFormatted
+                    .replace("OTT SERIES", "")
+                    .replace("Tap to explore", "")
+                    .trim()
+                    .trim('•')
+                    .trim()
+                    .ifBlank { "Drama" }
+
+                Text(
+                    text = genreClean,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Normal,
+                    color = TextSecondary, // #94A3B8
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
             }
         }
     }
@@ -1841,8 +2273,8 @@ private fun CatalogEmptyView(
                         OutlinedButton(
                             onClick = onChooseMovies,
                             shape = PillShape,
-                            colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF00E5FF)),
-                            border = BorderStroke(1.dp, Color(0xFF00E5FF))
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentBlue),
+                            border = BorderStroke(1.dp, AccentBlue)
                         ) {
                             Icon(Icons.Default.Folder, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(6.dp))
@@ -1851,8 +2283,8 @@ private fun CatalogEmptyView(
                         OutlinedButton(
                             onClick = onChooseSeries,
                             shape = PillShape,
-                            colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF00E5FF)),
-                            border = BorderStroke(1.dp, Color(0xFF00E5FF))
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentBlue),
+                            border = BorderStroke(1.dp, AccentBlue)
                         ) {
                             Icon(Icons.Default.Folder, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(6.dp))
@@ -1887,14 +2319,20 @@ fun ContinueWatchingCard(
     onResumeClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val interactionSource = remember { MutableInteractionSource() }
     Card(
         modifier = modifier
             .fillMaxWidth()
             .height(210.dp)
             .padding(horizontal = 16.dp, vertical = 8.dp)
+            .appleTvPressable(interactionSource, pressedScale = 0.96f)
             .clip(RoundedCornerShape(16.dp))
-            .clickable { onResumeClick() },
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF0F141E))
+            .clickable(
+                interactionSource = interactionSource,
+                indication = ripple(bounded = true)
+            ) { onResumeClick() },
+        colors = CardDefaults.cardColors(containerColor = SurfaceDefault),
+        border = BorderStroke(1.dp, SurfaceBorder)
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
             // 1. High-Resolution Episode / Movie Artwork
@@ -1929,26 +2367,19 @@ fun ContinueWatchingCard(
                     .padding(16.dp),
                 verticalArrangement = Arrangement.SpaceBetween
             ) {
-                // Top Row: Tag ONLY (Cross 'X' button completely removed)
+                // Top Row: Subtle off-white label
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.Start,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Surface(
-                        shape = RoundedCornerShape(6.dp),
-                        color = Color(0xCC0E1A2B),
-                        border = BorderStroke(1.dp, Color(0xFF00E5FF).copy(alpha = 0.5f))
-                    ) {
-                        Text(
-                            text = "CONTINUE WATCHING",
-                            color = Color(0xFF00E5FF),
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.Bold,
-                            letterSpacing = 0.5.sp,
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                        )
-                    }
+                    Text(
+                        text = "CONTINUE WATCHING",
+                        color = Color(0xFF94A3B8),
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 1.sp
+                    )
                 }
 
                 // Bottom Row: Title, Episode Details, Watched Stats & Resume Action
@@ -1962,18 +2393,27 @@ fun ContinueWatchingCard(
                             .weight(1f)
                             .padding(end = 12.dp)
                     ) {
-                        Text(
-                            text = data.displayHeader.ifBlank { data.seriesTitle },
-                            color = Color(0xFF00E5FF),
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.SemiBold
-                        )
-
-                        Spacer(modifier = Modifier.height(2.dp))
+                        val header = data.displayHeader.ifBlank { data.seriesTitle }
+                        if (header.isNotBlank()) {
+                            Text(
+                                text = header,
+                                color = Color(0xFF94A3B8),
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                        }
 
                         val displaySubtitle = when {
                             data.displayTitle.isNotBlank() -> data.displayTitle
-                            data.seasonNumber > 0 -> "S${data.seasonNumber.toString().padStart(2, '0')}:E${data.episodeNumber.toString().padStart(2, '0')} • ${data.episodeTitle}"
+                            data.seasonNumber > 0 -> {
+                                val sFormatted = data.seasonNumber.toString().padStart(2, '0')
+                                val eFormatted = data.episodeNumber.toString().padStart(2, '0')
+                                val epCode = "S${sFormatted}:E${eFormatted}"
+                                if (data.episodeTitle.isNotBlank()) "$epCode • ${data.episodeTitle}" else epCode
+                            }
                             else -> data.episodeTitle
                         }
 
@@ -1988,47 +2428,55 @@ fun ContinueWatchingCard(
 
                         Spacer(modifier = Modifier.height(3.dp))
 
-                        val posFormatted = formatMsToTime(data.currentPositionMs)
-                        val durFormatted = formatMsToTime(data.durationMs)
+                        val remainingMs = (data.durationMs - data.currentPositionMs).coerceAtLeast(0L)
+                        val remainingMinutes = remainingMs / 60000L
+                        val remainingText = if (remainingMinutes > 0) {
+                            "${remainingMinutes}m remaining"
+                        } else {
+                            val posFormatted = formatMsToTime(data.currentPositionMs)
+                            val durFormatted = formatMsToTime(data.durationMs)
+                            "${(data.progressFraction * 100).toInt()}% watched • $posFormatted / $durFormatted"
+                        }
+
                         Text(
-                            text = "${(data.progressFraction * 100).toInt()}% watched • $posFormatted / $durFormatted",
-                            color = Color(0xFF90A4AE),
+                            text = remainingText,
+                            color = Color(0xFF94A3B8),
                             fontSize = 11.sp
                         )
                     }
 
-                    // Circular Cyan Action Button
+                    // Frosted-glass play circle with white play icon
                     Box(
                         modifier = Modifier
                             .size(46.dp)
                             .clip(CircleShape)
-                            .background(Color(0xFF00E5FF)),
+                            .background(Color.White.copy(alpha = 0.2f)),
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(
                             imageVector = Icons.Rounded.PlayArrow,
                             contentDescription = "Resume",
-                            tint = Color(0xFF07090E),
+                            tint = Color.White,
                             modifier = Modifier.size(28.dp)
                         )
                     }
                 }
             }
 
-            // 4. Cyan Progress Line at Bottom
+            // 4. Sleek 2.5.dp progress track using AccentBlue over track
             if (data.progressFraction > 0f) {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(3.5.dp)
+                        .height(2.5.dp)
                         .align(Alignment.BottomCenter)
-                        .background(Color(0x33FFFFFF))
+                        .background(Color(0x26FFFFFF))
                 ) {
                     Box(
                         modifier = Modifier
                             .fillMaxWidth(data.progressFraction.coerceIn(0.02f, 1f))
                             .fillMaxHeight()
-                            .background(Color(0xFF00E5FF))
+                            .background(AccentBlue)
                     )
                 }
             }
@@ -2189,19 +2637,19 @@ fun HomeScreen(
                 Text(
                     text = "Clotube",
                     color = Color.White,
-                    fontSize = 20.sp,
+                    fontSize = 22.sp,
                     fontWeight = FontWeight.Bold
                 )
 
                 Surface(
                     modifier = Modifier
                         .weight(1f)
-                        .height(38.dp)
+                        .height(40.dp)
                         .clip(RoundedCornerShape(20.dp))
                         .clickable { onSearchClick() },
                     shape = RoundedCornerShape(20.dp),
-                    color = Color(0xFF131A26),
-                    border = BorderStroke(1.dp, Color(0xFF1E2838))
+                    color = SurfaceElevated,
+                    border = BorderStroke(1.dp, SurfaceBorder)
                 ) {
                     Row(
                         modifier = Modifier
@@ -2213,13 +2661,13 @@ fun HomeScreen(
                         Icon(
                             imageVector = Icons.Rounded.Search,
                             contentDescription = "Search",
-                            tint = Color(0xFF6B7A90),
+                            tint = Color(0xFF64748B),
                             modifier = Modifier.size(18.dp)
                         )
                         Text(
                             text = "Search movies, series...",
-                            color = Color(0xFF6B7A90),
-                            fontSize = 12.sp,
+                            color = Color(0xFF64748B),
+                            fontSize = 13.sp,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
@@ -2230,8 +2678,8 @@ fun HomeScreen(
                     modifier = Modifier
                         .size(36.dp)
                         .clip(CircleShape)
-                        .border(1.5.dp, Color(0xFF1976D2), CircleShape)
-                        .background(Color(0xFF111824))
+                        .border(1.dp, SurfaceBorder, CircleShape)
+                        .background(SurfaceElevated)
                         .clickable { onProfileClick() },
                     contentAlignment = Alignment.Center
                 ) {
@@ -2246,7 +2694,7 @@ fun HomeScreen(
                     } else {
                         Text(
                             text = "C",
-                            color = Color(0xFF00E5FF),
+                            color = AccentBlue,
                             fontWeight = FontWeight.Bold,
                             fontSize = 14.sp
                         )
@@ -2265,32 +2713,37 @@ fun HomeScreen(
             ) {
                 HomeCatalogFilter.values().forEach { filter ->
                     val isSelected = selectedFilter == filter
-                    FilterChip(
-                        selected = isSelected,
-                        onClick = { selectedFilter = filter },
-                        label = {
-                            Text(
-                                text = filter.title,
-                                fontSize = 12.sp,
-                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium
-                            )
-                        },
-                        shape = RoundedCornerShape(20.dp),
-                        colors = FilterChipDefaults.filterChipColors(
-                            containerColor = Color(0xFF131822),
-                            labelColor = Color(0xFF90A4AE),
-                            selectedContainerColor = Color(0xFF1976D2),
-                            selectedLabelColor = Color.White
-                        ),
-                        border = FilterChipDefaults.filterChipBorder(
-                            enabled = true,
-                            selected = isSelected,
-                            borderColor = Color(0xFF222C3D),
-                            selectedBorderColor = Color(0xFF1976D2),
-                            borderWidth = 1.dp,
-                            selectedBorderWidth = 1.dp
-                        )
+                    val backgroundColor by animateColorAsState(
+                        targetValue = if (isSelected) Color.White else SurfaceDefault,
+                        animationSpec = AppleTvMotion.fluidSpring(),
+                        label = "secondFilterChipBackground_${filter.name}"
                     )
+                    val textColor by animateColorAsState(
+                        targetValue = if (isSelected) Color(0xFF08090D) else TextSecondary,
+                        animationSpec = AppleTvMotion.fluidSpring(),
+                        label = "secondFilterChipText_${filter.name}"
+                    )
+                    val chipInteractionSource = remember { MutableInteractionSource() }
+                    Surface(
+                        modifier = Modifier
+                            .appleTvPressable(chipInteractionSource, pressedScale = 0.94f)
+                            .clip(RoundedCornerShape(20.dp))
+                            .clickable(
+                                interactionSource = chipInteractionSource,
+                                indication = ripple(bounded = true)
+                            ) { selectedFilter = filter },
+                        shape = RoundedCornerShape(20.dp),
+                        color = backgroundColor,
+                        border = if (isSelected) null else BorderStroke(1.dp, SurfaceBorder)
+                    ) {
+                        Text(
+                            text = filter.title,
+                            fontSize = 12.sp,
+                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                            color = textColor,
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                        )
+                    }
                 }
             }
 
@@ -2327,8 +2780,8 @@ fun HomeScreen(
                     PullToRefreshDefaults.Indicator(
                         state = secondPullRefreshState,
                         isRefreshing = isSecondOverloadRefreshing,
-                        color = Color(0xFF00E5FF),
-                        containerColor = Color(0xFF161B26),
+                        color = AccentBlue,
+                        containerColor = SurfaceElevated,
                         modifier = Modifier.align(Alignment.TopCenter)
                     )
                 },
@@ -2336,7 +2789,18 @@ fun HomeScreen(
                     .fillMaxWidth()
                     .weight(1f)
             ) {
-                when (selectedFilter) {
+                AnimatedContent(
+                    targetState = selectedFilter,
+                    transitionSpec = {
+                        (fadeIn(animationSpec = tween(280, easing = AppleTvMotion.SmoothOutEasing)) +
+                            scaleIn(initialScale = 0.97f, animationSpec = tween(320, easing = AppleTvMotion.SmoothOutEasing)))
+                            .togetherWith(
+                                fadeOut(animationSpec = tween(150))
+                            )
+                    },
+                    label = "secondHomeCatalogFilterTransition"
+                ) { currentFilter ->
+                    when (currentFilter) {
                     HomeCatalogFilter.ALL -> {
                         // Home Overview: Continue Watching + Horizontal Carousels
                         LazyColumn(
@@ -2351,12 +2815,14 @@ fun HomeScreen(
                                         ContinueWatchingCard(
                                             data = item,
                                             onResumeClick = {
-                                                if (item.isSeries && !item.seriesId.isNullOrBlank()) {
+                                                if (item.isSeries) {
                                                     val ep = series.flatMap { it.seasons }.flatMap { it.episodes }.find { it.id == safeCwId }
                                                     if (ep != null) {
                                                         onContinueWatchingClick(ep)
                                                     } else {
-                                                        val matchedSeries = series.find { it.id == item.seriesId }
+                                                        val sId = item.seriesId?.trim()?.ifBlank { null }
+                                                            ?: series.firstOrNull { s -> s.seasons.any { season -> season.episodes.any { e -> e.id == safeCwId } } }?.id
+                                                        val matchedSeries = series.find { it.id == sId }
                                                         if (matchedSeries != null) onSeriesClick(matchedSeries)
                                                     }
                                                 } else {
@@ -2386,8 +2852,8 @@ fun HomeScreen(
                             // Movies Preview Carousel
                             item(key = "home_movies_preview") {
                                 SectionHeader(
-                                    title = "Movies",
-                                    subtitle = "${movies.size} videos available"
+                                    title = "Trending Movies",
+                                    onSeeAllClick = { selectedFilter = HomeCatalogFilter.MOVIES }
                                 )
                                 LazyRow(
                                     contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
@@ -2407,8 +2873,8 @@ fun HomeScreen(
                             item(key = "home_series_preview") {
                                 Spacer(modifier = Modifier.height(14.dp))
                                 SectionHeader(
-                                    title = "TV Series & Shows",
-                                    subtitle = "${series.size} multi-season shows"
+                                    title = "Popular Series",
+                                    onSeeAllClick = { selectedFilter = HomeCatalogFilter.TV_SERIES }
                                 )
                                 LazyRow(
                                     contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
@@ -2427,19 +2893,19 @@ fun HomeScreen(
                     }
 
                     HomeCatalogFilter.MOVIES -> {
-                        // Full-screen 2-column Grid of All Movies (No Continue Watching)
+                        // Full-screen 3-column Portrait Poster Grid of All Movies
                         if (movies.isEmpty()) {
                             CatalogEmptyView("No movies available in your Drive folder")
                         } else {
                             LazyVerticalGrid(
-                                columns = GridCells.Fixed(2),
+                                columns = GridCells.Fixed(3),
                                 modifier = Modifier.fillMaxSize(),
-                                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 110.dp),
-                                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                                verticalArrangement = Arrangement.spacedBy(12.dp)
+                                contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 8.dp, bottom = 110.dp),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                verticalArrangement = Arrangement.spacedBy(14.dp)
                             ) {
                                 items(movies, key = { it.id }) { movie ->
-                                    MovieOverlayCard(
+                                    MoviePosterCard(
                                         movie = movie,
                                         onClick = { onMovieClick(movie) },
                                         modifier = Modifier.fillMaxWidth()
@@ -2450,19 +2916,17 @@ fun HomeScreen(
                     }
 
                     HomeCatalogFilter.TV_SERIES -> {
-                        // Full-screen 2-column Grid of All TV Series (No Continue Watching)
+                        // Full-screen Cinematic List of All TV Series
                         if (series.isEmpty()) {
                             CatalogEmptyView("No series available in your Drive folder")
                         } else {
-                            LazyVerticalGrid(
-                                columns = GridCells.Fixed(2),
+                            LazyColumn(
                                 modifier = Modifier.fillMaxSize(),
                                 contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 110.dp),
-                                horizontalArrangement = Arrangement.spacedBy(12.dp),
                                 verticalArrangement = Arrangement.spacedBy(12.dp)
                             ) {
                                 items(series, key = { it.id }) { show ->
-                                    SeriesOverlayCard(
+                                    SeriesRowCard(
                                         series = show,
                                         onClick = { onSeriesClick(show) },
                                         modifier = Modifier.fillMaxWidth()
@@ -2472,6 +2936,7 @@ fun HomeScreen(
                         }
                     }
                 }
+            }
             }
         }
 

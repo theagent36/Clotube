@@ -616,7 +616,7 @@ class PlaybackHistoryManager(
             )
         )
 
-        (watchHistorySync ?: context?.let { DriveWatchHistorySync.getInstance(it) })?.backupImmediately(dataStore)
+        (watchHistorySync ?: context?.let { DriveWatchHistorySync.getInstance(it) })?.enqueueImmediateWatchState(dataStore)
     }
 
     /**
@@ -638,45 +638,111 @@ class PlaybackHistoryManager(
     }
 
     /**
-     * Checks reactively if a specific episode is watched (fraction >= 0.95f).
+     * Checks reactively if a single episode is marked as watched (either explicit _is_watched flag or fraction >= 0.90f).
      */
-    fun isEpisodeWatched(episodeId: String): Flow<Boolean> {
-        return dataStore.data.map { prefs ->
-            val explicit = prefs[booleanPreferencesKey("${episodeId}_is_watched")]
-            if (explicit != null) return@map explicit
-            val fraction = prefs[floatPreferencesKey("${episodeId}_fraction")] ?: 0f
-            fraction >= 0.95f
-        }
+    fun isEpisodeWatched(episodeId: String): Flow<Boolean> = dataStore.data.map { prefs ->
+        val isWatched = prefs[booleanPreferencesKey("${episodeId}_is_watched")]
+        val fraction = prefs[floatPreferencesKey("${episodeId}_fraction")] ?: 0f
+        isWatched == true || fraction >= 0.90f
     }
 
     /**
-     * Toggles the watched state of an episode between 100% and 0%.
+     * Toggles an episode between watched (100%) and unwatched (0%), syncing immediately to Drive.
      */
     suspend fun toggleEpisodeWatched(
-        episode: Episode,
         seriesId: String,
-        seriesTitle: String
+        seriesTitle: String,
+        episode: com.clotube.app.model.Episode,
+        userEmail: String = ""
     ) = withContext(NonCancellable + Dispatchers.IO) {
         val prefs = dataStore.data.first()
-        val currentFraction = prefs[floatPreferencesKey("${episode.id}_fraction")] ?: 0f
-        val isCurrentlyWatched = currentFraction >= 0.95f
+        val currentlyWatched = prefs[booleanPreferencesKey("${episode.id}_is_watched")]
+            ?: ((prefs[floatPreferencesKey("${episode.id}_fraction")] ?: 0f) >= 0.90f)
+        val targetWatched = !currentlyWatched
+        val now = System.currentTimeMillis()
+        val dur = episode.durationMs.coerceAtLeast(1000L)
 
-        if (isCurrentlyWatched) {
-            markEpisodeUnwatched(
-                seriesId = seriesId,
-                seriesTitle = seriesTitle,
-                episodeId = episode.id,
-                episodeTitle = episode.displayTitle,
-                seasonNumber = episode.seasonNumber,
-                episodeNumber = episode.episodeNumber
-            )
-        } else {
-            markSingleEpisodeComplete(
-                seriesId = seriesId,
-                seriesTitle = seriesTitle,
-                episode = episode
-            )
+        dataStore.edit { p ->
+            p[booleanPreferencesKey("${episode.id}_is_watched")] = targetWatched
+            p[floatPreferencesKey("${episode.id}_fraction")] = if (targetWatched) 1.0f else 0.0f
+            p[longPreferencesKey("${episode.id}_pos")] = if (targetWatched) dur else 0L
+            p[longPreferencesKey("${episode.id}_dur")] = dur
+            p[longPreferencesKey("${episode.id}_timestamp")] = now
+            p[stringPreferencesKey("${episode.id}_title")] = episode.displayTitle
+            p[booleanPreferencesKey("${episode.id}_is_series")] = true
+            p[stringPreferencesKey("${episode.id}_series_id")] = seriesId
+            p[intPreferencesKey("${episode.id}_season_num")] = episode.seasonNumber
+            p[intPreferencesKey("${episode.id}_episode_num")] = episode.episodeNumber
         }
+
+        // Keep legacy AndroidWatchHistoryManager in sync if needed
+        try {
+            if (userEmail.isNotBlank()) {
+                context?.let { ctx ->
+                    com.clotube.app.data.AndroidWatchHistoryManager.setEpisodeWatched(
+                        ctx,
+                        userEmail,
+                        episode.id,
+                        targetWatched
+                    )
+                }
+            }
+        } catch (_: Throwable) {}
+
+        // PRIORITY 1: Fire instant upload without pre-pull delay
+        (watchHistorySync ?: context?.let { DriveWatchHistorySync.getInstance(it) })?.enqueueImmediateWatchState(dataStore)
+    }
+
+    /**
+     * Backward-compatible overload for legacy callers.
+     */
+    suspend fun toggleEpisodeWatched(
+        episode: com.clotube.app.model.Episode,
+        seriesId: String,
+        seriesTitle: String
+    ) = toggleEpisodeWatched(seriesId, seriesTitle, episode)
+
+    /**
+     * Explicitly sets watched state for an episode and syncs to Google Drive.
+     */
+    suspend fun setEpisodeWatched(
+        seriesId: String,
+        seriesTitle: String,
+        episode: com.clotube.app.model.Episode,
+        isWatched: Boolean,
+        userEmail: String = ""
+    ) = withContext(NonCancellable + Dispatchers.IO) {
+        val now = System.currentTimeMillis()
+        val dur = episode.durationMs.coerceAtLeast(1000L)
+
+        dataStore.edit { p ->
+            p[booleanPreferencesKey("${episode.id}_is_watched")] = isWatched
+            p[floatPreferencesKey("${episode.id}_fraction")] = if (isWatched) 1.0f else 0.0f
+            p[longPreferencesKey("${episode.id}_pos")] = if (isWatched) dur else 0L
+            p[longPreferencesKey("${episode.id}_dur")] = dur
+            p[longPreferencesKey("${episode.id}_timestamp")] = now
+            p[stringPreferencesKey("${episode.id}_title")] = episode.displayTitle
+            p[booleanPreferencesKey("${episode.id}_is_series")] = true
+            p[stringPreferencesKey("${episode.id}_series_id")] = seriesId
+            p[intPreferencesKey("${episode.id}_season_num")] = episode.seasonNumber
+            p[intPreferencesKey("${episode.id}_episode_num")] = episode.episodeNumber
+        }
+
+        try {
+            if (userEmail.isNotBlank()) {
+                context?.let { ctx ->
+                    com.clotube.app.data.AndroidWatchHistoryManager.setEpisodeWatched(
+                        ctx,
+                        userEmail,
+                        episode.id,
+                        isWatched
+                    )
+                }
+            }
+        } catch (_: Throwable) {}
+
+        // PRIORITY 1: Instant upload
+        (watchHistorySync ?: context?.let { DriveWatchHistorySync.getInstance(it) })?.enqueueImmediateWatchState(dataStore)
     }
 
     suspend fun markEpisodeUnwatched(
@@ -865,8 +931,8 @@ class PlaybackHistoryManager(
             )
         }
 
-        // Immediately push full snapshot to Google Drive
-        (watchHistorySync ?: context?.let { DriveWatchHistorySync.getInstance(it) })?.backupImmediately(dataStore)
+        // PRIORITY 1: Immediately push full snapshot to Google Drive
+        (watchHistorySync ?: context?.let { DriveWatchHistorySync.getInstance(it) })?.enqueueImmediateWatchState(dataStore)
     }
 
     /**
@@ -916,8 +982,8 @@ class PlaybackHistoryManager(
             }
         }
 
-        // Immediately push updated snapshot to Google Drive
-        (watchHistorySync ?: context?.let { DriveWatchHistorySync.getInstance(it) })?.backupImmediately(dataStore)
+        // PRIORITY 1: Immediately push updated snapshot to Google Drive
+        (watchHistorySync ?: context?.let { DriveWatchHistorySync.getInstance(it) })?.enqueueImmediateWatchState(dataStore)
     }
 
     /**
@@ -985,7 +1051,7 @@ class PlaybackHistoryManager(
             )
         )
 
-        (watchHistorySync ?: context?.let { DriveWatchHistorySync.getInstance(it) })?.backupImmediately(dataStore)
+        (watchHistorySync ?: context?.let { DriveWatchHistorySync.getInstance(it) })?.enqueueImmediateWatchState(dataStore)
     }
 
     /**
@@ -1019,7 +1085,7 @@ class PlaybackHistoryManager(
             }
         }
 
-        (watchHistorySync ?: context?.let { DriveWatchHistorySync.getInstance(it) })?.backupImmediately(dataStore)
+        (watchHistorySync ?: context?.let { DriveWatchHistorySync.getInstance(it) })?.enqueueImmediateWatchState(dataStore)
     }
 
     /**
@@ -1189,7 +1255,7 @@ class PlaybackHistoryManager(
         )
 
         if (immediateCloudSync || isFinished) {
-            (watchHistorySync ?: context?.let { DriveWatchHistorySync.getInstance(it) })?.backupImmediately(dataStore)
+            (watchHistorySync ?: context?.let { DriveWatchHistorySync.getInstance(it) })?.enqueueImmediateWatchState(dataStore)
         } else {
             (watchHistorySync ?: context?.let { DriveWatchHistorySync.getInstance(it) })?.triggerThrottledBackup(dataStore)
         }
@@ -1793,6 +1859,9 @@ class PlaybackHistoryManager(
             prefs[floatPreferencesKey("${prefix}_fraction")] = fraction
             prefs[longPreferencesKey("${prefix}_timestamp")] = timestamp
         }
+
+        // PRIORITY 2: Throttled progress upload
+        (watchHistorySync ?: context?.let { DriveWatchHistorySync.getInstance(it) })?.enqueueProgressUpdate(dataStore)
     }
 
     suspend fun saveSeriesPlaybackState(

@@ -6,9 +6,6 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.ExitTransition
-import androidx.compose.animation.core.FastOutLinearInEasing
-import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.animation.core.LinearOutSlowInEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -34,58 +31,40 @@ import com.clotube.app.ui.screens.RecentScreen
 import com.clotube.app.ui.screens.SeriesDetailScreen
 import com.clotube.app.ui.screens.SettingsScreen
 import com.clotube.app.data.WatchHistoryItem
+import com.clotube.app.ui.theme.AppleTvMotion
 import com.clotube.app.viewmodel.VideoViewModel
 
 object MaterialSharedZAxisMotion {
-    private const val DURATION_MOTION = 300
-    private const val DURATION_FADE_IN = 210
-    private const val DELAY_FADE_IN = 90
-    private const val DURATION_FADE_OUT = 90
-
     val enterTransition: EnterTransition =
         scaleIn(
-            initialScale = 0.8f,
-            animationSpec = tween(durationMillis = DURATION_MOTION, easing = FastOutSlowInEasing)
+            initialScale = 0.92f,
+            animationSpec = tween(380, easing = AppleTvMotion.SmoothOutEasing)
         ) + fadeIn(
-            animationSpec = tween(
-                durationMillis = DURATION_FADE_IN,
-                delayMillis = DELAY_FADE_IN,
-                easing = LinearOutSlowInEasing
-            )
+            animationSpec = tween(280, easing = AppleTvMotion.SmoothOutEasing)
         )
 
     val exitTransition: ExitTransition =
         scaleOut(
-            targetScale = 1.1f,
-            animationSpec = tween(durationMillis = DURATION_MOTION, easing = FastOutSlowInEasing)
+            targetScale = 1.05f,
+            animationSpec = tween(380, easing = AppleTvMotion.SmoothOutEasing)
         ) + fadeOut(
-            animationSpec = tween(
-                durationMillis = DURATION_FADE_OUT,
-                easing = FastOutLinearInEasing
-            )
+            animationSpec = tween(180)
         )
 
     val popEnterTransition: EnterTransition =
         scaleIn(
-            initialScale = 1.1f,
-            animationSpec = tween(durationMillis = DURATION_MOTION, easing = FastOutSlowInEasing)
+            initialScale = 1.05f,
+            animationSpec = tween(360, easing = AppleTvMotion.SmoothOutEasing)
         ) + fadeIn(
-            animationSpec = tween(
-                durationMillis = DURATION_FADE_IN,
-                delayMillis = DELAY_FADE_IN,
-                easing = LinearOutSlowInEasing
-            )
+            animationSpec = tween(260, easing = AppleTvMotion.SmoothOutEasing)
         )
 
     val popExitTransition: ExitTransition =
         scaleOut(
-            targetScale = 0.8f,
-            animationSpec = tween(durationMillis = DURATION_MOTION, easing = FastOutSlowInEasing)
+            targetScale = 0.92f,
+            animationSpec = tween(340, easing = AppleTvMotion.SmoothOutEasing)
         ) + fadeOut(
-            animationSpec = tween(
-                durationMillis = DURATION_FADE_OUT,
-                easing = FastOutLinearInEasing
-            )
+            animationSpec = tween(180)
         )
 }
 
