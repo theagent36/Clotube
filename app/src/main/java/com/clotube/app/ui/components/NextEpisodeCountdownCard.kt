@@ -76,9 +76,17 @@ fun NextEpisodeCountdownCard(
     var isDismissed by remember(nextEpisode.id) { mutableStateOf(false) }
     var countdownRemainingMs by remember(nextEpisode.id) { mutableLongStateOf(COUNTDOWN_TOTAL_MS) }
     var isCountdownActive by remember(nextEpisode.id) { mutableStateOf(false) }
+    var hasTriggeredPlayNext by remember(nextEpisode.id) { mutableStateOf(false) }
 
-    LaunchedEffect(shouldTriggerWindow, isDismissed) {
-        if (shouldTriggerWindow && !isDismissed) {
+    fun firePlayNextOnce() {
+        if (hasTriggeredPlayNext) return
+        hasTriggeredPlayNext = true
+        isCountdownActive = false
+        onPlayNext(nextEpisode)
+    }
+
+    LaunchedEffect(shouldTriggerWindow, isDismissed, hasTriggeredPlayNext) {
+        if (shouldTriggerWindow && !isDismissed && !hasTriggeredPlayNext) {
             isCountdownActive = true
         } else if (!shouldTriggerWindow) {
             countdownRemainingMs = COUNTDOWN_TOTAL_MS
@@ -86,15 +94,14 @@ fun NextEpisodeCountdownCard(
         }
     }
 
-    LaunchedEffect(isCountdownActive, isPlaying, isDismissed) {
-        if (isCountdownActive && isPlaying && !isDismissed) {
-            while (countdownRemainingMs > 0L && isPlaying && !isDismissed) {
+    LaunchedEffect(isCountdownActive, isPlaying, isDismissed, hasTriggeredPlayNext) {
+        if (isCountdownActive && isPlaying && !isDismissed && !hasTriggeredPlayNext) {
+            while (countdownRemainingMs > 0L && isPlaying && !isDismissed && !hasTriggeredPlayNext) {
                 delay(100L)
                 countdownRemainingMs = (countdownRemainingMs - 100L).coerceAtLeast(0L)
             }
-            if (countdownRemainingMs <= 0L && !isDismissed) {
-                isCountdownActive = false
-                onPlayNext(nextEpisode)
+            if (countdownRemainingMs <= 0L && !isDismissed && !hasTriggeredPlayNext) {
+                firePlayNextOnce()
             }
         }
     }
@@ -181,8 +188,7 @@ fun NextEpisodeCountdownCard(
                             interactionSource = remember { MutableInteractionSource() },
                             indication = null
                         ) {
-                            isCountdownActive = false
-                            onPlayNext(nextEpisode)
+                            firePlayNextOnce()
                         }
                         .padding(vertical = 4.dp),
                     verticalAlignment = Alignment.CenterVertically

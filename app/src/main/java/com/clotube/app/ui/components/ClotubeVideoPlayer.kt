@@ -64,6 +64,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.viewModelScope
 import coil.compose.AsyncImage
 import com.clotube.app.auth.TokenRefreshProvider
 import com.clotube.app.media.BluetoothAudioKeepAlive
@@ -77,10 +78,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.videolan.libvlc.LibVLC
 import org.videolan.libvlc.Media
 import org.videolan.libvlc.MediaPlayer
@@ -262,20 +265,43 @@ fun ClotubeVideoPlayer(
     onNextEpisode: (() -> Unit)? = null,
     onClosePlayer: () -> Unit,
     onToggleFullscreen: (() -> Unit)? = null,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    isFullscreen: Boolean? = null,
+    onFullscreenChanged: ((Boolean) -> Unit)? = null,
+    forceExplicitStartPosition: Boolean = false
 ) {
     val context = LocalContext.current
+    LaunchedEffect(episode.id) {
+        Log.i("ClotubePlayer", "--> ClotubeVideoPlayer COMPOSED for episode=${episode.id} (${episode.displayTitle})")
+    }
     val coroutineScope = rememberCoroutineScope()
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
     val effectiveStartPositionMs = if (startPositionMs > 0L) startPositionMs else initialPositionMs
+    val configIsLandscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
+    val resolvedIsFullscreen = isFullscreen ?: configIsLandscape
 
     fun isScreenVisible(): Boolean {
         return lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
     }
 
-    var isLoading by remember(episode.id) { mutableStateOf(false) }
-    var isSurfaceReady by remember(episode.id) { mutableStateOf(false) }
-    var isPlayerDisposed by remember(episode.id) { mutableStateOf(false) }
+    var isLoading by remember { mutableStateOf(false) }
+    var isSurfaceReady by remember { mutableStateOf(false) }
+    var isPlayerDisposed by remember { mutableStateOf(false) }
+    var loadedEpisodeId by remember { mutableStateOf<String?>(null) }
+    var activeLoadedEpisodeId by remember { mutableStateOf("") }
+    var triggeredEpisodeId by remember { mutableStateOf<String?>(null) }
+    var savedOnExitEpisodeId by remember { mutableStateOf<String?>(null) }
+
+    var hasTriggeredNextForEpisode by remember(episode.id) { mutableStateOf(false) }
+    var showFloatingNext by remember(episode.id) { mutableStateOf(false) }
+    var isFloatingNextDismissed by remember(episode.id) { mutableStateOf(false) }
+    var countdownJob by remember(episode.id) { mutableStateOf<Job?>(null) }
+    var streamLoadJob by remember { mutableStateOf<Job?>(null) }
+
+    val currentEpisodeState by rememberUpdatedState(episode)
+    val currentNextEpisodeState by rememberUpdatedState(nextEpisode)
+    val currentOnNextEpisodeState by rememberUpdatedState(onNextEpisode)
+    val currentOnPreviousEpisodeState by rememberUpdatedState(onPreviousEpisode)
 
     val resolvedSeriesId = remember(seriesId, episode.id) {
         seriesId?.trim()?.ifBlank { null }
@@ -283,8 +309,11 @@ fun ClotubeVideoPlayer(
             ?: viewModel.getDefaultSeriesId()
             ?: ""
     }
+    val currentResolvedSeriesId by rememberUpdatedState(resolvedSeriesId)
 
-    val libVLCInstance = remember(episode.id) {
+    // Reuse a single LibVLC and MediaPlayer across episode transitions so the landscape Surface
+    // is never torn down or raced with asynchronous native .release() calls.
+    val libVLCInstance = remember {
         LibVLC(
             context.applicationContext,
             arrayListOf(
@@ -312,9 +341,8 @@ fun ClotubeVideoPlayer(
 
     val player = mediaPlayer
     val libVLC = libVLCInstance
-    val isBuffering = isLoading
 
-    val audioFocusManager = remember(episode.id) {
+    val audioFocusManager = remember {
         ClotubeAudioFocusManager(
             context = context,
             onPausePlayback = {
@@ -325,7 +353,7 @@ fun ClotubeVideoPlayer(
             },
             onResumePlayback = {
                 val isCurrentlyPlaying = player.safeCall(false) { isPlaying }
-                if (!isCurrentlyPlaying && !isBuffering) {
+                if (!isCurrentlyPlaying && !isLoading) {
                     player.safeCall(Unit) { play() }
                 }
             }
@@ -333,132 +361,236 @@ fun ClotubeVideoPlayer(
     }
 
     var activeStreamUrl by remember(episode.id) { mutableStateOf("") }
+    var ensureListenerAttachedCallback by remember { mutableStateOf<(() -> Unit)?>(null) }
+    var resetUiForEpisodeCallback by remember { mutableStateOf<((Long, Long) -> Unit)?>(null) }
 
-    fun loadAndPlayStream(startPositionMs: Long = 0L, forceRefreshToken: Boolean = false) {
-        coroutineScope.launch(Dispatchers.IO) {
-            isLoading = true
-            try {
-                val downloadRepo = com.clotube.app.data.DownloadRepository(context)
-                val localFile = downloadRepo.getLocalFileIfDownloaded(episode.id)
-
-                val media = if (localFile != null && localFile.exists()) {
-                    Media(libVLCInstance, Uri.fromFile(localFile)).apply {
-                        addOption(":file-caching=1500")
-                    }
-                } else {
-                    val streamUrl = viewModel.getStreamUrlForEpisode(episode.id)
-                    activeStreamUrl = streamUrl
-                    val token = if (forceRefreshToken) {
+    suspend fun loadAndPlayStream(
+        targetEpisode: Episode,
+        streamUrl: String,
+        startPositionMs: Long = 0L,
+        forceRefreshToken: Boolean = false
+    ) {
+        isLoading = true
+        try {
+            withContext(Dispatchers.IO) {
+                val isLocalFile = streamUrl.startsWith("file:", ignoreCase = true)
+                if (!isLocalFile) {
+                    if (forceRefreshToken) {
                         viewModel.getFreshGoogleDriveAccessToken(forceRefresh = true)
                     } else {
-                        viewModel.uiState.value.accessToken?.takeIf { it.isNotBlank() }
-                            ?: viewModel.getFreshGoogleDriveAccessToken(forceRefresh = false)
-                    }
-
-                    if (streamUrl.isBlank()) {
-                        withContext(Dispatchers.Main) {
-                            Toast.makeText(context, "Stream link resolution failed", Toast.LENGTH_SHORT).show()
-                        }
-                        return@launch
-                    }
-
-                    Media(libVLCInstance, Uri.parse(streamUrl)).apply {
-                        addOption(":network-caching=3000")
-                        addOption(":http-reconnect")
-                        if (!token.isNullOrBlank()) {
-                            addOption(":http-header=Authorization: Bearer $token")
+                        val existingToken = viewModel.uiState.value.accessToken
+                        if (existingToken.isNullOrBlank()) {
+                            viewModel.getFreshGoogleDriveAccessToken(forceRefresh = false)
                         }
                     }
-                }.apply {
-                    val totalDuration = episode.durationMs
-                    val startSec = if (totalDuration > 0L && startPositionMs >= totalDuration - 5_000L) {
+                }
+
+                Log.i("ClotubePlayer", "--> loadAndPlayStream creating LibVLC Media: ep=${targetEpisode.id}, streamUrl=$streamUrl, startPositionMs=$startPositionMs")
+                val media = Media(libVLCInstance, Uri.parse(streamUrl))
+                try {
+                    if (isLocalFile) {
+                        media.addOption(":file-caching=1500")
+                    } else {
+                        media.addOption(":network-caching=3000")
+                        media.addOption(":http-reconnect")
+                    }
+                    val totalDuration = targetEpisode.durationMs
+                    val safeStartMs = if (totalDuration > 0L && startPositionMs >= totalDuration - 5_000L) {
                         0L
                     } else {
-                        (startPositionMs / 1000L).coerceAtLeast(0L)
+                        startPositionMs.coerceAtLeast(0L)
                     }
-                    applyClotubeMediaOptions(startSec)
+                    val startSec = (safeStartMs / 1000L).coerceAtLeast(0L)
+                    media.applyClotubeMediaOptions(startSec)
                     if (startSec > 0L) {
-                        addOption(":start-time=$startSec")
+                        media.addOption(":start-time=$startSec")
                     }
-                    setHWDecoderEnabled(true, true)
-                }
+                    media.setHWDecoderEnabled(true, true)
 
-                withContext(Dispatchers.Main) {
-                    mediaPlayer.stop()
-                    mediaPlayer.media = media
-                    media.release()
-
-                    if (isScreenVisible()) {
-                        audioFocusManager.requestAudioFocus()
-                        mediaPlayer.play()
-                    } else {
-                        mediaPlayer.pause()
+                    withContext(Dispatchers.Main) {
+                        if (!isActive || isPlayerDisposed || currentEpisodeState.id != targetEpisode.id) {
+                            return@withContext
+                        }
+                        ensureListenerAttachedCallback?.invoke()
+                        mediaPlayer.safeCall(Unit) { stop() }
+                        mediaPlayer.safeCall(Unit) { this.media = media }
+                        activeLoadedEpisodeId = targetEpisode.id
+                        if (isScreenVisible()) {
+                            Log.i("ClotubePlayer", "--> Calling mediaPlayer.play() for ep=${targetEpisode.id}, startSec=$startSec, isLocal=$isLocalFile")
+                            audioFocusManager.requestAudioFocus()
+                            mediaPlayer.safeCall(Unit) { play() }
+                        } else {
+                            mediaPlayer.safeCall(Unit) { pause() }
+                        }
                     }
+                } finally {
+                    try {
+                        media.release()
+                    } catch (_: Throwable) {}
                 }
-            } catch (e: Exception) {
-                Log.e("ClotubePlayer", "Playback launch error: ${e.message}", e)
-            } finally {
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e("ClotubePlayer", "Playback launch error: ${e.message}", e)
+        } finally {
+            if (currentEpisodeState.id == targetEpisode.id) {
                 isLoading = false
             }
         }
     }
 
-    // MediaTek Hardware Decoder & Crash Prevention (Strict Order: setEventListener(null) -> stop -> detachViews -> deferred release)
-    DisposableEffect(episode.id) {
+    fun saveEpisodeProgressIfNeeded(targetEpisode: Episode, seriesIdForSave: String) {
+        if (hasTriggeredNextForEpisode ||
+            triggeredEpisodeId == targetEpisode.id ||
+            savedOnExitEpisodeId == targetEpisode.id ||
+            activeLoadedEpisodeId != targetEpisode.id
+        ) {
+            return
+        }
+        savedOnExitEpisodeId = targetEpisode.id
+        try {
+            val current = mediaPlayer.safeCall(0L) { time }
+            val total = mediaPlayer.safeCall(0L) { length }
+            if (total > 0L && current >= 3000L) {
+                val isNearEnd = current >= (total * 0.95f) || (total - current <= 15_000L)
+                if (isNearEnd) {
+                    val next = currentNextEpisodeState ?: viewModel.getNextEpisode(seriesIdForSave, targetEpisode.id)
+                    viewModel.completeEpisode(
+                        episode = targetEpisode,
+                        seriesId = seriesIdForSave,
+                        totalDurationMs = total,
+                        nextEpisode = next
+                    )
+                } else {
+                    viewModel.savePlaybackPositionImmediate(
+                        fileId = targetEpisode.id,
+                        positionMs = current,
+                        durationMs = total,
+                        title = targetEpisode.displayTitle,
+                        seriesTitle = targetEpisode.seriesTitle.ifBlank { null },
+                        seasonNumber = targetEpisode.seasonNumber,
+                        episodeNumber = targetEpisode.episodeNumber,
+                        isSeries = true,
+                        seriesId = seriesIdForSave,
+                        thumbnailUrl = targetEpisode.thumbnailUrl.ifBlank { null }
+                    )
+                }
+            }
+        } catch (_: Throwable) {}
+    }
+
+    fun triggerNextEpisodeSafely() {
+        val finishedEpisode = currentEpisodeState
+        if (hasTriggeredNextForEpisode || triggeredEpisodeId == finishedEpisode.id) return
+        hasTriggeredNextForEpisode = true
+        triggeredEpisodeId = finishedEpisode.id
+        activeLoadedEpisodeId = ""
+        countdownJob?.cancel()
+        countdownJob = null
+        showFloatingNext = false
+        isFloatingNextDismissed = true
+        streamLoadJob?.cancel()
+        streamLoadJob = null
+
+        // 1. Immediately detach listener and stop current player so EndReached or TimeChanged
+        // cannot fire a second time or bleed old timestamps into the next episode!
+        val finalDuration = mediaPlayer.safeCall(0L) { length }
+            .coerceAtLeast(finishedEpisode.durationMs)
+            .coerceAtLeast(1000L)
+        mediaPlayer.safeCall(Unit) { setEventListener(null) }
+        mediaPlayer.safeCall(Unit) { stop() }
+
+        val upcomingEpisode = currentNextEpisodeState
+            ?: viewModel.getNextEpisode(currentResolvedSeriesId, finishedEpisode.id)
+
+        resetUiForEpisodeCallback?.invoke(0L, upcomingEpisode?.durationMs ?: 0L)
+
+        // 2. Explicitly mark ONLY the finishedEpisode as completed, and set the nextEpisode resume pointer to 0L
+        viewModel.viewModelScope.launch(Dispatchers.IO + NonCancellable) {
+            viewModel.playbackHistoryManager.completeEpisodeAndAdvance(
+                seriesId = currentResolvedSeriesId,
+                seriesTitle = finishedEpisode.seriesTitle,
+                completedEpisodeId = finishedEpisode.id,
+                seasonNumber = finishedEpisode.seasonNumber,
+                episodeNumber = finishedEpisode.episodeNumber,
+                durationMs = finalDuration,
+                nextEpisodeId = upcomingEpisode?.id,
+                nextEpisodeTitle = upcomingEpisode?.displayTitle,
+                nextSeasonNumber = upcomingEpisode?.seasonNumber,
+                nextEpisodeNumber = upcomingEpisode?.episodeNumber,
+                nextThumbnailUrl = upcomingEpisode?.thumbnailUrl
+            )
+            com.clotube.app.data.DriveSyncWorker.enqueue(context.applicationContext)
+        }
+
+        // 3. Advance UI to nextEpisode with explicit startPositionMs = 0L
+        if (upcomingEpisode != null) {
+            currentOnNextEpisodeState?.invoke()
+        }
+    }
+
+    fun switchEpisodeFromControls(isNext: Boolean) {
+        val outgoingEpisode = currentEpisodeState
+        val current = mediaPlayer.safeCall(0L) { time }
+        val total = mediaPlayer.safeCall(0L) { length }
+        val isNearEnd = isNext && total > 0L && (current >= (total * 0.95f) || (total - current <= 15_000L))
+        if (isNearEnd) {
+            triggerNextEpisodeSafely()
+            return
+        }
+
+        countdownJob?.cancel()
+        countdownJob = null
+        showFloatingNext = false
+        streamLoadJob?.cancel()
+        streamLoadJob = null
+
+        saveEpisodeProgressIfNeeded(outgoingEpisode, currentResolvedSeriesId)
+        activeLoadedEpisodeId = ""
+        mediaPlayer.safeCall(Unit) { setEventListener(null) }
+        mediaPlayer.safeCall(Unit) { stop() }
+
+        val targetDuration = if (isNext) currentNextEpisodeState?.durationMs ?: 0L else 0L
+        resetUiForEpisodeCallback?.invoke(0L, targetDuration)
+
+        if (isNext) {
+            currentOnNextEpisodeState?.invoke()
+        } else {
+            currentOnPreviousEpisodeState?.invoke()
+        }
+    }
+
+    // Session-level LibVLC & MediaPlayer release ONLY when leaving ClotubeVideoPlayer entirely
+    DisposableEffect(mediaPlayer) {
         audioFocusManager.requestAudioFocus()
         isPlayerDisposed = false
         onDispose {
             isPlayerDisposed = true
+            streamLoadJob?.cancel()
+            streamLoadJob = null
+            countdownJob?.cancel()
+            countdownJob = null
 
-            // 1. Abandon audio focus and silence all focus callbacks FIRST
+            // Abandon audio focus and silence callbacks FIRST
             try {
                 audioFocusManager.abandonFocus()
             } catch (_: Throwable) {}
 
             viewModel.unregisterActivePlayer(mediaPlayer)
-
-            try {
-                val current = mediaPlayer.safeCall(0L) { time }
-                val total = mediaPlayer.safeCall(0L) { length }
-                if (total > 0L && current >= 3000L) {
-                    val isNearEnd = current >= (total * 0.95f) || (total - current <= 15_000L)
-                    if (isNearEnd) {
-                        val next = nextEpisode ?: viewModel.getNextEpisode(resolvedSeriesId, episode.id)
-                        viewModel.completeEpisode(
-                            episode = episode,
-                            seriesId = resolvedSeriesId,
-                            totalDurationMs = total,
-                            nextEpisode = next
-                        )
-                    } else {
-                        viewModel.savePlaybackPositionImmediate(
-                            fileId = episode.id,
-                            positionMs = current,
-                            durationMs = total,
-                            title = episode.displayTitle,
-                            seriesTitle = episode.seriesTitle.ifBlank { null },
-                            seasonNumber = episode.seasonNumber,
-                            episodeNumber = episode.episodeNumber,
-                            isSeries = true,
-                            seriesId = resolvedSeriesId,
-                            thumbnailUrl = episode.thumbnailUrl.ifBlank { null }
-                        )
-                    }
-                }
-            } catch (_: Throwable) {}
+            saveEpisodeProgressIfNeeded(currentEpisodeState, currentResolvedSeriesId)
+            loadedEpisodeId = null
+            activeLoadedEpisodeId = ""
 
             val playerToRelease = player
             val vlcToRelease = libVLC
 
-            // 2. Immediately remove event listener
-            player.safeCall(Unit) { setEventListener(null) }
+            // Synchronous Main-thread teardown before background native release
+            playerToRelease.safeCall(Unit) { setEventListener(null) }
+            playerToRelease.safeCall(Unit) { stop() }
+            playerToRelease.safeCall(Unit) { detachViews() }
 
-            // 3. Detach surface views and stop
-            player.safeCall(Unit) { detachViews() }
-            player.safeCall(Unit) { stop() }
-
-            // 4. Post native release to Looper queue
-            android.os.Handler(android.os.Looper.getMainLooper()).post {
+            kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
                 try {
                     if (!playerToRelease.isReleased) {
                         playerToRelease.release()
@@ -473,48 +605,113 @@ fun ClotubeVideoPlayer(
         }
     }
 
-    var computedInitialPositionMs by remember(episode.id) { mutableLongStateOf(0L) }
+    // Per-episode disposal ONLY handles progress saving (never tears down LibVLC or orientation)
+    DisposableEffect(episode.id) {
+        onDispose {
+            saveEpisodeProgressIfNeeded(episode, resolvedSeriesId)
+            if (!isPlayerDisposed) {
+                activeLoadedEpisodeId = ""
+                mediaPlayer.safeCall(Unit) { setEventListener(null) }
+                mediaPlayer.safeCall(Unit) { stop() }
+            }
+        }
+    }
 
-    // Initial launch with progress recovery (gated by surface readiness)
-    LaunchedEffect(episode.id, isSurfaceReady) {
-        if (!isSurfaceReady) return@LaunchedEffect
-        val streamUrl = viewModel.getStreamUrlForEpisode(episode.id)
-        if (streamUrl.isBlank()) return@LaunchedEffect
+    var computedInitialPositionMs by remember(episode.id) { mutableLongStateOf(effectiveStartPositionMs) }
 
-        val resumePos = withContext(Dispatchers.IO) {
-            if (effectiveStartPositionMs > 0L) {
-                effectiveStartPositionMs
-            } else {
-                viewModel.playbackHistoryManager.getResumePosition(episode.id)
+    // Initial launch & episode switch with progress recovery (do not deadlock indefinitely on isSurfaceReady)
+    LaunchedEffect(episode.id) {
+        Log.i("ClotubePlayer", "--> LaunchedEffect triggered: ep=${episode.id}, isSurfaceReady=$isSurfaceReady, loadedId=$loadedEpisodeId")
+        if (!isSurfaceReady) {
+            withTimeoutOrNull(400L) {
+                snapshotFlow { isSurfaceReady }.first { it }
+            }
+            Log.i("ClotubePlayer", "--> LaunchedEffect surface wait completed: ep=${episode.id}, isSurfaceReady=$isSurfaceReady")
+        }
+        if (loadedEpisodeId == episode.id && (isLoading || mediaPlayer.safeCall(false) { isPlaying })) return@LaunchedEffect
+        loadedEpisodeId = episode.id
+
+        // 1. Reset per-episode playback states
+        hasTriggeredNextForEpisode = false
+        if (triggeredEpisodeId == episode.id) {
+            triggeredEpisodeId = null
+        }
+        if (savedOnExitEpisodeId == episode.id) {
+            savedOnExitEpisodeId = null
+        }
+        showFloatingNext = false
+        isFloatingNextDismissed = false
+        isLoading = true
+        activeLoadedEpisodeId = ""
+        resetUiForEpisodeCallback?.invoke(effectiveStartPositionMs, episode.durationMs)
+
+        // 2. Stop previous media cleanly on the existing MediaPlayer without detaching the landscape Surface!
+        mediaPlayer.safeCall(Unit) { setEventListener(null) }
+        mediaPlayer.safeCall(Unit) { stop() }
+
+        // 3. Resolve stream URL and start position
+        val streamUrl = withContext(Dispatchers.IO) {
+            viewModel.getStreamUrlForEpisode(episode.id)
+        }
+        if (streamUrl.isBlank()) {
+            loadedEpisodeId = null
+            isLoading = false
+            Toast.makeText(context, "Stream link resolution failed", Toast.LENGTH_SHORT).show()
+            return@LaunchedEffect
+        }
+        activeStreamUrl = streamUrl
+
+        val resumePos = if (forceExplicitStartPosition) {
+            effectiveStartPositionMs
+        } else {
+            withContext(Dispatchers.IO) {
+                if (effectiveStartPositionMs > 0L) {
+                    effectiveStartPositionMs
+                } else {
+                    viewModel.playbackHistoryManager.getResumePosition(episode.id)
+                }
             }
         }
 
         computedInitialPositionMs = resumePos
-        loadAndPlayStream(startPositionMs = resumePos)
+        resetUiForEpisodeCallback?.invoke(resumePos, episode.durationMs)
+        try {
+            loadAndPlayStream(
+                targetEpisode = episode,
+                streamUrl = streamUrl,
+                startPositionMs = resumePos
+            )
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            if (activeLoadedEpisodeId != episode.id) {
+                loadedEpisodeId = null
+            }
+            throw ce
+        }
     }
 
-    // Periodic progress saving loop
+    // Periodic progress saving loop (guarded against episode transitions)
     LaunchedEffect(episode.id, mediaPlayer) {
         while (isActive) {
             delay(4000L)
+            if (hasTriggeredNextForEpisode || activeLoadedEpisodeId != episode.id) continue
             val isPlaying = mediaPlayer.safeCall(false) { isPlaying }
-            if (isPlaying) {
-                val current = mediaPlayer.safeCall(0L) { time }
-                val total = mediaPlayer.safeCall(0L) { length }
-                if (total > 0L && current >= 3000L) {
-                    viewModel.playbackHistoryManager.saveProgress(
-                        fileId = episode.id,
-                        title = episode.displayTitle,
-                        seriesTitle = episode.seriesTitle.ifBlank { null },
-                        seasonNumber = episode.seasonNumber,
-                        episodeNumber = episode.episodeNumber,
-                        isSeries = true,
-                        seriesId = resolvedSeriesId,
-                        positionMs = current,
-                        durationMs = total,
-                        thumbnailUrl = episode.thumbnailUrl.ifBlank { null }
-                    )
-                }
+            if (!isPlaying) continue
+            val current = mediaPlayer.safeCall(0L) { time }
+            val total = mediaPlayer.safeCall(0L) { length }
+            if (hasTriggeredNextForEpisode || activeLoadedEpisodeId != episode.id) continue
+            if (total > 0L && current >= 3000L) {
+                viewModel.playbackHistoryManager.saveProgress(
+                    fileId = episode.id,
+                    title = episode.displayTitle,
+                    seriesTitle = episode.seriesTitle.ifBlank { null },
+                    seasonNumber = episode.seasonNumber,
+                    episodeNumber = episode.episodeNumber,
+                    isSeries = true,
+                    seriesId = resolvedSeriesId,
+                    positionMs = current,
+                    durationMs = total,
+                    thumbnailUrl = episode.thumbnailUrl.ifBlank { null }
+                )
             }
         }
     }
@@ -530,35 +727,58 @@ fun ClotubeVideoPlayer(
         thumbnailUrl = episode.thumbnailUrl,
         fallbackDurationMs = episode.durationMs,
         initialPositionMs = computedInitialPositionMs,
+        startPositionMs = computedInitialPositionMs,
         activeStreamUrl = activeStreamUrl,
         tokenRefreshProvider = viewModel.tokenRefreshProvider,
         modifier = modifier,
-        isInitiallyFullscreen = false,
+        isInitiallyFullscreen = resolvedIsFullscreen,
+        isFullscreen = resolvedIsFullscreen,
         audioFocusManager = audioFocusManager,
-        onPreviousEpisode = onPreviousEpisode,
-        onNextEpisode = onNextEpisode,
-        nextEpisode = nextEpisode,
-        onPlayNextEpisode = { nextEp ->
-            onNextEpisode?.invoke()
+        onPreviousEpisode = currentOnPreviousEpisodeState?.let {
+            { switchEpisodeFromControls(isNext = false) }
         },
-        onReloadMedia = { startPositionMs ->
-            loadAndPlayStream(startPositionMs, forceRefreshToken = false)
+        onNextEpisode = currentOnNextEpisodeState?.let {
+            { switchEpisodeFromControls(isNext = true) }
+        },
+        nextEpisode = nextEpisode,
+        onPlayNextEpisode = { _ ->
+            triggerNextEpisodeSafely()
+        },
+        onFullscreenChanged = onFullscreenChanged,
+        onReloadMedia = { reloadStartMs ->
+            val targetEp = currentEpisodeState
+            streamLoadJob?.cancel()
+            streamLoadJob = coroutineScope.launch {
+                val url = activeStreamUrl.ifBlank {
+                    withContext(Dispatchers.IO) { viewModel.getStreamUrlForEpisode(targetEp.id) }
+                }
+                if (url.isNotBlank()) {
+                    loadAndPlayStream(
+                        targetEpisode = targetEp,
+                        streamUrl = url,
+                        startPositionMs = reloadStartMs,
+                        forceRefreshToken = false
+                    )
+                }
+            }
         },
         onPlaybackEnded = {
-            val total = mediaPlayer.length.coerceAtLeast(1000L)
-            val next = nextEpisode ?: viewModel.getNextEpisode(resolvedSeriesId, episode.id)
-            viewModel.completeEpisode(
-                episode = episode,
-                seriesId = resolvedSeriesId,
-                totalDurationMs = total,
-                nextEpisode = next
-            )
+            triggerNextEpisodeSafely()
         },
         onSurfaceReady = {
-            isSurfaceReady = true
+            if (!isSurfaceReady) {
+                isSurfaceReady = true
+            }
+        },
+        onBindListenerAndReset = { ensureAttached, resetUi ->
+            ensureListenerAttachedCallback = ensureAttached
+            resetUiForEpisodeCallback = resetUi
         },
         onToggleFullscreen = onToggleFullscreen,
-        onNavigateBack = onClosePlayer
+        onNavigateBack = {
+            saveEpisodeProgressIfNeeded(currentEpisodeState, currentResolvedSeriesId)
+            onClosePlayer()
+        }
     )
 }
 
@@ -589,7 +809,8 @@ fun ClotubeVideoPlayer(
     onPlayerCreated: ((MediaPlayer) -> Unit)? = null,
     onSurfaceReady: (() -> Unit)? = null,
     onToggleFullscreen: (() -> Unit)? = null,
-    onNavigateBack: () -> Unit
+    onNavigateBack: () -> Unit,
+    onBindListenerAndReset: ((ensureAttached: () -> Unit, resetUi: (Long, Long) -> Unit) -> Unit)? = null
 ) {
     val context = LocalContext.current
     LaunchedEffect(mediaPlayer) {
@@ -681,30 +902,39 @@ fun ClotubeVideoPlayer(
         effectiveAudioFocusManager.abandonAudioFocus()
     }
 
-    DisposableEffect(mediaId) {
+    DisposableEffect(effectiveAudioFocusManager) {
         onDispose {
             effectiveAudioFocusManager.cancelPendingResume()
             abandonPlaybackAudioFocus()
         }
     }
 
-    var userIntendedToPlay by remember(mediaId) { mutableStateOf(true) }
+    val currentMediaId by rememberUpdatedState(mediaId)
+    val currentFallbackDurationMs by rememberUpdatedState(fallbackDurationMs)
+    val currentOnNextEpisode by rememberUpdatedState(onNextEpisode)
+    val currentOnPreviousEpisode by rememberUpdatedState(onPreviousEpisode)
+    val currentOnPlaybackEnded by rememberUpdatedState(onPlaybackEnded)
+    val currentOnReloadMedia by rememberUpdatedState(onReloadMedia)
+    val currentOnSurfaceReady by rememberUpdatedState(onSurfaceReady)
+    val currentOnIsPlayingChanged by rememberUpdatedState(onIsPlayingChanged)
+
+    var userIntendedToPlay by remember(mediaPlayer) { mutableStateOf(true) }
     var queueDebouncedSeekRef by remember { mutableStateOf<((Long) -> Unit)?>(null) }
     var handlePlayPauseToggleRef by remember { mutableStateOf<(() -> Unit)?>(null) }
 
-    val sessionManager = remember(mediaId, onNextEpisode, onPreviousEpisode, mediaPlayer) {
+    val sessionManager = remember(mediaPlayer) {
         ClotubeMediaSessionManager(
             context = context,
             actionPlayPauseToggle = {
                 handlePlayPauseToggleRef?.invoke() ?: run {
                     mediaPlayer.let { player ->
-                        if (player.isPlaying) {
+                        if (player.safeCall(false) { isPlaying }) {
                             userIntendedToPlay = false
-                            try { player.pause() } catch (_: Exception) {}
+                            player.safeCall(Unit) { pause() }
                         } else {
                             userIntendedToPlay = true
                             requestPlaybackAudioFocus()
-                            try { player.play() } catch (_: Exception) {}
+                            player.safeCall(Unit) { play() }
                         }
                     }
                 }
@@ -712,34 +942,36 @@ fun ClotubeVideoPlayer(
             actionPlay = {
                 mediaPlayer.let { player ->
                     userIntendedToPlay = true
-                    if (!player.isPlaying) {
+                    if (!player.safeCall(false) { isPlaying }) {
                         requestPlaybackAudioFocus()
-                        try { player.play() } catch (_: Exception) {}
+                        player.safeCall(Unit) { play() }
                     }
                 }
             },
             actionPause = {
                 mediaPlayer.let { player ->
                     userIntendedToPlay = false
-                    if (player.isPlaying) {
-                        try { player.pause() } catch (_: Exception) {}
+                    if (player.safeCall(false) { isPlaying }) {
+                        player.safeCall(Unit) { pause() }
                     }
                 }
             },
-            actionNext = onNextEpisode,
-            actionPrevious = onPreviousEpisode,
+            actionNext = { currentOnNextEpisode?.invoke() },
+            actionPrevious = { currentOnPreviousEpisode?.invoke() },
             actionFastForward = {
                 queueDebouncedSeekRef?.invoke(10_000L) ?: run {
                     mediaPlayer.let { player ->
-                        val maxLen = if (player.length > 0) player.length else Long.MAX_VALUE
-                        player.time = (player.time + 10_000L).coerceAtMost(maxLen)
+                        val maxLen = player.safeCall(0L) { length }.let { if (it > 0L) it else Long.MAX_VALUE }
+                        val cur = player.safeCall(0L) { time }
+                        player.safeCall(Unit) { time = (cur + 10_000L).coerceAtMost(maxLen) }
                     }
                 }
             },
             actionRewind = {
                 queueDebouncedSeekRef?.invoke(-10_000L) ?: run {
                     mediaPlayer.let { player ->
-                        player.time = (player.time - 10_000L).coerceAtLeast(0L)
+                        val cur = player.safeCall(0L) { time }
+                        player.safeCall(Unit) { time = (cur - 10_000L).coerceAtLeast(0L) }
                     }
                 }
             }
@@ -771,55 +1003,57 @@ fun ClotubeVideoPlayer(
     }
     val currentFullscreen = if (onFullscreenChanged != null) isFullscreen else internalFullscreen
     var areControlsVisible by remember { mutableStateOf(true) }
-    var isPlaying by remember { mutableStateOf(mediaPlayer.isPlaying) }
-    var isBuffering by remember { mutableStateOf(true) }
-    var isSeeking by remember { mutableStateOf(false) }
-    var accumulatedSeekTargetMs by remember { mutableLongStateOf(-1L) }
+    var isPlaying by remember(mediaPlayer) { mutableStateOf(mediaPlayer.safeCall(false) { isPlaying }) }
+    var isBuffering by remember(mediaPlayer) { mutableStateOf(true) }
+    var isSeeking by remember(mediaPlayer) { mutableStateOf(false) }
+    var accumulatedSeekTargetMs by remember(mediaPlayer) { mutableLongStateOf(-1L) }
     var seekDebounceJob by remember { mutableStateOf<Job?>(null) }
     var seekWatchdogJob by remember { mutableStateOf<Job?>(null) }
-    var hasEnded by remember(mediaId) { mutableStateOf(false) }
-    var isFirstFrameRendered by remember(mediaId) { mutableStateOf(false) }
+    var hasEnded by remember(mediaPlayer) { mutableStateOf(false) }
+    var isFirstFrameRendered by remember(mediaPlayer) { mutableStateOf(false) }
     var vlcVideoLayoutRef by remember { mutableStateOf<VLCVideoLayout?>(null) }
     var isViewsAttached by remember { mutableStateOf(false) }
     var autoHideJob by remember { mutableStateOf<Job?>(null) }
 
     val effectiveStartPositionMs = if (startPositionMs > 0L) startPositionMs else initialPositionMs
+    var lastObservedMediaId by remember(mediaPlayer) { mutableStateOf(mediaId) }
+    val isTransitioningToNewMedia = (lastObservedMediaId != mediaId)
 
     // Dynamic Network Handover, 8s Buffer Underrun Stall Watchdog & State
-    var lastValidPositionMs by remember(mediaId) {
-        val curTime = mediaPlayer.time
+    var lastValidPositionMs by remember(mediaPlayer) {
+        val curTime = mediaPlayer.safeCall(0L) { time }
         mutableLongStateOf(if (curTime > 0L) curTime else effectiveStartPositionMs)
     }
-    var currentPositionMs by remember(mediaId) {
-        val curTime = mediaPlayer.time
+    var currentPositionMs by remember(mediaPlayer) {
+        val curTime = mediaPlayer.safeCall(0L) { time }
         mutableLongStateOf(if (curTime > 0L) curTime else effectiveStartPositionMs)
     }
-    var durationMs by remember(mediaId) {
-        val len = mediaPlayer.length
+    var durationMs by remember(mediaPlayer) {
+        val len = mediaPlayer.safeCall(0L) { length }
         mutableLongStateOf(if (len > 0L) len else fallbackDurationMs)
     }
-    var isPlaybackEnded by remember(mediaId) { mutableStateOf(false) }
-    var hasStartedOnce by remember(mediaId) { mutableStateOf(false) }
+    var isPlaybackEnded by remember(mediaPlayer) { mutableStateOf(false) }
+    var hasStartedOnce by remember(mediaPlayer) { mutableStateOf(false) }
     var isReconnecting by remember { mutableStateOf(false) }
     var pendingReloadOnReconnect by remember { mutableStateOf(false) }
     var stallWatchdogJob by remember { mutableStateOf<Job?>(null) }
-    var stallRetryCount by remember(mediaId) { mutableIntStateOf(0) }
+    var stallRetryCount by remember(mediaPlayer) { mutableIntStateOf(0) }
 
-    var currentActiveStreamUrl by remember(mediaId, activeStreamUrl) {
+    var currentActiveStreamUrl by remember(mediaPlayer) {
         mutableStateOf(activeStreamUrl)
     }
-    var currentAccessToken by remember(mediaId) { mutableStateOf("") }
-    var lastTokenRefreshTimeMs by remember(mediaId) {
+    var currentAccessToken by remember(mediaPlayer) { mutableStateOf("") }
+    var lastTokenRefreshTimeMs by remember(mediaPlayer) {
         mutableLongStateOf(System.currentTimeMillis())
     }
-    var proactiveTokenRotationJob by remember(mediaId) {
+    var proactiveTokenRotationJob by remember(mediaPlayer) {
         mutableStateOf<Job?>(null)
     }
 
-    var userSelectedAudioTrackId by remember(mediaId) { mutableStateOf<Int?>(null) }
-    var userSelectedSpuTrackId by remember(mediaId) { mutableStateOf<Int?>(null) }
-    var currentSpuTrackId by remember(mediaId) { mutableIntStateOf(-1) }
-    var currentAudioTrackId by remember(mediaId) { mutableIntStateOf(-1) }
+    var userSelectedAudioTrackId by remember(mediaPlayer) { mutableStateOf<Int?>(null) }
+    var userSelectedSpuTrackId by remember(mediaPlayer) { mutableStateOf<Int?>(null) }
+    var currentSpuTrackId by remember(mediaPlayer) { mutableIntStateOf(-1) }
+    var currentAudioTrackId by remember(mediaPlayer) { mutableIntStateOf(-1) }
 
     // Update cached tracks safely when playing starts
     LaunchedEffect(mediaId, isBuffering) {
@@ -829,9 +1063,9 @@ fun ClotubeVideoPlayer(
         }
     }
 
-    var userSelectedPlaybackSpeed by remember(mediaId) { mutableFloatStateOf(mediaPlayer.rate.takeIf { it > 0f } ?: 1.0f) }
-    var currentSpeed by remember(mediaId) { mutableFloatStateOf(mediaPlayer.rate.takeIf { it > 0f } ?: 1.0f) }
-    var pendingTrackRestore by remember(mediaId) { mutableStateOf(false) }
+    var userSelectedPlaybackSpeed by remember(mediaPlayer) { mutableFloatStateOf(mediaPlayer.safeCall(1.0f) { rate }.takeIf { it > 0f } ?: 1.0f) }
+    var currentSpeed by remember(mediaPlayer) { mutableFloatStateOf(mediaPlayer.safeCall(1.0f) { rate }.takeIf { it > 0f } ?: 1.0f) }
+    var pendingTrackRestore by remember(mediaPlayer) { mutableStateOf(false) }
 
     fun restoreTracksIfNeeded(player: MediaPlayer) {
         if (!pendingTrackRestore) return
@@ -930,7 +1164,7 @@ fun ClotubeVideoPlayer(
                     if (!freshToken.isNullOrBlank()) {
                         currentAccessToken = freshToken
                         lastTokenRefreshTimeMs = System.currentTimeMillis()
-                        val newUrl = effectiveTokenRefreshProvider.buildAuthenticatedStreamUrl(mediaId, freshToken)
+                        val newUrl = effectiveTokenRefreshProvider.buildAuthenticatedStreamUrl(currentMediaId, freshToken)
                         currentActiveStreamUrl = newUrl
                         Log.i("ClotubePlayer", "Successfully refreshed token reactive in softReloadStream")
                     }
@@ -949,30 +1183,33 @@ fun ClotubeVideoPlayer(
                 }
                 pendingTrackRestore = true
 
-                if (onReloadMedia != null) {
-                    onReloadMedia.invoke(resumeMs)
+                val reloadCallback = currentOnReloadMedia
+                if (reloadCallback != null) {
+                    reloadCallback.invoke(resumeMs)
                     if (!userIntendedToPlay) {
-                        try { mediaPlayer.pause() } catch (_: Exception) {}
+                        mediaPlayer.safeCall(Unit) { pause() }
                     }
                     isReconnecting = false
                 } else {
                     val downloadRepo = com.clotube.app.data.DownloadRepository(context)
-                    val localFile = downloadRepo.getLocalFileIfDownloaded(mediaId)
+                    val localFile = downloadRepo.getLocalFileIfDownloaded(currentMediaId)
                     if (localFile != null && localFile.exists()) {
-                        mediaPlayer.stop()
-                        val media = Media(mediaPlayer.libVLC, Uri.fromFile(localFile)).apply {
-                            addOption(":file-caching=1500")
-                            applyClotubeMediaOptions(resumeSec)
-                            setHWDecoderEnabled(true, false)
+                        mediaPlayer.safeCall(Unit) { stop() }
+                        val media = Media(mediaPlayer.libVLC, Uri.fromFile(localFile))
+                        try {
+                            media.addOption(":file-caching=1500")
+                            media.applyClotubeMediaOptions(resumeSec)
+                            media.setHWDecoderEnabled(true, false)
+                            mediaPlayer.safeCall(Unit) { this.media = media }
+                        } finally {
+                            try { media.release() } catch (_: Throwable) {}
                         }
-                        mediaPlayer.media = media
-                        media.release()
 
                         if (userIntendedToPlay && isScreenVisible()) {
                             requestPlaybackAudioFocus()
-                            mediaPlayer.play()
+                            mediaPlayer.safeCall(Unit) { play() }
                         } else {
-                            mediaPlayer.pause()
+                            mediaPlayer.safeCall(Unit) { pause() }
                         }
                     } else {
                         val streamUrl = currentActiveStreamUrl.ifBlank {
@@ -981,23 +1218,25 @@ fun ClotubeVideoPlayer(
                             }
                         }
                         if (streamUrl.isNotBlank()) {
-                            mediaPlayer.stop()
-                            val media = Media(mediaPlayer.libVLC, Uri.parse(streamUrl)).apply {
-                                addOption(":network-caching=1500")
+                            mediaPlayer.safeCall(Unit) { stop() }
+                            val media = Media(mediaPlayer.libVLC, Uri.parse(streamUrl))
+                            try {
+                                media.addOption(":network-caching=1500")
                                 if (currentAccessToken.isNotBlank()) {
-                                    addOption(":http-header=Authorization: Bearer $currentAccessToken")
+                                    media.addOption(":http-header=Authorization: Bearer $currentAccessToken")
                                 }
-                                applyClotubeMediaOptions(resumeSec)
-                                setHWDecoderEnabled(true, false)
+                                media.applyClotubeMediaOptions(resumeSec)
+                                media.setHWDecoderEnabled(true, false)
+                                mediaPlayer.safeCall(Unit) { this.media = media }
+                            } finally {
+                                try { media.release() } catch (_: Throwable) {}
                             }
-                            mediaPlayer.media = media
-                            media.release()
 
                             if (userIntendedToPlay && isScreenVisible()) {
                                 requestPlaybackAudioFocus()
-                                mediaPlayer.play()
+                                mediaPlayer.safeCall(Unit) { play() }
                             } else {
-                                mediaPlayer.pause()
+                                mediaPlayer.safeCall(Unit) { pause() }
                             }
                         }
                     }
@@ -1154,43 +1393,12 @@ fun ClotubeVideoPlayer(
         if (isPlaying) {
             requestPlaybackAudioFocus()
         }
-        val pos = try { if (!mediaPlayer.isReleased) mediaPlayer.time else currentPositionMs } catch (_: Throwable) { currentPositionMs }
+        val pos = mediaPlayer.safeCall(currentPositionMs) { time }
         sessionManager.updatePlaybackState(isPlaying = isPlaying, currentPositionMs = pos)
-        onIsPlayingChanged?.invoke(isPlaying)
+        currentOnIsPlayingChanged?.invoke(isPlaying)
     }
 
-    // Reset loading state whenever mediaId changes
-    LaunchedEffect(mediaId) {
-        isBuffering = true
-        isSeeking = false
-        accumulatedSeekTargetMs = -1L
-        seekDebounceJob?.cancel()
-        seekDebounceJob = null
-        seekWatchdogJob?.cancel()
-        seekWatchdogJob = null
-        isPlaybackEnded = false
-        hasStartedOnce = false
-        isFirstFrameRendered = false
-        userIntendedToPlay = true
-        pendingReloadOnReconnect = false
-        lastTokenRefreshTimeMs = System.currentTimeMillis()
-        userSelectedAudioTrackId = null
-        userSelectedSpuTrackId = null
-        currentSpuTrackId = -1
-        currentAudioTrackId = -1
-        pendingTrackRestore = false
-        stallWatchdogJob?.cancel()
-        stallWatchdogJob = null
-        stallRetryCount = 0
-        val len = mediaPlayer.length
-        durationMs = if (len > 0L) len else fallbackDurationMs
-        if (currentPositionMs == 0L && initialPositionMs > 0L) {
-            currentPositionMs = initialPositionMs
-            lastValidPositionMs = initialPositionMs
-        } else if (currentPositionMs > 0L) {
-            lastValidPositionMs = currentPositionMs
-        }
-    }
+    var isFloatingNextDismissed by remember(mediaPlayer) { mutableStateOf(false) }
 
     // Measured track width for pixel-perfect thumb and preview alignment
     var trackWidthPx by remember { mutableFloatStateOf(0f) }
@@ -1199,79 +1407,39 @@ fun ClotubeVideoPlayer(
     var isDragging by remember { mutableStateOf(false) }
     var dragFraction by remember { mutableFloatStateOf(0f) }
 
-    val effectiveCurrentPositionMs = if (accumulatedSeekTargetMs >= 0L) accumulatedSeekTargetMs else currentPositionMs
-
-    val actualFraction = if (durationMs > 0L) {
-        (effectiveCurrentPositionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
-    } else 0f
-
-    val displayFraction = if (isDragging) dragFraction else actualFraction
-    val displayedCurrentTimeMs = if (isDragging) {
-        (dragFraction * durationMs).toLong()
-    } else {
-        effectiveCurrentPositionMs
+    val resetUiState: (Long, Long) -> Unit = { posMs, durMs ->
+        isBuffering = true
+        isPlaying = false
+        isSeeking = false
+        isDragging = false
+        accumulatedSeekTargetMs = -1L
+        seekDebounceJob?.cancel()
+        seekDebounceJob = null
+        seekWatchdogJob?.cancel()
+        seekWatchdogJob = null
+        stallWatchdogJob?.cancel()
+        stallWatchdogJob = null
+        stallRetryCount = 0
+        isPlaybackEnded = false
+        hasEnded = false
+        hasStartedOnce = false
+        isFirstFrameRendered = false
+        userIntendedToPlay = true
+        pendingReloadOnReconnect = false
+        isFloatingNextDismissed = false
+        currentPositionMs = posMs.coerceAtLeast(0L)
+        lastValidPositionMs = posMs.coerceAtLeast(0L)
+        durationMs = durMs.coerceAtLeast(0L)
     }
 
-    val isScrubbing = isDragging
-    val scrubFraction = dragFraction
-    val activeFraction = displayFraction
-    val displayPositionMs = displayedCurrentTimeMs
-
-    // Floating Next Episode Dismissal
-    var isFloatingNextDismissed by remember { mutableStateOf(false) }
-    LaunchedEffect(title) { isFloatingNextDismissed = false }
-
-    // Volume & Brightness Gesture States with Continuous Float Accumulators
-    val maxVolume = remember { audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1) }
-    var currentVolumeInt by remember { mutableIntStateOf(audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)) }
-    var volumeAccumulator by remember { mutableFloatStateOf(currentVolumeInt.toFloat()) }
-
-    val initialBrightness = remember {
-        val wb = activity?.window?.attributes?.screenBrightness ?: -1f
-        if (wb >= 0f) wb else {
-            val sys = try {
-                Settings.System.getInt(context.contentResolver, Settings.System.SCREEN_BRIGHTNESS)
-            } catch (e: Exception) { 128 }
-            (sys / 255f).coerceIn(0.1f, 1.0f)
-        }
-    }
-    var currentBrightness by remember { mutableFloatStateOf(initialBrightness) }
-    var brightnessAccumulator by remember { mutableFloatStateOf(initialBrightness) }
-
-    var showGestureOverlay by remember { mutableStateOf(false) }
-    var activeGestureMode by remember { mutableStateOf<PlayerGestureMode?>(null) }
-    var lastLockedGestureMode by remember { mutableStateOf(PlayerGestureMode.BRIGHTNESS) }
-    var gestureIndicatorFraction by remember { mutableFloatStateOf(0f) }
-    var dismissGestureJob by remember { mutableStateOf<Job?>(null) }
-
-    fun scheduleGestureDismiss() {
-        dismissGestureJob?.cancel()
-        dismissGestureJob = coroutineScope.launch {
-            delay(1200)
-            showGestureOverlay = false
-            delay(350) // Wait for AnimatedVisibility exit transition to completely finish
-            activeGestureMode = null // Safe to reset identity only after overlay is completely invisible
-        }
-    }
-
-    // Dialogs & Overlays
-    var showSpeedDialog by remember { mutableStateOf(false) }
-    var showSubtitleDialog by remember { mutableStateOf(false) }
-    var showAudioTrackDialog by remember { mutableStateOf(false) }
-    var showStatsOverlay by remember { mutableStateOf(false) }
-
-    // Synchronize LibVLC Events (Handling Buffering & Opening)
-    DisposableEffect(mediaPlayer, mediaId) {
-        networkMonitor.register()
-
-        val listener = MediaPlayer.EventListener { event ->
+    // Synchronize LibVLC Events across episode transitions (never detachViews on mediaId change)
+    val playerEventListener = remember(mediaPlayer) {
+        MediaPlayer.EventListener { event ->
             when (event.type) {
                 MediaPlayer.Event.Opening -> {
                     isBuffering = true
                     if (!isScreenVisible()) {
-                        try {
-                            mediaPlayer.pause()
-                        } catch (_: Exception) {}
+                        mediaPlayer.safeCall(Unit) { pause() }
                         isPlaying = false
                     }
                 }
@@ -1299,16 +1467,15 @@ fun ClotubeVideoPlayer(
                             seekWatchdogJob?.cancel()
                         }
                         if (!isScreenVisible()) {
-                            try {
-                                mediaPlayer.pause()
-                            } catch (_: Exception) {}
+                            mediaPlayer.safeCall(Unit) { pause() }
                             isPlaying = false
                         } else {
                             // If the player stalled or paused during initial buffering, ensure it starts playing
-                            if (userIntendedToPlay && !mediaPlayer.isPlaying) {
+                            val currentlyPlaying = mediaPlayer.safeCall(false) { isPlaying }
+                            if (userIntendedToPlay && !currentlyPlaying) {
                                 requestPlaybackAudioFocus()
-                                mediaPlayer.play()
-                            } else if (mediaPlayer.isPlaying) {
+                                mediaPlayer.safeCall(Unit) { play() }
+                            } else if (currentlyPlaying) {
                                 hasStartedOnce = true
                                 isFirstFrameRendered = true
                             }
@@ -1340,6 +1507,18 @@ fun ClotubeVideoPlayer(
                             lastValidPositionMs = curPos
                         }
                         sessionManager.updatePlaybackState(isPlaying = true, currentPositionMs = curPos)
+                        if (!isViewsAttached) {
+                            vlcVideoLayoutRef?.let { layout ->
+                                if (layout.width > 0 && layout.height > 0) {
+                                    mediaPlayer.safeCall(Unit) {
+                                        attachViews(layout, null, false, true)
+                                        videoScale = MediaPlayer.ScaleType.SURFACE_BEST_FIT
+                                        aspectRatio = "16:9"
+                                    }
+                                    isViewsAttached = true
+                                }
+                            }
+                        }
                         mediaPlayer.safeCall(Unit) { updateVideoSurfaces() }
                         currentSpuTrackId = mediaPlayer.safeSpuTrack
                         currentAudioTrackId = mediaPlayer.safeAudioTrack
@@ -1397,11 +1576,24 @@ fun ClotubeVideoPlayer(
                 }
                 MediaPlayer.Event.EndReached,
                 MediaPlayer.Event.EncounteredError -> {
-                    val totalDur = if (durationMs > 0L) durationMs else (if (mediaPlayer.length > 0L) mediaPlayer.length else fallbackDurationMs)
+                    val playerLen = mediaPlayer.safeCall(0L) { length }
+                    val totalDur = if (durationMs > 0L) durationMs else if (playerLen > 0L) playerLen else currentFallbackDurationMs
                     val isPrematureEof = totalDur > 0L && lastValidPositionMs > 0L && lastValidPositionMs < (totalDur - 15_000L)
-                    Log.d("ClotubePlayer", "Event ${if (event.type == MediaPlayer.Event.EndReached) "EndReached" else "EncounteredError"}, totalDur=$totalDur, lastValidPositionMs=$lastValidPositionMs, isPrematureEof=$isPrematureEof")
+                    Log.d("ClotubePlayer", "Event ${if (event.type == MediaPlayer.Event.EndReached) "EndReached" else "EncounteredError"} for $currentMediaId, totalDur=$totalDur, lastValidPositionMs=$lastValidPositionMs, isPrematureEof=$isPrematureEof, hasStartedOnce=$hasStartedOnce")
 
-                    if (isPrematureEof) {
+                    if (event.type == MediaPlayer.Event.EncounteredError && !hasStartedOnce && !isFirstFrameRendered) {
+                        // Stream failed before rendering first frame; never mark episode as watched
+                        stallWatchdogJob?.cancel()
+                        stallWatchdogJob = null
+                        isPlaying = false
+                        isPlaybackEnded = false
+                        if (networkMonitor.isConnected && stallRetryCount < 1) {
+                            stallRetryCount++
+                            softReloadStream(forceTokenRefresh = true)
+                        } else {
+                            isBuffering = false
+                        }
+                    } else if (isPrematureEof) {
                         // Premature EOF guard: stream dropped prematurely due to socket reset
                         stallWatchdogJob?.cancel()
                         stallWatchdogJob = null
@@ -1425,15 +1617,103 @@ fun ClotubeVideoPlayer(
                         seekWatchdogJob?.cancel()
                         seekWatchdogJob = null
                         isPlaybackEnded = true
+                        hasEnded = true
                         val endPos = mediaPlayer.safeCall(currentPositionMs) { time }
                         sessionManager.updatePlaybackState(isPlaying = false, currentPositionMs = endPos)
-                        onPlaybackEnded?.invoke()
+                        currentOnPlaybackEnded?.invoke()
                     }
                 }
             }
         }
+    }
+
+    LaunchedEffect(mediaPlayer, onBindListenerAndReset) {
+        onBindListenerAndReset?.invoke(
+            { mediaPlayer.safeCall(Unit) { setEventListener(playerEventListener) } },
+            resetUiState
+        )
+    }
+
+    // Reset loading state and re-attach event listener whenever mediaId changes
+    LaunchedEffect(mediaPlayer, mediaId) {
+        lastObservedMediaId = mediaId
+        resetUiState(effectiveStartPositionMs, fallbackDurationMs)
+        lastTokenRefreshTimeMs = System.currentTimeMillis()
+        userSelectedAudioTrackId = null
+        userSelectedSpuTrackId = null
+        currentSpuTrackId = -1
+        currentAudioTrackId = -1
+        pendingTrackRestore = false
+        currentActiveStreamUrl = activeStreamUrl
+        mediaPlayer.safeCall(Unit) { setEventListener(playerEventListener) }
+    }
+
+    val safeCurrentPositionMs = if (isTransitioningToNewMedia) effectiveStartPositionMs else currentPositionMs
+    val safeDurationMs = if (isTransitioningToNewMedia) fallbackDurationMs else durationMs
+    val effectiveCurrentPositionMs = if (accumulatedSeekTargetMs >= 0L) accumulatedSeekTargetMs else safeCurrentPositionMs
+
+    val actualFraction = if (safeDurationMs > 0L) {
+        (effectiveCurrentPositionMs.toFloat() / safeDurationMs.toFloat()).coerceIn(0f, 1f)
+    } else 0f
+
+    val displayFraction = if (isDragging) dragFraction else actualFraction
+    val displayedCurrentTimeMs = if (isDragging) {
+        (dragFraction * safeDurationMs).toLong()
+    } else {
+        effectiveCurrentPositionMs
+    }
+
+    val isScrubbing = isDragging
+    val scrubFraction = dragFraction
+    val activeFraction = displayFraction
+    val displayPositionMs = displayedCurrentTimeMs
+
+    LaunchedEffect(title) { isFloatingNextDismissed = false }
+
+    // Volume & Brightness Gesture States with Continuous Float Accumulators
+    val maxVolume = remember { audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1) }
+    var currentVolumeInt by remember { mutableIntStateOf(audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)) }
+    var volumeAccumulator by remember { mutableFloatStateOf(currentVolumeInt.toFloat()) }
+
+    val initialBrightness = remember {
+        val wb = activity?.window?.attributes?.screenBrightness ?: -1f
+        if (wb >= 0f) wb else {
+            val sys = try {
+                Settings.System.getInt(context.contentResolver, Settings.System.SCREEN_BRIGHTNESS)
+            } catch (e: Exception) { 128 }
+            (sys / 255f).coerceIn(0.1f, 1.0f)
+        }
+    }
+    var currentBrightness by remember { mutableFloatStateOf(initialBrightness) }
+    var brightnessAccumulator by remember { mutableFloatStateOf(initialBrightness) }
+
+    var showGestureOverlay by remember { mutableStateOf(false) }
+    var activeGestureMode by remember { mutableStateOf<PlayerGestureMode?>(null) }
+    var lastLockedGestureMode by remember { mutableStateOf(PlayerGestureMode.BRIGHTNESS) }
+    var gestureIndicatorFraction by remember { mutableFloatStateOf(0f) }
+    var dismissGestureJob by remember { mutableStateOf<Job?>(null) }
+
+    fun scheduleGestureDismiss() {
+        dismissGestureJob?.cancel()
+        dismissGestureJob = coroutineScope.launch {
+            delay(1200)
+            showGestureOverlay = false
+            delay(350) // Wait for AnimatedVisibility exit transition to completely finish
+            activeGestureMode = null // Safe to reset identity only after overlay is completely invisible
+        }
+    }
+
+    // Dialogs & Overlays
+    var showSpeedDialog by remember { mutableStateOf(false) }
+    var showSubtitleDialog by remember { mutableStateOf(false) }
+    var showAudioTrackDialog by remember { mutableStateOf(false) }
+    var showStatsOverlay by remember { mutableStateOf(false) }
+
+    // Synchronize LibVLC Events (session-scoped to mediaPlayer so episode switches never detach Surface)
+    DisposableEffect(mediaPlayer) {
+        networkMonitor.register()
         mediaPlayer.safeCall(Unit) {
-            setEventListener(listener)
+            setEventListener(playerEventListener)
         }
         onDispose {
             isPlayerDisposed = true
@@ -1481,22 +1761,24 @@ fun ClotubeVideoPlayer(
     LaunchedEffect(mediaPlayer, isDragging, accumulatedSeekTargetMs) {
         while (isActive) {
             delay(250)
-            if (!isDragging && accumulatedSeekTargetMs < 0L && !isSeeking) {
-                val currentTime = mediaPlayer.safeCall(0L) { time.coerceAtLeast(0L) }
-                if (currentTime > 0L) {
-                    currentPositionMs = currentTime
-                    lastValidPositionMs = maxOf(lastValidPositionMs, currentTime)
-                }
-                val len = mediaPlayer.safeCall(0L) { length }
-                if (len > 0L) durationMs = len
+            if (!isTransitioningToNewMedia && !isDragging && accumulatedSeekTargetMs < 0L && !isSeeking) {
                 val isPlayingNow = mediaPlayer.safeCall(false) { isPlaying }
-                if (isPlayingNow && currentTime > 0L) {
-                    // Failsafe: if video is actively playing frames, dismiss loading spinner & placeholder immediately
-                    isFirstFrameRendered = true
-                    isBuffering = false
-                    stallWatchdogJob?.cancel()
-                    stallWatchdogJob = null
-                    stallRetryCount = 0
+                if (!isBuffering || isPlayingNow) {
+                    val currentTime = mediaPlayer.safeCall(0L) { time.coerceAtLeast(0L) }
+                    if (currentTime > 0L) {
+                        currentPositionMs = currentTime
+                        lastValidPositionMs = maxOf(lastValidPositionMs, currentTime)
+                    }
+                    val len = mediaPlayer.safeCall(0L) { length }
+                    if (len > 0L) durationMs = len
+                    if (isPlayingNow && currentTime > 0L) {
+                        // Failsafe: if video is actively playing frames, dismiss loading spinner & placeholder immediately
+                        isFirstFrameRendered = true
+                        isBuffering = false
+                        stallWatchdogJob?.cancel()
+                        stallWatchdogJob = null
+                        stallRetryCount = 0
+                    }
                 }
             }
         }
@@ -1795,6 +2077,22 @@ fun ClotubeVideoPlayer(
                     )
                     vlcVideoLayoutRef = this
 
+                    if (!isViewsAttached) {
+                        try {
+                            mediaPlayer.detachViews()
+                        } catch (_: Exception) {}
+                        try {
+                            mediaPlayer.attachViews(this, null, false, true)
+                            mediaPlayer.videoScale = MediaPlayer.ScaleType.SURFACE_BEST_FIT
+                            mediaPlayer.aspectRatio = "16:9"
+                            if (width > 0 && height > 0) {
+                                mediaPlayer.updateVideoSurfaces()
+                            }
+                            isViewsAttached = true
+                        } catch (_: Exception) {}
+                    }
+                    onSurfaceReady?.invoke()
+
                     // Attach LibVLC strictly when the AndroidView has finished measuring non-zero dimensions
                     val layoutListener = View.OnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
                         val newWidth = right - left
@@ -1803,6 +2101,7 @@ fun ClotubeVideoPlayer(
                         val oldHeight = oldBottom - oldTop
 
                         if (newWidth > 0 && newHeight > 0) {
+                            onSurfaceReady?.invoke()
                             if (!isViewsAttached) {
                                 try {
                                     mediaPlayer.detachViews()
@@ -1813,7 +2112,6 @@ fun ClotubeVideoPlayer(
                                     mediaPlayer.aspectRatio = "16:9"
                                     mediaPlayer.updateVideoSurfaces()
                                     isViewsAttached = true
-                                    onSurfaceReady?.invoke()
                                     val currentPos = mediaPlayer.time
                                     if (currentPos > 0L) {
                                         mediaPlayer.time = currentPos
@@ -1822,7 +2120,6 @@ fun ClotubeVideoPlayer(
                             } else if (newWidth != oldWidth || newHeight != oldHeight) {
                                 try {
                                     mediaPlayer.updateVideoSurfaces()
-                                    onSurfaceReady?.invoke()
                                 } catch (_: Exception) {}
                             }
                         }
@@ -1830,58 +2127,33 @@ fun ClotubeVideoPlayer(
                     addOnLayoutChangeListener(layoutListener)
 
                     post {
-                        if (!isViewsAttached && width > 0 && height > 0) {
-                            try {
-                                mediaPlayer.detachViews()
-                            } catch (_: Exception) {}
-                            try {
-                                mediaPlayer.attachViews(this, null, false, true)
-                                mediaPlayer.videoScale = MediaPlayer.ScaleType.SURFACE_BEST_FIT
-                                mediaPlayer.aspectRatio = "16:9"
-                                mediaPlayer.updateVideoSurfaces()
-                                isViewsAttached = true
-                                onSurfaceReady?.invoke()
-                                val currentPos = mediaPlayer.time
-                                if (currentPos > 0L) {
-                                    mediaPlayer.time = currentPos
-                                }
-                            } catch (_: Exception) {}
-                        } else if (isViewsAttached && width > 0 && height > 0) {
-                            try {
-                                mediaPlayer.updateVideoSurfaces()
-                                onSurfaceReady?.invoke()
-                            } catch (_: Exception) {}
-                        }
-                    }
-                }
-            },
-            update = { layout ->
-                vlcVideoLayoutRef = layout
-                mediaPlayer.safeCall(Unit) {
-                    if (!isViewsAttached && layout.width > 0 && layout.height > 0) {
-                        try { detachViews() } catch (_: Throwable) {}
-                        try {
-                            attachViews(layout, null, false, true)
-                            videoScale = MediaPlayer.ScaleType.SURFACE_BEST_FIT
-                            aspectRatio = "16:9"
-                            updateVideoSurfaces()
-                            isViewsAttached = true
-                            onSurfaceReady?.invoke()
-                            val currentPos = time
-                            if (currentPos > 0L) {
-                                time = currentPos
+                        if (width > 0 && height > 0) {
+                            if (!isViewsAttached) {
+                                try {
+                                    mediaPlayer.detachViews()
+                                } catch (_: Exception) {}
+                                try {
+                                    mediaPlayer.attachViews(this, null, false, true)
+                                    mediaPlayer.videoScale = MediaPlayer.ScaleType.SURFACE_BEST_FIT
+                                    mediaPlayer.aspectRatio = "16:9"
+                                    mediaPlayer.updateVideoSurfaces()
+                                    isViewsAttached = true
+                                    val currentPos = mediaPlayer.time
+                                    if (currentPos > 0L) {
+                                        mediaPlayer.time = currentPos
+                                    }
+                                } catch (_: Exception) {}
+                            } else {
+                                try {
+                                    mediaPlayer.updateVideoSurfaces()
+                                } catch (_: Exception) {}
                             }
-                        } catch (_: Throwable) {}
-                    } else if (isViewsAttached && layout.width > 0 && layout.height > 0) {
-                        try {
-                            updateVideoSurfaces()
-                            onSurfaceReady?.invoke()
-                        } catch (_: Throwable) {}
+                        }
+                        onSurfaceReady?.invoke()
                     }
-                    videoScale = MediaPlayer.ScaleType.SURFACE_BEST_FIT
-                    aspectRatio = "16:9"
                 }
             },
+            update = {},
             onReset = { layout ->
                 if (isViewsAttached) {
                     mediaPlayer.safeCall(Unit) { detachViews() }
@@ -1996,18 +2268,23 @@ fun ClotubeVideoPlayer(
                     }
             ) {
                 // Top Action Bar
-                val isPortrait = configuration.orientation == Configuration.ORIENTATION_PORTRAIT
-                val insetModifier = if (isPortrait) {
-                    Modifier.statusBarsPadding()
+                // In portrait, clear the top status bar vertically.
+                // In landscape (where system bars are hidden in fullscreen), do NOT apply
+                // horizontal displayCutout or navigationBars insets so both left and right
+                // button groups stay symmetrically anchored to the screen edges in both
+                // clockwise (ROTATION_270) and anticlockwise (ROTATION_90) orientations.
+                val topBarInsetModifier = if (isLandscape) {
+                    Modifier
                 } else {
-                    Modifier.windowInsetsPadding(WindowInsets.displayCutout)
+                    Modifier.windowInsetsPadding(WindowInsets.statusBars.only(WindowInsetsSides.Top))
                 }
 
                 Row(
                     modifier = Modifier
+                        .align(Alignment.TopCenter)
                         .fillMaxWidth()
-                        .then(insetModifier)
-                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                        .then(topBarInsetModifier)
+                        .padding(horizontal = 16.dp, vertical = 8.dp)
                         .clickable(
                             interactionSource = remember { MutableInteractionSource() },
                             indication = null
@@ -2206,10 +2483,10 @@ fun ClotubeVideoPlayer(
                     IconButton(
                         onClick = {
                             resetInactivityTimer()
-                            if (nextEpisode != null && onPlayNextEpisode != null) {
+                            if (onNextEpisode != null) {
+                                onNextEpisode.invoke()
+                            } else if (nextEpisode != null && onPlayNextEpisode != null) {
                                 onPlayNextEpisode.invoke(nextEpisode)
-                            } else {
-                                onNextEpisode?.invoke()
                             }
                         },
                         enabled = onNextEpisode != null || (nextEpisode != null && onPlayNextEpisode != null),
@@ -2229,8 +2506,14 @@ fun ClotubeVideoPlayer(
                     modifier = Modifier
                         .fillMaxWidth()
                         .align(Alignment.BottomCenter)
-                        .then(if (currentFullscreen) Modifier.navigationBarsPadding() else Modifier)
-                        .padding(horizontal = 14.dp, vertical = 6.dp)
+                        .then(
+                            if (currentFullscreen) {
+                                Modifier.windowInsetsPadding(WindowInsets.navigationBars.only(WindowInsetsSides.Bottom))
+                            } else {
+                                Modifier
+                            }
+                        )
+                        .padding(horizontal = 16.dp, vertical = 6.dp)
                         .clickable(
                             interactionSource = remember { MutableInteractionSource() },
                             indication = null
@@ -2303,7 +2586,7 @@ fun ClotubeVideoPlayer(
                                         contentAlignment = Alignment.Center
                                     ) {
                                         Text(
-                                            text = if (durationMs > 0L) "${formatTimecode(displayPositionMs)} / ${formatTimecode(durationMs)}" else formatTimecode(displayPositionMs),
+                                            text = if (safeDurationMs > 0L) "${formatTimecode(displayPositionMs)} / ${formatTimecode(safeDurationMs)}" else formatTimecode(displayPositionMs),
                                             color = Color.White,
                                             fontSize = 10.sp,
                                             fontFamily = FontFamily.Monospace,
@@ -2350,8 +2633,8 @@ fun ClotubeVideoPlayer(
                                         }
                                     }
 
-                                    if (durationMs > 0L) {
-                                        val targetMs = calculateSafeSeekTargetMs(dragFraction, durationMs)
+                                    if (safeDurationMs > 0L) {
+                                        val targetMs = calculateSafeSeekTargetMs(dragFraction, safeDurationMs)
                                         seekTo(targetMs)
                                     }
                                     isDragging = false
@@ -2411,7 +2694,7 @@ fun ClotubeVideoPlayer(
                             fontWeight = FontWeight.Medium
                         )
                         Text(
-                            text = formatTimecode(durationMs),
+                            text = formatTimecode(safeDurationMs),
                             color = Color(0xFF94A3B8),
                             fontSize = 11.sp,
                             fontFamily = FontFamily.Monospace,
@@ -2423,10 +2706,10 @@ fun ClotubeVideoPlayer(
         }
 
         // 6. Floating Next Episode Auto-Play Card (Absolute Highest Z-Index)
-        if (nextEpisode != null) {
+        if (nextEpisode != null && !isTransitioningToNewMedia && !isPlaybackEnded && !isBuffering && safeDurationMs > 0L) {
             NextEpisodeCountdownCard(
-                currentPositionMs = if (isScrubbing) displayPositionMs else currentPositionMs,
-                durationMs = durationMs,
+                currentPositionMs = if (isScrubbing) displayPositionMs else safeCurrentPositionMs,
+                durationMs = safeDurationMs,
                 isPlaying = isPlaying,
                 nextEpisode = nextEpisode,
                 onPlayNext = { ep ->
@@ -2435,7 +2718,13 @@ fun ClotubeVideoPlayer(
                 modifier = Modifier
                     .align(Alignment.BottomEnd)
                     .zIndex(100f)
-                    .then(if (currentFullscreen) Modifier.navigationBarsPadding() else Modifier)
+                    .then(
+                        if (currentFullscreen) {
+                            Modifier.windowInsetsPadding(WindowInsets.navigationBars.only(WindowInsetsSides.Bottom))
+                        } else {
+                            Modifier
+                        }
+                    )
                     .padding(end = 16.dp, bottom = if (currentFullscreen) 80.dp else 16.dp),
                 isScrubbing = isScrubbing
             )

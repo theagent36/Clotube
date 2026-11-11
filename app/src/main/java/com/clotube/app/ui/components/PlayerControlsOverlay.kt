@@ -200,6 +200,33 @@ fun PlayerControlsOverlay(
     var hideJob by remember { mutableStateOf<Job?>(null) }
     var showQuickSettingsSheet by remember { mutableStateOf(false) }
     var currentScaleMode by remember { mutableStateOf(VideoScaleMode.FIT) }
+    var lastAppliedScaleMode by remember { mutableStateOf<VideoScaleMode?>(null) }
+
+    LaunchedEffect(currentScaleMode) {
+        if (lastAppliedScaleMode == null) {
+            lastAppliedScaleMode = currentScaleMode
+            return@LaunchedEffect
+        }
+        if (lastAppliedScaleMode == currentScaleMode) return@LaunchedEffect
+        lastAppliedScaleMode = currentScaleMode
+        when (currentScaleMode) {
+            VideoScaleMode.FIT -> {
+                safeSetVideoScale(mediaPlayer, MediaPlayer.ScaleType.SURFACE_BEST_FIT)
+                mediaPlayer.safeSetAspectRatio(null)
+            }
+            VideoScaleMode.FILL -> {
+                safeSetVideoScale(mediaPlayer, MediaPlayer.ScaleType.SURFACE_FIT_SCREEN)
+                mediaPlayer.safeSetAspectRatio(null)
+            }
+            VideoScaleMode.STRETCH -> {
+                safeSetVideoScale(mediaPlayer, MediaPlayer.ScaleType.SURFACE_FILL)
+                mediaPlayer.safeSetAspectRatio(null)
+            }
+        }
+        try {
+            if (!mediaPlayer.isReleased) mediaPlayer.updateVideoSurfaces()
+        } catch (_: Throwable) {}
+    }
 
     // Quick Double-Tap Seek Ripple Animation
     var seekRippleDirection by remember { mutableStateOf<SeekRippleDirection?>(null) }
@@ -448,13 +475,18 @@ fun PlayerControlsOverlay(
                 // ========================================================
                 // 1. TOP ACTION BAR
                 // ========================================================
+                val topBarInsetModifier = if (isLandscape) {
+                    Modifier
+                } else {
+                    Modifier.windowInsetsPadding(WindowInsets.statusBars.only(WindowInsetsSides.Top))
+                }
+
                 Row(
                     modifier = Modifier
                         .align(Alignment.TopCenter)
                         .fillMaxWidth()
-                        .statusBarsPadding()
-                        .displayCutoutPadding()
-                        .padding(horizontal = 24.dp, vertical = 16.dp)
+                        .then(topBarInsetModifier)
+                        .padding(horizontal = 16.dp, vertical = 8.dp)
                         .clickable(
                             interactionSource = remember { MutableInteractionSource() },
                             indication = null
@@ -659,8 +691,8 @@ fun PlayerControlsOverlay(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .fillMaxWidth()
-                        .navigationBarsPadding()
-                        .padding(horizontal = 28.dp)
+                        .windowInsetsPadding(WindowInsets.navigationBars.only(WindowInsetsSides.Bottom))
+                        .padding(horizontal = 16.dp)
                         .padding(bottom = 24.dp)
                         .clickable(
                             interactionSource = remember { MutableInteractionSource() },
@@ -728,8 +760,8 @@ fun PlayerControlsOverlay(
                         onPlayNext = { ep -> onPlayNext?.invoke(ep) },
                         modifier = Modifier
                             .align(Alignment.BottomEnd)
-                            .navigationBarsPadding()
-                            .padding(end = 28.dp, bottom = 80.dp),
+                            .windowInsetsPadding(WindowInsets.navigationBars.only(WindowInsetsSides.Bottom))
+                            .padding(end = 16.dp, bottom = 80.dp),
                         isScrubbing = isDragging
                     )
                 }
@@ -951,20 +983,6 @@ fun PlayerQuickSettingsSheet(
                         modifier = Modifier.weight(1f),
                         onClick = {
                             onScaleModeChange(mode)
-                            when (mode) {
-                                VideoScaleMode.FIT -> {
-                                    safeSetVideoScale(mediaPlayer, MediaPlayer.ScaleType.SURFACE_BEST_FIT)
-                                    mediaPlayer.safeSetAspectRatio(null)
-                                }
-                                VideoScaleMode.FILL -> {
-                                    safeSetVideoScale(mediaPlayer, MediaPlayer.ScaleType.SURFACE_FIT_SCREEN)
-                                    mediaPlayer.safeSetAspectRatio(null)
-                                }
-                                VideoScaleMode.STRETCH -> {
-                                    safeSetVideoScale(mediaPlayer, MediaPlayer.ScaleType.SURFACE_FILL)
-                                    mediaPlayer.safeSetAspectRatio(null)
-                                }
-                            }
                         }
                     )
                 }

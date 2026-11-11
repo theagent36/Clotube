@@ -21,8 +21,8 @@ android {
         applicationId = "com.clotube.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 19
-        versionName = "3.4"
+        versionCode = 21
+        versionName = "3.6"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -30,41 +30,43 @@ android {
         }
 
         ndk {
-            // Include target ABIs for LibVLC native playback
             abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a", "x86_64"))
         }
     }
 
     signingConfigs {
         create("release") {
-            if (keystorePropertiesFile.exists() && keystoreProperties.containsKey("storeFile")) {
-                val storePath = keystoreProperties.getProperty("storeFile")
-                storeFile = file(storePath)
+            val propStorePath = if (keystorePropertiesFile.exists() && keystoreProperties.containsKey("storeFile")) {
+                keystoreProperties.getProperty("storeFile")?.trim()
+            } else null
+
+            val resolvedPropFile = if (!propStorePath.isNullOrBlank()) {
+                file(propStorePath).takeIf { it.exists() } ?: rootProject.file(propStorePath)
+            } else null
+
+            if (resolvedPropFile != null && resolvedPropFile.exists()) {
+                storeFile = resolvedPropFile
                 storePassword = keystoreProperties.getProperty("storePassword") ?: ""
                 keyAlias = keystoreProperties.getProperty("keyAlias") ?: ""
                 keyPassword = keystoreProperties.getProperty("keyPassword") ?: ""
                 enableV1Signing = true
                 enableV2Signing = true
             } else {
-                val storeFilePath = project.findProperty("CLOTUBE_KEYSTORE_FILE")?.toString()
-                    ?: project.findProperty("CLOTUBE_RELEASE_STORE_FILE")?.toString()
+                val storeFilePath = project.findProperty("CLOTUBE_KEYSTORE_FILE")?.toString()?.trim()
+                    ?: project.findProperty("CLOTUBE_RELEASE_STORE_FILE")?.toString()?.trim()
 
-                if (!storeFilePath.isNullOrBlank() && file(storeFilePath).exists()) {
-                    storeFile = file(storeFilePath)
+                val resolvedCliFile = if (!storeFilePath.isNullOrBlank()) {
+                    file(storeFilePath).takeIf { it.exists() } ?: rootProject.file(storeFilePath)
+                } else null
+
+                if (resolvedCliFile != null && resolvedCliFile.exists()) {
+                    storeFile = resolvedCliFile
                     storePassword = project.findProperty("CLOTUBE_KEYSTORE_PASSWORD")?.toString()
                         ?: project.findProperty("CLOTUBE_RELEASE_STORE_PASSWORD")?.toString() ?: ""
                     keyAlias = project.findProperty("CLOTUBE_KEY_ALIAS")?.toString()
                         ?: project.findProperty("CLOTUBE_RELEASE_KEY_ALIAS")?.toString() ?: ""
                     keyPassword = project.findProperty("CLOTUBE_KEY_PASSWORD")?.toString()
                         ?: project.findProperty("CLOTUBE_RELEASE_KEY_PASSWORD")?.toString() ?: ""
-                    enableV1Signing = true
-                    enableV2Signing = true
-                } else {
-                    val debugConfig = signingConfigs.getByName("debug")
-                    storeFile = debugConfig.storeFile
-                    storePassword = debugConfig.storePassword
-                    keyAlias = debugConfig.keyAlias
-                    keyPassword = debugConfig.keyPassword
                     enableV1Signing = true
                     enableV2Signing = true
                 }
@@ -74,12 +76,20 @@ android {
 
     buildTypes {
         release {
-            // Keep code and resources 1:1 identical to debug build to prevent any runtime breakage
-            isMinifyEnabled = false
+            isMinifyEnabled = true
             isShrinkResources = false
             isDebuggable = false
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
 
-            signingConfig = signingConfigs.getByName("release")
+            val releaseConfig = signingConfigs.findByName("release")
+            if (releaseConfig != null && releaseConfig.storeFile != null && releaseConfig.storeFile!!.exists()) {
+                signingConfig = releaseConfig
+            } else {
+                signingConfig = signingConfigs.getByName("debug")
+            }
         }
         debug {
             // CRITICAL: Do NOT append applicationIdSuffix here.

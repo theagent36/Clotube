@@ -727,16 +727,24 @@ fun HomeScreen(
                                             ContinueWatchingCard(
                                                 data = item,
                                                 onResumeClick = {
-                                                    if (item.isSeries) {
-                                                        val targetSeriesId = item.seriesId?.trim()?.ifBlank { null }
-                                                            ?: uiState.tvSeriesList.firstOrNull { s -> s.seasons.any { season -> season.episodes.any { ep -> ep.id == item.mediaId } } }?.id
+                                                    android.util.Log.i("ClotubePlayer", "--> Home ContinueWatching clicked: isSeries=${item.isSeries}, seriesId=${item.seriesId}, mediaId=${item.mediaId}")
+                                                    if (item.isSeries || !item.seriesId.isNullOrBlank()) {
+                                                        val candidateSeriesId = item.seriesId?.trim()?.ifBlank { null }
+                                                        val resolvedFromCatalog = if (candidateSeriesId != null && (uiState.tvSeriesList.isEmpty() || uiState.tvSeriesList.any { it.id == candidateSeriesId })) {
+                                                            candidateSeriesId
+                                                        } else {
+                                                            uiState.tvSeriesList.firstOrNull { s ->
+                                                                s.seasons.any { season -> season.episodes.any { ep -> ep.id == item.mediaId } }
+                                                            }?.id ?: candidateSeriesId
+                                                        }
+                                                        val targetSeriesId = resolvedFromCatalog
                                                             ?: viewModel.getSeriesIdForEpisode(item.mediaId, item.seriesTitle.ifBlank { item.displayHeader })
                                                             ?: viewModel.getDefaultSeriesId()
                                                             ?: ""
 
                                                         if (targetSeriesId.isNotBlank()) {
                                                             if (onNavigateToSeriesDetail != null) {
-                                                                onNavigateToSeriesDetail(targetSeriesId, item.episodeId)
+                                                                onNavigateToSeriesDetail(targetSeriesId, item.mediaId)
                                                             } else if (onResumePlayback != null) {
                                                                 onResumePlayback(item.mediaId, item.displayTitle, targetSeriesId, item.currentPositionMs)
                                                             } else {
@@ -746,7 +754,7 @@ fun HomeScreen(
                                                                 }
                                                             }
                                                         }
-                                                    } else {
+                                                    } else if (item.mediaId.isNotBlank()) {
                                                         if (onPlayMovie != null) {
                                                             onPlayMovie(item.mediaId)
                                                         } else if (onResumePlayback != null) {
@@ -2454,7 +2462,8 @@ fun ContinueWatchingCard(
                         modifier = Modifier
                             .size(46.dp)
                             .clip(CircleShape)
-                            .background(Color.White.copy(alpha = 0.2f)),
+                            .background(Color.White.copy(alpha = 0.2f))
+                            .clickable { onResumeClick() },
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(
@@ -2819,13 +2828,18 @@ fun HomeScreen(
                                         ContinueWatchingCard(
                                             data = item,
                                             onResumeClick = {
-                                                if (item.isSeries) {
+                                                android.util.Log.i("ClotubePlayer", "--> Home ContinueWatching clicked: isSeries=${item.isSeries}, seriesId=${item.seriesId}, mediaId=${item.mediaId}")
+                                                if (item.isSeries || !item.seriesId.isNullOrBlank()) {
                                                     val ep = series.flatMap { it.seasons }.flatMap { it.episodes }.find { it.id == safeCwId }
                                                     if (ep != null) {
                                                         onContinueWatchingClick(ep)
                                                     } else {
-                                                        val sId = item.seriesId?.trim()?.ifBlank { null }
-                                                            ?: series.firstOrNull { s -> s.seasons.any { season -> season.episodes.any { e -> e.id == safeCwId } } }?.id
+                                                        val candidateSeriesId = item.seriesId?.trim()?.ifBlank { null }
+                                                        val sId = if (candidateSeriesId != null && (series.isEmpty() || series.any { it.id == candidateSeriesId })) {
+                                                            candidateSeriesId
+                                                        } else {
+                                                            series.firstOrNull { s -> s.seasons.any { season -> season.episodes.any { e -> e.id == safeCwId } } }?.id ?: candidateSeriesId
+                                                        }
                                                         val matchedSeries = series.find { it.id == sId }
                                                         if (matchedSeries != null) onSeriesClick(matchedSeries)
                                                     }

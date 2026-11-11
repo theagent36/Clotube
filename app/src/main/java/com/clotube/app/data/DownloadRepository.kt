@@ -30,6 +30,7 @@ enum class DownloadStatus {
 }
 
 @androidx.annotation.Keep
+@androidx.compose.runtime.Immutable
 data class OfflineMediaRecord(
     val fileId: String,
     val title: String,
@@ -61,6 +62,32 @@ class DownloadRepository(private val context: Context) {
                 downloadedBytes = downloaded,
                 status = try { DownloadStatus.valueOf(statusStr) } catch (e: Exception) { DownloadStatus.FAILED }
             )
+        }
+    }
+
+    /**
+     * Screen-level single-Flow collection of all download records keyed by fileId,
+     * eliminating per-row DataStore Flow creation during list rendering and season switching.
+     */
+    fun getAllDownloadRecords(): Flow<Map<String, OfflineMediaRecord>> {
+        return context.downloadsDataStore.data.map { prefs ->
+            val result = HashMap<String, OfflineMediaRecord>()
+            for (key in prefs.asMap().keys) {
+                if (key.name.endsWith("_status")) {
+                    val fileId = key.name.removeSuffix("_status")
+                    val statusStr = prefs[stringPreferencesKey("${fileId}_status")] ?: continue
+                    val status = try { DownloadStatus.valueOf(statusStr) } catch (_: Exception) { DownloadStatus.FAILED }
+                    result[fileId] = OfflineMediaRecord(
+                        fileId = fileId,
+                        title = prefs[stringPreferencesKey("${fileId}_title")] ?: "",
+                        localFilePath = prefs[stringPreferencesKey("${fileId}_path")] ?: "",
+                        totalBytes = prefs[longPreferencesKey("${fileId}_total")] ?: 0L,
+                        downloadedBytes = prefs[longPreferencesKey("${fileId}_downloaded")] ?: 0L,
+                        status = status
+                    )
+                }
+            }
+            result
         }
     }
 

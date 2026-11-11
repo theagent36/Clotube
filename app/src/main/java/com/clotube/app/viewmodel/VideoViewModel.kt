@@ -66,43 +66,19 @@ import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import java.io.File
 
-// Persist the catalog to app-private cache whenever fetched successfully online
+// Persist the series catalog via unified CatalogCacheManager
 fun saveCatalogToDisk(context: Context, seriesList: List<TvSeries>) {
-    try {
-        val cacheFile = File(context.filesDir, "cached_series_catalog.json")
-        val json = Gson().toJson(seriesList)
-        cacheFile.writeText(json)
-    } catch (ignored: Exception) {}
+    CatalogCacheManager(context).saveSeriesOnlySync(seriesList)
 }
 
-// Read the cached catalog when offline or in Airplane Mode
+// Read the cached series catalog via unified CatalogCacheManager (with memory caching)
 fun loadCatalogFromDisk(context: Context): List<TvSeries> {
-    return try {
-        val cacheFile = File(context.filesDir, "cached_series_catalog.json")
-        if (cacheFile.exists()) {
-            val json = cacheFile.readText()
-            val type = object : TypeToken<List<TvSeries>>() {}.type
-            Gson().fromJson(json, type) ?: emptyList()
-        } else {
-            emptyList()
-        }
-    } catch (e: Exception) {
-        emptyList()
-    }
+    return CatalogCacheManager(context).getCachedSeriesSync()
 }
 
-// Save or update an individual show (with its populated seasons and episodes)
+// Save or update an individual show (with its populated seasons and episodes) in unified cache
 fun saveShowToDisk(context: Context, updatedShow: TvSeries) {
-    try {
-        val existing = loadCatalogFromDisk(context).toMutableList()
-        val index = existing.indexOfFirst { it.id == updatedShow.id }
-        if (index >= 0) {
-            existing[index] = updatedShow
-        } else {
-            existing.add(updatedShow)
-        }
-        saveCatalogToDisk(context, existing)
-    } catch (ignored: Exception) {}
+    CatalogCacheManager(context).upsertSeriesSync(updatedShow)
 }
 
 fun VideoItem.toMovie(): Movie = Movie(
@@ -244,6 +220,7 @@ data class VideoUiState(
     val searchQuery: String = "",
     val isSearchActive: Boolean = false,
     val selectedVideoForInspection: VideoItem? = null,
+    val selectedSeasonIndex: Int = 0,
     val currentTab: NavigationTab = NavigationTab.LIBRARY,
     val isHardwareAccelerationEnabled: Boolean = true,
     val userEmail: String? = null,
@@ -261,6 +238,7 @@ data class VideoUiState(
     val watchProgressMap: Map<String, com.clotube.app.data.WatchProgress> = emptyMap()
 )
 
+@androidx.compose.runtime.Stable
 class VideoViewModel(application: Application) : AndroidViewModel(application) {
 
     companion object {
@@ -482,17 +460,19 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 playerToRelease.setEventListener(null)
                 try {
-                    if (playerToRelease.isPlaying) {
-                        playerToRelease.stop()
-                    } else {
-                        playerToRelease.stop()
-                    }
+                    playerToRelease.stop()
                 } catch (_: Throwable) {}
                 try {
                     playerToRelease.detachViews()
                 } catch (_: Throwable) {}
                 if (playerToRelease != vlcPlayerManager.mediaPlayer) {
-                    playerToRelease.release()
+                    CoroutineScope(Dispatchers.IO).launch {
+                        try {
+                            if (!playerToRelease.isReleased) {
+                                playerToRelease.release()
+                            }
+                        } catch (_: Throwable) {}
+                    }
                 }
             } catch (e: Exception) {
                 android.util.Log.e("VideoViewModel", "Error releasing active player: ${e.message}")
@@ -916,11 +896,20 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             }.getOrNull()
     }
 
-    // On every successful online sync:
-    fun onOnlineCatalogFetched(seriesList: List<TvSeries>) {
-        _seriesState.value = seriesList
+    private fun persistCatalogAsync(
+        movies: List<VideoItem> = _moviesState.value,
+        series: List<TvSeries> = _seriesState.value
+    ) {
         viewModelScope.launch(Dispatchers.IO) {
-            saveCatalogToDisk(getApplication(), seriesList)
+            catalogCacheManager.saveCatalog(movies, series)
+        }
+    }
+
+    // On every successful online sync:
+    fun onOnlineCatalogFetched(seriesList: List<TvSeries>, persistToDisk: Boolean = true) {
+        _seriesState.value = seriesList
+        if (persistToDisk) {
+            persistCatalogAsync(_moviesState.value, seriesList)
         }
     }
 
@@ -936,9 +925,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { current ->
             current.copy(tvSeriesList = currentList)
         }
-        viewModelScope.launch(Dispatchers.IO) {
-            saveCatalogToDisk(getApplication(), currentList)
-        }
+        persistCatalogAsync(_moviesState.value, currentList)
     }
 
     fun initOfflineCatalog() {
@@ -1360,6 +1347,10 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
 
     val selectedSeasonNumber = androidx.compose.runtime.mutableStateOf<Int?>(null)
 
+    fun selectSeason(index: Int) {
+        _uiState.update { it.copy(selectedSeasonIndex = index.coerceAtLeast(0)) }
+    }
+
     val filterChips = listOf("All", "Movies", "TV Series")
     private var catalogLoadingJob: Job? = null
 
@@ -1379,9 +1370,6 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         DriveWatchHistorySync.setOnAuthFailureListener {
             tokenRepository.invalidateAndForceConsent()
         }
-        viewModelScope.launch(Dispatchers.IO) {
-            playbackHistoryManager.syncFromCloud()
-        }
         val lastAccount = GoogleSignIn.getLastSignedInAccount(getApplication())
         if (lastAccount != null && com.clotube.app.auth.GoogleAuthManager.hasAllDrivePermissions(getApplication(), lastAccount)) {
             _uiState.update {
@@ -1393,13 +1381,9 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
         }
-        com.clotube.app.data.metadata.OnlineMetadataResolver.clearCache()
         observePlaybackHistory()
         initOfflineCatalog()
         initStaleWhileRevalidateFlow()
-        if (com.clotube.app.BuildConfig.DEBUG) {
-            runScannerDiagnosticTest()
-        }
     }
 
     private fun initStaleWhileRevalidateFlow() {
@@ -1496,9 +1480,6 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
 
             // Single coordinated startup revalidation
             checkFolderOnboarding()
-            viewModelScope.launch(Dispatchers.IO) {
-                playbackHistoryManager.syncFromCloud()
-            }
         }
     }
 
@@ -1930,7 +1911,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                     val seriesFraction = seriesEpProgress?.progressFraction ?: 0f
                     series.copy(watchProgressFraction = seriesFraction)
                 }
-                onOnlineCatalogFetched(finalMappedSeries)
+                onOnlineCatalogFetched(finalMappedSeries, persistToDisk = false)
                 _uiState.update { current ->
                     current.copy(
                         tvSeriesList = finalMappedSeries,
@@ -1942,8 +1923,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             _isInitialLoading.value = false
             _uiState.update { it.copy(isLoading = false, isInitialLoading = false) }
 
-            // Save accumulated results to local catalog cache for instant subsequent boots
-            onOnlineCatalogFetched(_seriesState.value)
+            // Persist accumulated catalog once to unified local cache on Dispatchers.IO
             catalogCacheManager.saveCatalog(_moviesState.value, _seriesState.value)
         }
     }
@@ -2021,9 +2001,8 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                     _moviesState.value = videoItems
                     _seriesList.value = result.series
 
-                    // 2. Overwrite disk cache with fresh results
-                    catalogCacheManager.saveCatalog(result.movies, result.series)
-                    saveCatalogToDisk(getApplication(), result.series)
+                    // 2. Overwrite unified disk cache with fresh results once on Dispatchers.IO
+                    catalogCacheManager.saveCatalog(videoItems, result.series)
 
                     // 3. Update UI state
                     _uiState.update { current ->
@@ -2065,7 +2044,6 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                 currentList.add(updated)
             }
             _seriesState.value = currentList
-            saveCatalogToDisk(getApplication(), currentList)
             catalogCacheManager.saveCatalog(_moviesState.value, currentList)
         }
         updated
@@ -2073,7 +2051,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
 
     fun refreshCatalog(forceSync: Boolean = false) {
         viewModelScope.launch(Dispatchers.IO) {
-            playbackHistoryManager.syncFromCloud()
+            driveWatchHistorySync.syncFromCloud(playbackHistoryManager.dataStore, force = forceSync)
             _isRefreshing.value = true
             _uiState.update { it.copy(isLoading = true) }
             try {
@@ -2135,7 +2113,6 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                     if (!seriesFolderId.isNullOrBlank()) {
                         val series = DriveCatalogScanner.scanSeriesRecursively(service, seriesFolderId)
                         _seriesList.value = series
-                        saveCatalogToDisk(getApplication(), series)
                         _uiState.update { current ->
                             val heroShow = current.heroSeries ?: series.firstOrNull()
                             current.copy(
@@ -2149,7 +2126,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                         _seriesList.value = emptyList()
                     }
 
-                    // Persist accumulated catalog to local cache
+                    // Persist accumulated catalog once to unified local cache
                     catalogCacheManager.saveCatalog(_moviesState.value, _seriesState.value)
                 }
             } catch (e: Exception) {

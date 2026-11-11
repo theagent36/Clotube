@@ -1,28 +1,41 @@
 # ==============================================================================
-# CLOTUBE - COMPREHENSIVE R8 / PROGUARD PRODUCTION RULES
+# CLOTUBE - ZERO-BREAKAGE PRODUCTION R8 / PROGUARD RULES
 # ==============================================================================
 
-# 1. Domain Models, DTOs & DataStore Preferences
--keep class com.clotube.app.model.** { *; }
--keepclassmembers class com.clotube.app.model.** { *; }
+# ------------------------------------------------------------------------------
+# 1. COMPLETE APPLICATION NAMESPACE SHIELD (PREVENTS GSON / REFLECTION NPEs)
+# ------------------------------------------------------------------------------
+# Keep every class, inner data class, enum, companion, and field inside Clotube
+# so Gson, SharedPreferences, DataStore, and Compose Navigation never fail.
+-keep class com.clotube.** { *; }
+-keepclassmembers class com.clotube.** { *; }
+-keep interface com.clotube.** { *; }
 
--keep class com.clotube.app.data.** { *; }
--keepclassmembers class com.clotube.app.data.** { *; }
+-keep @androidx.annotation.Keep class * { *; }
+-keepclassmembers class * {
+    @androidx.annotation.Keep *;
+}
 
--keep class com.clotube.app.data.metadata.** { *; }
--keepclassmembers class com.clotube.app.data.metadata.** { *; }
+# ------------------------------------------------------------------------------
+# 2. KOTLIN METADATA, GSON & JSON SERIALIZATION
+# ------------------------------------------------------------------------------
+-keepattributes Signature, InnerClasses, EnclosingMethod, RuntimeVisibleAnnotations, *Annotation*
+-keep class kotlin.Metadata { *; }
 
--keep class com.clotube.app.viewmodel.** { *; }
+-keepclassmembers class * {
+    @com.google.gson.annotations.SerializedName <fields>;
+}
+-keep class com.google.gson.** { *; }
+-keep class com.google.gson.reflect.TypeToken { *; }
+-keep class * extends com.google.gson.reflect.TypeToken
 
--keep class androidx.datastore.preferences.** { *; }
--keep class androidx.datastore.core.** { *; }
-
-# 2. LibVLC Native JNI & VLCVideoLayout
--keep class org.videolan.libvlc.** { *; }
--keep interface org.videolan.libvlc.** { *; }
--keep class org.videolan.medialibrary.** { *; }
--dontwarn org.videolan.libvlc.**
--dontwarn org.videolan.medialibrary.**
+# ------------------------------------------------------------------------------
+# 3. LIBVLC NATIVE JNI, AWINDOW & MEDIA PLAYBACK ENGINE (CRITICAL)
+# ------------------------------------------------------------------------------
+-keep class org.videolan.** { *; }
+-keep interface org.videolan.** { *; }
+-keepclassmembers class org.videolan.** { *; }
+-dontwarn org.videolan.**
 
 -keepclasseswithmembernames class * {
     native <methods>;
@@ -32,7 +45,33 @@
     void onEvent(org.videolan.libvlc.MediaPlayer$Event);
 }
 
-# 3. WorkManager & Background Sync Workers
+# ------------------------------------------------------------------------------
+# 4. GOOGLE PLAY SERVICES, CREDENTIALS & GOOGLE DRIVE REST API v3
+# ------------------------------------------------------------------------------
+-keep class com.google.api.** { *; }
+-keep class com.google.apis.** { *; }
+-keep class com.google.http.** { *; }
+-keep interface com.google.api.client.** { *; }
+-keep class com.google.android.gms.auth.** { *; }
+-keep class com.google.android.gms.common.** { *; }
+-keep class com.google.android.gms.tasks.** { *; }
+-keep class com.google.android.libraries.identity.googleid.** { *; }
+-keep class androidx.credentials.** { *; }
+
+-keepclassmembers class * {
+    @com.google.api.client.util.Key <fields>;
+}
+
+-dontwarn com.google.api.**
+-dontwarn com.google.apis.**
+-dontwarn com.google.common.**
+-dontwarn com.google.android.gms.**
+-dontwarn org.apache.http.**
+-dontwarn java.awt.**
+
+# ------------------------------------------------------------------------------
+# 5. WORKMANAGER, FOREGROUND SERVICES & MEDIASESSION
+# ------------------------------------------------------------------------------
 -keep public class androidx.work.Worker { *; }
 -keep public class androidx.work.CoroutineWorker { *; }
 -keep public class androidx.work.ListenableWorker { *; }
@@ -40,50 +79,24 @@
     public <init>(android.content.Context, androidx.work.WorkerParameters);
 }
 
--keep class com.clotube.app.workers.** { *; }
--keep class com.clotube.app.data.DriveSyncWorker { *; }
--keep class com.clotube.app.data.ClotubeSyncService { *; }
-
-# 4. MediaSessionCompat & Audio Focus
--keep class com.clotube.app.media.** { *; }
 -keep class android.support.v4.media.** { *; }
 -keep class androidx.media.** { *; }
+-keep class androidx.media3.** { *; }
+-keep interface androidx.media3.** { *; }
+-dontwarn androidx.media3.**
 
-# 5. Google Play Services & Google Drive REST API
--keep class com.google.android.gms.auth.api.** { *; }
--keep class com.google.android.gms.auth.api.signin.** { *; }
--keep class com.google.android.gms.common.** { *; }
--keep class com.google.android.gms.tasks.** { *; }
--dontwarn com.google.android.gms.**
-
--keep class com.google.api.services.drive.** { *; }
--keep class com.google.api.client.** { *; }
--keep interface com.google.api.client.** { *; }
-
--keepclassmembers class * {
-    @com.google.api.client.util.Key <fields>;
-}
-
--dontwarn com.google.api.client.**
--dontwarn com.google.api.services.drive.**
--dontwarn com.google.common.**
--dontwarn org.apache.http.**
-
-# 6. OkHttp, Networking & Coil
--keepattributes Signature
--keepattributes *Annotation*
--keepattributes EnclosingMethod
--keepattributes InnerClasses
+# ------------------------------------------------------------------------------
+# 6. JETPACK DATASTORE, COIL, OKHTTP & COROUTINES
+# ------------------------------------------------------------------------------
+-keep class androidx.datastore.** { *; }
+-keep class coil.** { *; }
+-dontwarn coil.**
 
 -keep class okhttp3.** { *; }
 -keep interface okhttp3.** { *; }
 -dontwarn okhttp3.**
 -dontwarn okio.**
 
--keep class coil.** { *; }
--dontwarn coil.**
-
-# 7. Jetpack Compose & Kotlin Coroutines
 -keepclassmembers class * {
     @androidx.compose.runtime.Immutable <fields>;
     @androidx.compose.runtime.Stable <fields>;
@@ -96,5 +109,9 @@
     volatile <fields>;
 }
 
+-dontwarn kotlinx.coroutines.**
 -dontwarn sun.misc.Unsafe
 -dontwarn javax.annotation.**
+-dontwarn org.conscrypt.**
+-dontwarn org.bouncycastle.**
+-dontwarn org.openjsse.**

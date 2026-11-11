@@ -4,6 +4,8 @@ import android.app.Activity
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import androidx.activity.compose.BackHandler
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
@@ -36,7 +38,11 @@ fun NativeVideoPlayerScreen(
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
     val coroutineScope = rememberCoroutineScope()
-    val movie = remember(fileId) { viewModel.getMovieById(fileId) }
+    val movie = remember(fileId) {
+        viewModel.getMovieById(fileId) ?: if (fileId.isNotBlank()) {
+            com.clotube.app.model.VideoItem(id = fileId, title = "Movie")
+        } else null
+    }
     val movieTitle = remember(movie) {
         movie?.title?.ifBlank { null } ?: movie?.displayTitle?.ifBlank { null } ?: "Movie"
     }
@@ -128,6 +134,16 @@ fun NativeVideoPlayerScreen(
                 }
             }
             viewModel.stopAndReleaseCurrentPlayer()
+        }
+    }
+
+    // Restore portrait orientation and system bars only when leaving NativeVideoPlayerScreen
+    DisposableEffect(Unit) {
+        val window = activity?.window
+        val insets = window?.let { WindowCompat.getInsetsController(it, it.decorView) }
+        onDispose {
+            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            insets?.show(WindowInsetsCompat.Type.systemBars())
         }
     }
 

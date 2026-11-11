@@ -82,66 +82,64 @@ fun EpisodeItemRow(
     onStartDownload: () -> Unit,
     onCancelDownload: () -> Unit,
     isWatched: Boolean = false,
+    watchProgressFraction: Float = 0f,
+    downloadStatus: DownloadStatus? = null,
+    downloadProgress: Float = 0f,
     isDownloading: Boolean = false,
     isDownloaded: Boolean = false,
     downloadRecord: OfflineMediaRecord? = null,
     playbackHistoryManager: PlaybackHistoryManager? = null,
     onToggleWatched: (() -> Unit)? = null,
+    useHoistedState: Boolean = true,
     modifier: Modifier = Modifier
 ) {
     val view = LocalView.current
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
 
-    val userEmail = remember { com.google.android.gms.auth.api.signin.GoogleSignIn.getLastSignedInAccount(context)?.email.orEmpty() }
-
-    // Reactive watch state with optimistic override for zero-latency tap response
+    // Pure hoisted-state evaluation: zero internal Flow collectors or synchronous Disk/SharedPrefs reads
     var optimisticWatched by remember(episode.id) { mutableStateOf<Boolean?>(null) }
-    val isWatchedFromFlow by (playbackHistoryManager?.isEpisodeWatched(episode.id)
-        ?: remember(episode.id) { kotlinx.coroutines.flow.flowOf(false) })
-        .collectAsState(initial = isWatched)
 
-    LaunchedEffect(isWatchedFromFlow) {
+    LaunchedEffect(isWatched) {
         optimisticWatched = null
     }
 
-    val effectiveWatched = optimisticWatched ?: isWatchedFromFlow
+    val effectiveWatched = optimisticWatched ?: isWatched
+    val effectiveRecord = downloadRecord
 
-    val downloadRepo = remember(context) { DownloadRepository(context) }
-    val recordState by downloadRepo.getDownloadRecord(episode.id).collectAsState(initial = null)
-    val effectiveRecord = downloadRecord ?: recordState
-
-    val status = effectiveRecord?.status ?: when {
+    val status = downloadStatus ?: effectiveRecord?.status ?: when {
         isDownloaded -> DownloadStatus.COMPLETED
         isDownloading -> DownloadStatus.DOWNLOADING
         else -> DownloadStatus.NOT_DOWNLOADED
     }
+    val effectiveDownloadProgress = effectiveRecord?.progressFraction ?: downloadProgress
 
     val isActionCancelOrDelete = status == DownloadStatus.COMPLETED ||
             status == DownloadStatus.DOWNLOADING ||
             status == DownloadStatus.QUEUED
 
-    val infiniteTransition = rememberInfiniteTransition(label = "now_playing_pulse")
-    val pulseAlpha by infiniteTransition.animateFloat(
-        initialValue = 0.4f,
-        targetValue = 1.0f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(800, easing = LinearEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "pulse_alpha"
-    )
+    val pulseAlpha = if (isPlayingThis) {
+        val infiniteTransition = rememberInfiniteTransition(label = "now_playing_pulse")
+        val animated by infiniteTransition.animateFloat(
+            initialValue = 0.4f,
+            targetValue = 1.0f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(800, easing = LinearEasing),
+                repeatMode = RepeatMode.Reverse
+            ),
+            label = "pulse_alpha"
+        )
+        animated
+    } else {
+        1.0f
+    }
 
-    val rowBgColor by animateColorAsState(
-        targetValue = if (isPlayingThis) SurfaceElevated else SurfaceDefault,
-        animationSpec = AppleTvMotion.fluidSpring(),
-        label = "episode_row_bg"
-    )
-    val rowBorderColor by animateColorAsState(
-        targetValue = if (isPlayingThis) AccentBlue else SurfaceBorder,
-        animationSpec = AppleTvMotion.fluidSpring(),
-        label = "episode_row_border"
-    )
+    val rowBgColor = remember(isPlayingThis) {
+        if (isPlayingThis) SurfaceElevated else SurfaceDefault
+    }
+    val rowBorderColor = remember(isPlayingThis) {
+        if (isPlayingThis) AccentBlue else SurfaceBorder
+    }
     val rowInteractionSource = remember { MutableInteractionSource() }
 
     Surface(
@@ -173,8 +171,18 @@ fun EpisodeItemRow(
                 contentAlignment = Alignment.Center
             ) {
                 if (episode.thumbnailUrl.isNotBlank()) {
+                    val imageRequest = remember(episode.id, episode.thumbnailUrl) {
+                        coil.request.ImageRequest.Builder(context)
+                            .data(episode.thumbnailUrl)
+                            .size(320, 180)
+                            .precision(coil.size.Precision.INEXACT)
+                            .memoryCacheKey("ep_thumb_${episode.id}")
+                            .diskCacheKey("ep_thumb_${episode.id}")
+                            .crossfade(false)
+                            .build()
+                    }
                     AsyncImage(
-                        model = episode.thumbnailUrl,
+                        model = imageRequest,
                         contentDescription = episode.displayTitle,
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize()
@@ -288,21 +296,15 @@ fun EpisodeItemRow(
             ) {
                 // THEMED MARK AS WATCHED CHECKBOX BUTTON
                 val checkInteractionSource = remember { MutableInteractionSource() }
-                val checkBgColor by animateColorAsState(
-                    targetValue = if (effectiveWatched) AccentBlue.copy(alpha = 0.16f) else Color.Transparent,
-                    animationSpec = AppleTvMotion.tactileSpring(),
-                    label = "check_bg"
-                )
-                val checkBorderColor by animateColorAsState(
-                    targetValue = if (effectiveWatched) AccentBlue else SurfaceBorder,
-                    animationSpec = AppleTvMotion.tactileSpring(),
-                    label = "check_border"
-                )
-                val checkIconTint by animateColorAsState(
-                    targetValue = if (effectiveWatched) AccentBlue else Color(0xFF64748B),
-                    animationSpec = AppleTvMotion.tactileSpring(),
-                    label = "check_tint"
-                )
+                val checkBgColor = remember(effectiveWatched) {
+                    if (effectiveWatched) AccentBlue.copy(alpha = 0.16f) else Color.Transparent
+                }
+                val checkBorderColor = remember(effectiveWatched) {
+                    if (effectiveWatched) AccentBlue else SurfaceBorder
+                }
+                val checkIconTint = remember(effectiveWatched) {
+                    if (effectiveWatched) AccentBlue else Color(0xFF64748B)
+                }
 
                 Surface(
                     modifier = Modifier
@@ -319,24 +321,14 @@ fun EpisodeItemRow(
 
                             if (onToggleWatched != null) {
                                 onToggleWatched()
-                            } else {
+                            } else if (playbackHistoryManager != null) {
                                 coroutineScope.launch {
-                                    playbackHistoryManager?.setEpisodeWatched(
+                                    playbackHistoryManager.setEpisodeWatched(
                                         seriesId = seriesId,
                                         seriesTitle = seriesTitle,
                                         episode = episode,
-                                        isWatched = nextState,
-                                        userEmail = userEmail
-                                    ) ?: run {
-                                        if (userEmail.isNotBlank()) {
-                                            com.clotube.app.data.AndroidWatchHistoryManager.setEpisodeWatched(
-                                                context = context,
-                                                email = userEmail,
-                                                fileId = episode.id,
-                                                isWatched = nextState
-                                            )
-                                        }
-                                    }
+                                        isWatched = nextState
+                                    )
                                 }
                             }
                         },
@@ -373,7 +365,7 @@ fun EpisodeItemRow(
                         }
                         DownloadStatus.DOWNLOADING -> {
                             CircularProgressIndicator(
-                                progress = { effectiveRecord?.progressFraction ?: 0f },
+                                progress = { effectiveDownloadProgress },
                                 modifier = Modifier.size(18.dp),
                                 color = AccentBlue,
                                 strokeWidth = 2.dp

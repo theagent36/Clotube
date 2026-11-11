@@ -33,6 +33,8 @@ import com.clotube.app.ui.screens.SettingsScreen
 import com.clotube.app.data.WatchHistoryItem
 import com.clotube.app.ui.theme.AppleTvMotion
 import com.clotube.app.viewmodel.VideoViewModel
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 
 object MaterialSharedZAxisMotion {
     val enterTransition: EnterTransition =
@@ -118,7 +120,9 @@ fun ClotubeNavHost(
     modifier: Modifier = Modifier,
     navController: NavHostController = rememberNavController()
 ) {
-    val uiState by videoViewModel.uiState.collectAsState()
+    val isSignedIn by remember(videoViewModel) {
+        videoViewModel.uiState.map { it.isSignedIn }.distinctUntilChanged()
+    }.collectAsState(initial = videoViewModel.uiState.value.isSignedIn)
 
     val context = androidx.compose.ui.platform.LocalContext.current
     val activity = remember(context) {
@@ -140,10 +144,17 @@ fun ClotubeNavHost(
         }
     }
 
-    if (!uiState.isSignedIn) {
+    if (!isSignedIn) {
+        val authUiState by remember(videoViewModel) {
+            videoViewModel.uiState
+                .map { it.isLoading to it.errorMessage }
+                .distinctUntilChanged()
+        }.collectAsState(
+            initial = videoViewModel.uiState.value.isLoading to videoViewModel.uiState.value.errorMessage
+        )
         ConnectDriveScreen(
-            isLoading = uiState.isLoading,
-            errorMessage = uiState.errorMessage,
+            isLoading = authUiState.first,
+            errorMessage = authUiState.second,
             onConnectClick = {
                 val act = activity
                 if (act != null) {
@@ -183,15 +194,22 @@ fun ClotubeNavHost(
                     onResumePlayback = { fileId, title, seriesId, positionMs ->
                         val safeFileId = (fileId ?: "").trim()
                         val safeTitle = (title ?: "").trim().ifBlank { "Video" }
+                        android.util.Log.i("ClotubePlayer", "--> NavHost onResumePlayback: fileId=$safeFileId, seriesId=$seriesId, positionMs=$positionMs")
                         if (safeFileId.isNotEmpty()) {
                             val isEpisode = videoViewModel.isEpisode(safeFileId, safeTitle) ||
                                 (seriesId ?: "").isNotBlank() ||
                                 safeTitle.contains(Regex("""S\d+E\d+|Season\s*\d+|Episode\s*\d+""", RegexOption.IGNORE_CASE))
 
-                            val resolvedSeriesId = seriesId?.trim()?.ifBlank { null }
-                                ?: if (isEpisode) {
-                                    videoViewModel.getSeriesIdForEpisode(safeFileId, null) ?: videoViewModel.getDefaultSeriesId()
-                                } else null
+                            val allKnownSeries = (videoViewModel.seriesList.value + videoViewModel.uiState.value.tvSeriesList).distinctBy { it.id }
+                            val resolvedSeriesId = seriesId?.trim()?.ifBlank { null }?.takeIf { sid ->
+                                allKnownSeries.isEmpty() || allKnownSeries.any { it.id == sid }
+                            } ?: if (isEpisode) {
+                                allKnownSeries.firstOrNull { s ->
+                                    s.seasons.any { sn -> sn.episodes.any { ep -> ep.id == safeFileId } }
+                                }?.id
+                                    ?: videoViewModel.getSeriesIdForEpisode(safeFileId, null)
+                                    ?: videoViewModel.getDefaultSeriesId()
+                            } else null
 
                             if (!resolvedSeriesId.isNullOrEmpty() || isEpisode) {
                                 val sId = resolvedSeriesId.orEmpty().ifBlank {
@@ -207,12 +225,16 @@ fun ClotubeNavHost(
                         navController.navigate(NavRoutes.SETTINGS)
                     },
                     onNavigateToSeriesDetail = { seriesId, autoPlayEpisodeId ->
+                        android.util.Log.i("ClotubePlayer", "--> NavHost navigating to SeriesDetail: seriesId=$seriesId, autoPlayEpisodeId=$autoPlayEpisodeId")
                         navController.navigate(NavRoutes.seriesDetailRoute(seriesId, episodeId = autoPlayEpisodeId, autoPlayEpisodeId = autoPlayEpisodeId))
                     },
                     onPlayMovie = { fileId ->
-                        val movie = videoViewModel.getMovieById(fileId)
-                        val title = movie?.title?.ifBlank { null } ?: movie?.displayTitle?.ifBlank { null } ?: "Movie"
-                        navController.navigate(NavRoutes.playerRoute(fileId, title))
+                        if (fileId.isNotBlank()) {
+                            val movie = videoViewModel.getMovieById(fileId)
+                            val title = movie?.title?.ifBlank { null } ?: movie?.displayTitle?.ifBlank { null } ?: "Movie"
+                            android.util.Log.i("ClotubePlayer", "--> NavHost navigating to Movie Player: fileId=$fileId, title=$title")
+                            navController.navigate(NavRoutes.playerRoute(fileId, title))
+                        }
                     }
                 )
             }
@@ -310,8 +332,18 @@ fun ClotubeNavHost(
                 val positionMs = backStackEntry.arguments?.getLong("positionMs") ?: 0L
                 val autoPlayEpisodeId = backStackEntry.arguments?.getString("autoPlayEpisodeId")
                 val effectiveAutoPlay = autoPlayEpisodeId?.ifBlank { null } ?: episodeId?.ifBlank { null }
-                val state = videoViewModel.uiState.collectAsState().value
-                val initialSeries = state.tvSeriesList.find { it.id == seriesId } ?: videoViewModel.getSeriesById(seriesId)
+                val initialSeries = remember(seriesId, effectiveAutoPlay) {
+                    val combinedSeries = (videoViewModel.seriesList.value + videoViewModel.uiState.value.tvSeriesList).distinctBy { it.id }
+                    combinedSeries.firstOrNull { it.id == seriesId && seriesId.isNotEmpty() }
+                        ?: effectiveAutoPlay?.let { epId ->
+                            combinedSeries.firstOrNull { s ->
+                                s.seasons.any { sn -> sn.episodes.any { it.id == epId } }
+                            }
+                        }
+                }
+                val initialAccessToken = remember(seriesId) {
+                    videoViewModel.uiState.value.accessToken ?: videoViewModel.getAccessToken()
+                }
 
                 SeriesDetailScreen(
                     seriesId = seriesId,
@@ -319,7 +351,7 @@ fun ClotubeNavHost(
                     initialPositionMs = positionMs,
                     autoPlayEpisodeId = effectiveAutoPlay,
                     initialSeries = initialSeries,
-                    accessToken = state.accessToken ?: videoViewModel.getAccessToken(),
+                    accessToken = initialAccessToken,
                     onNavigateBack = {
                         navController.popBackStack()
                     },
@@ -351,16 +383,26 @@ fun ClotubeNavHost(
                 popExitTransition = { MaterialSharedZAxisMotion.popExitTransition }
             ) { backStackEntry ->
                 val seriesId = backStackEntry.arguments?.getString("seriesId") ?: ""
-                val autoPlayEpisodeId = backStackEntry.arguments?.getString("autoPlayEpisodeId")
-                val state = videoViewModel.uiState.collectAsState().value
-                val initialSeries = state.tvSeriesList.find { it.id == seriesId } ?: videoViewModel.getSeriesById(seriesId)
+                val autoPlayEpisodeId = backStackEntry.arguments?.getString("autoPlayEpisodeId")?.ifBlank { null }
+                val initialSeries = remember(seriesId, autoPlayEpisodeId) {
+                    val combinedSeries = (videoViewModel.seriesList.value + videoViewModel.uiState.value.tvSeriesList).distinctBy { it.id }
+                    combinedSeries.firstOrNull { it.id == seriesId && seriesId.isNotEmpty() }
+                        ?: autoPlayEpisodeId?.let { epId ->
+                            combinedSeries.firstOrNull { s ->
+                                s.seasons.any { sn -> sn.episodes.any { it.id == epId } }
+                            }
+                        }
+                }
+                val initialAccessToken = remember(seriesId) {
+                    videoViewModel.uiState.value.accessToken ?: videoViewModel.getAccessToken()
+                }
 
                 SeriesDetailScreen(
                     seriesId = seriesId,
                     initialEpisodeId = autoPlayEpisodeId,
                     autoPlayEpisodeId = autoPlayEpisodeId,
                     initialSeries = initialSeries,
-                    accessToken = state.accessToken ?: videoViewModel.getAccessToken(),
+                    accessToken = initialAccessToken,
                     onNavigateBack = {
                         navController.popBackStack()
                     },

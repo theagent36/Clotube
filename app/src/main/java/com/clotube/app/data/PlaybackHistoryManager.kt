@@ -33,6 +33,7 @@ val Context.playbackDataStore: DataStore<Preferences> by preferencesDataStore(na
 val Context.playbackHistoryDataStore: DataStore<Preferences> get() = playbackDataStore
 
 @Keep
+@androidx.compose.runtime.Immutable
 data class WatchProgress(
     @SerializedName("fileId") val fileId: String = "",
     @SerializedName("title") val title: String = "",
@@ -47,7 +48,8 @@ data class WatchProgress(
     @SerializedName("seriesTitle") val seriesTitle: String? = null,
     @SerializedName("thumbnailUrl") val thumbnailUrl: String? = null,
     @SerializedName("backdropUrl") val backdropUrl: String? = null,
-    @SerializedName("genre") val genre: String? = null
+    @SerializedName("genre") val genre: String? = null,
+    @SerializedName("isWatched") val isWatched: Boolean = progressFraction >= 0.90f
 ) : Serializable {
     val lastUpdatedEpochMs: Long get() = lastWatchedTimestamp
     val episodeId: String get() = fileId
@@ -519,8 +521,9 @@ class PlaybackHistoryManager(
         val targetNextThumb = nextThumbnailUrl ?: resolvedNext?.thumbnailUrl
 
         dataStore.edit { prefs ->
-            // Mark completed episode 100%
-            prefs[longPreferencesKey("${completedEpisodeId}_pos")] = validDur
+            // Mark completed episode 100% watched with reset resume position (0L)
+            prefs[booleanPreferencesKey("${completedEpisodeId}_is_watched")] = true
+            prefs[longPreferencesKey("${completedEpisodeId}_pos")] = 0L
             prefs[longPreferencesKey("${completedEpisodeId}_dur")] = validDur
             prefs[floatPreferencesKey("${completedEpisodeId}_fraction")] = 1.0f
             prefs[longPreferencesKey("${completedEpisodeId}_timestamp")] = now
@@ -546,6 +549,7 @@ class PlaybackHistoryManager(
                 targetNextThumb?.let { prefs[stringPreferencesKey("${prefix}_thumb")] = it }
 
                 // Ensure next episode records reflect series status and queued progress
+                // (never mark targetNextId as watched or write durationMs into its position)
                 prefs[booleanPreferencesKey("${targetNextId}_is_series")] = true
                 prefs[stringPreferencesKey("${targetNextId}_series_id")] = seriesId
                 prefs[stringPreferencesKey("${targetNextId}_series_title")] = cleanSeries
@@ -557,6 +561,7 @@ class PlaybackHistoryManager(
                 prefs[floatPreferencesKey("${targetNextId}_fraction")] = 0.0f
                 prefs[longPreferencesKey("${targetNextId}_timestamp")] = now + 500L
                 targetNextThumb?.let { prefs[stringPreferencesKey("${targetNextId}_thumb")] = it }
+                prefs.remove(stringPreferencesKey("progress_${targetNextId}"))
 
                 // Save snapshot
                 prefs[SNAPSHOT_FILE_ID] = targetNextId
@@ -1632,8 +1637,10 @@ class PlaybackHistoryManager(
                 val eNum = allMap[intPreferencesKey("${fileId}_episode_num")] as? Int
                 val sTitle = allMap[stringPreferencesKey("${fileId}_series_title")] as? String
                 val thumb = allMap[stringPreferencesKey("${fileId}_thumb")] as? String
+                val explicitWatched = allMap[booleanPreferencesKey("${fileId}_is_watched")] as? Boolean
+                val isWatched = explicitWatched ?: (frac >= 0.90f)
 
-                if (dur > 0L) {
+                if (dur > 0L || explicitWatched != null) {
                     resultMap[fileId] = WatchProgress(
                         fileId = fileId,
                         title = title,
@@ -1647,7 +1654,8 @@ class PlaybackHistoryManager(
                         episodeNumber = eNum ?: 0,
                         seriesTitle = sTitle,
                         thumbnailUrl = thumb,
-                        backdropUrl = thumb
+                        backdropUrl = thumb,
+                        isWatched = isWatched
                     )
                 }
             }
@@ -1685,6 +1693,7 @@ class PlaybackHistoryManager(
             val eNum = prefs[intPreferencesKey("${fileId}_episode_num")]
             val sTitle = prefs[stringPreferencesKey("${fileId}_series_title")]
             val thumb = prefs[stringPreferencesKey("${fileId}_thumb")]
+            val isWatched = prefs[booleanPreferencesKey("${fileId}_is_watched")] ?: (frac >= 0.90f)
             return@map WatchProgress(
                 fileId = fileId,
                 title = title,
@@ -1698,7 +1707,8 @@ class PlaybackHistoryManager(
                 episodeNumber = eNum ?: 0,
                 seriesTitle = sTitle,
                 thumbnailUrl = thumb,
-                backdropUrl = thumb
+                backdropUrl = thumb,
+                isWatched = isWatched
             )
         }
         val legacyJson = prefs[stringPreferencesKey("progress_$fileId")]

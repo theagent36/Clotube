@@ -47,6 +47,8 @@ class DriveWatchHistorySync(private val context: Context) {
     private val lastUploadedHash = AtomicReference<String>("")
     private val uploadMutex = Mutex()
     private val lastUploadTime = AtomicLong(0L)
+    private val isSyncingFromCloud = AtomicBoolean(false)
+    private val lastCloudPullTimeMs = AtomicLong(0L)
 
     private data class SyncTarget(
         val fileId: String?,
@@ -58,6 +60,7 @@ class DriveWatchHistorySync(private val context: Context) {
         cachedFileId.set(null)
         cachedHistoryFolderId.set(null)
         lastUploadedHash.set("")
+        lastCloudPullTimeMs.set(0L)
     }
 
     private suspend fun resolveHistoryFolderId(driveService: Drive): String = withContext(Dispatchers.IO) {
@@ -692,11 +695,26 @@ class DriveWatchHistorySync(private val context: Context) {
         return (rootMatch ?: files.firstOrNull())?.id
     }
 
-    suspend fun syncFromCloud(dataStore: DataStore<Preferences>): Boolean = withContext(NonCancellable + Dispatchers.IO) {
+    suspend fun syncFromCloud(
+        dataStore: DataStore<Preferences>,
+        force: Boolean = false
+    ): Boolean = withContext(NonCancellable + Dispatchers.IO) {
+        val now = System.currentTimeMillis()
+        val lastPull = lastCloudPullTimeMs.get()
+        if (!force && (now - lastPull < CLOUD_PULL_COOLDOWN_MS)) {
+            Log.d(TAG, "Skipping duplicate syncFromCloud (cooldown active: ${now - lastPull}ms)")
+            return@withContext false
+        }
+        if (!isSyncingFromCloud.compareAndSet(false, true)) {
+            Log.d(TAG, "Skipping concurrent syncFromCloud (already in flight)")
+            return@withContext false
+        }
+
         try {
             val driveService = getDriveService() ?: return@withContext false
             var target = resolveTarget(driveService)
             val fileId = target.fileId ?: run {
+                lastCloudPullTimeMs.set(System.currentTimeMillis())
                 Log.d(TAG, "No remote history file in clotube/History/ or root to pull")
                 return@withContext false
             }
@@ -721,6 +739,7 @@ class DriveWatchHistorySync(private val context: Context) {
             }
 
             val rawJson = outputStream.toString("UTF-8")
+            lastCloudPullTimeMs.set(System.currentTimeMillis())
             if (rawJson.isBlank()) return@withContext false
 
             val merged = mergeRemotePayload(dataStore, rawJson)
@@ -732,6 +751,8 @@ class DriveWatchHistorySync(private val context: Context) {
         } catch (e: Exception) {
             Log.e(TAG, "Error pulling watch history from cloud: ${e.message}", e)
             false
+        } finally {
+            isSyncingFromCloud.set(false)
         }
     }
 
@@ -843,6 +864,7 @@ class DriveWatchHistorySync(private val context: Context) {
         private const val TAG = "ClotubeSync"
         private const val ACTIVE_SYNC_FILE = "clotube_active_sync.json"
         private const val LEGACY_SYNC_FILE = "clotube_watch_history.json"
+        private const val CLOUD_PULL_COOLDOWN_MS = 10_000L
 
         @Volatile
         private var defaultInstance: DriveWatchHistorySync? = null

@@ -1,10 +1,12 @@
 package com.clotube.app.model
 
 import androidx.annotation.Keep
+import androidx.compose.runtime.Immutable
 import com.google.gson.annotations.SerializedName
 import java.io.Serializable
 
 @Keep
+@Immutable
 data class ContinueWatchingItem(
     @SerializedName("mediaId") val mediaId: String = "",
     @SerializedName("seriesId") val seriesId: String? = null,
