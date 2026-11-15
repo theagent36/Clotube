@@ -5,6 +5,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
+import com.clotube.app.data.DownloadRepository
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -81,6 +82,15 @@ class MainActivity : ComponentActivity() {
             startService(android.content.Intent(this, com.clotube.app.data.ClotubeSyncService::class.java))
         } catch (e: Exception) {
             android.util.Log.e("MainActivity", "Failed to start ClotubeSyncService: ${e.message}", e)
+        }
+
+        // Auto-resume interrupted downloads on startup
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                DownloadRepository(applicationContext).resumeAllInterruptedDownloads()
+            } catch (e: Exception) {
+                android.util.Log.e("MainActivity", "Failed to resume downloads on startup: ${e.message}", e)
+            }
         }
 
         // Bind recovery launcher so UserRecoverableAuthException displays the consent checkboxes

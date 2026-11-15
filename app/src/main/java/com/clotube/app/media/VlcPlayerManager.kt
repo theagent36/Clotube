@@ -162,7 +162,13 @@ class VlcPlayerManager(
             userSelectedSpuTrackId = mediaPlayer.spuTrack
         }
         pendingTrackRestore = true
-        play(currentFileId, activeLocalFile, resumeMs)
+        CoroutineScope(Dispatchers.IO).launch {
+            val downloadRepo = com.clotube.app.data.DownloadRepository(context)
+            val localFile = downloadRepo.resolveVerifiedOfflineFile(currentFileId)
+            kotlinx.coroutines.withContext(Dispatchers.Main) {
+                play(currentFileId, localFile, resumeMs)
+            }
+        }
     }
 
     fun play(
@@ -181,23 +187,36 @@ class VlcPlayerManager(
         isPlaybackEnded = false
         mediaPlayer.stop()
         activeMedia?.release()
+        activeMedia = null
 
         val media = if (localFile != null && localFile.exists()) {
-            Media(libVLC, Uri.fromFile(localFile))
+            Media(libVLC, Uri.fromFile(localFile)).apply {
+                addOption(":file-caching=1500")
+                addOption(":clock-jitter=0")
+                addOption(":clock-synchro=0")
+            }
         } else {
             val proxyUrl = "http://127.0.0.1:${LocalStreamProxy.PORT}/stream?fileId=$fileId"
-            Media(libVLC, Uri.parse(proxyUrl))
+            Media(libVLC, Uri.parse(proxyUrl)).apply {
+                addOption(":network-caching=2000")
+                addOption(":file-caching=2000")
+                addOption(":http-reconnect")
+                addOption(":clock-jitter=0")
+                addOption(":clock-synchro=0")
+            }
         }
 
         media.apply {
-            setHWDecoderEnabled(true, false)
+            setHWDecoderEnabled(true, true)
             val startSecond = (startPositionMs / 1000L).coerceAtLeast(0L)
             applyClotubeMediaOptions(startSecond)
         }
 
-        activeMedia = media
-        mediaPlayer.media = media
-        media.release()
+        try {
+            mediaPlayer.media = media
+        } finally {
+            media.release()
+        }
 
         // RACE CONDITION FIX: Verify app is still active in foreground before starting
         if (isAppForegrounded) {

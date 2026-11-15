@@ -32,6 +32,7 @@ build/
 *.aab
 *.ap_
 *.dex
+clotube_source_bundle.md
 
 # IDE & Editor files
 .gradle/

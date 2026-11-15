@@ -348,7 +348,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         val movieTitle = movie?.title?.ifBlank { null } ?: movie?.displayTitle?.ifBlank { null } ?: "Untitled Movie"
         viewModelScope.launch(Dispatchers.IO) {
             val downloadRepo = com.clotube.app.data.DownloadRepository(getApplication())
-            val localFile = downloadRepo.getLocalFileIfDownloaded(fileId)
+            val localFile = downloadRepo.resolveVerifiedOfflineFile(fileId)
             val initialSeek = if (startPositionMs > 0L) {
                 val totalDuration = movie?.durationMs ?: 0L
                 val isNearEof = (totalDuration > 0L && startPositionMs >= totalDuration - 30_000L)
@@ -380,7 +380,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
     fun prepareAndPlayEpisode(episode: Episode, startPositionMs: Long = 0L) {
         viewModelScope.launch(Dispatchers.IO) {
             val downloadRepo = com.clotube.app.data.DownloadRepository(getApplication())
-            val localFile = downloadRepo.getLocalFileIfDownloaded(episode.id)
+            val localFile = downloadRepo.resolveVerifiedOfflineFile(episode.id)
             val initialSeek = if (startPositionMs > 0L) {
                 val totalDuration = episode.durationMs
                 val isNearEof = (totalDuration > 0L && startPositionMs >= totalDuration - 30_000L)
@@ -410,7 +410,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
     fun getStreamUrlForEpisode(episodeId: String): String {
         val downloaded = downloadRepository.getLocalFileIfDownloaded(episodeId)
         return if (downloaded != null && downloaded.exists()) {
-            downloaded.toURI().toString()
+            android.net.Uri.fromFile(downloaded).toString()
         } else {
             com.clotube.app.media.DriveStreamEngine.getStreamUrl(episodeId)
         }
@@ -418,6 +418,14 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
 
     suspend fun getFreshGoogleDriveAccessToken(forceRefresh: Boolean = false): String {
         return getValidAccessToken(forceRefresh)
+    }
+
+    fun downloadMedia(fileId: String, title: String) {
+        viewModelScope.launch {
+            val token = getValidAccessToken()
+            downloadRepository.enqueueDownload(fileId, title, token)
+            downloadRepository.requestUnrestrictedBatteryIfNeeded()
+        }
     }
 
     private val _episodeList = MutableStateFlow<List<Episode>>(emptyList())
@@ -544,7 +552,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
 
         viewModelScope.launch(Dispatchers.IO) {
             val downloadRepo = com.clotube.app.data.DownloadRepository(getApplication())
-            val localFile = downloadRepo.getLocalFileIfDownloaded(nextEpisode.id)
+            val localFile = downloadRepo.resolveVerifiedOfflineFile(nextEpisode.id)
             withContext(Dispatchers.Main) {
                 vlcPlayerManager.play(
                     fileId = nextEpisode.id,
@@ -594,7 +602,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
 
         viewModelScope.launch(Dispatchers.IO) {
             val downloadRepo = com.clotube.app.data.DownloadRepository(getApplication())
-            val localFile = downloadRepo.getLocalFileIfDownloaded(prevEpisode.id)
+            val localFile = downloadRepo.resolveVerifiedOfflineFile(prevEpisode.id)
             withContext(Dispatchers.Main) {
                 vlcPlayerManager.play(
                     fileId = prevEpisode.id,

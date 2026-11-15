@@ -975,6 +975,7 @@ private fun SeriesEpisodesSection(
                                     title = "${series.title} - ${episode.displayTitle}",
                                     authToken = token
                                 )
+                                viewModel.downloadRepository.requestUnrestrictedBatteryIfNeeded()
                             }
                         },
                         onCancelDownload = {

@@ -271,6 +271,7 @@ fun ClotubeVideoPlayer(
     forceExplicitStartPosition: Boolean = false
 ) {
     val context = LocalContext.current
+    val downloadRepository = remember { com.clotube.app.data.DownloadRepository(context) }
     LaunchedEffect(episode.id) {
         Log.i("ClotubePlayer", "--> ClotubeVideoPlayer COMPOSED for episode=${episode.id} (${episode.displayTitle})")
     }
@@ -385,28 +386,34 @@ fun ClotubeVideoPlayer(
                     }
                 }
 
-                Log.i("ClotubePlayer", "--> loadAndPlayStream creating LibVLC Media: ep=${targetEpisode.id}, streamUrl=$streamUrl, startPositionMs=$startPositionMs")
-                val media = Media(libVLCInstance, Uri.parse(streamUrl))
-                try {
-                    if (isLocalFile) {
-                        media.addOption(":file-caching=1500")
-                    } else {
-                        media.addOption(":network-caching=3000")
-                        media.addOption(":http-reconnect")
-                    }
-                    val totalDuration = targetEpisode.durationMs
-                    val safeStartMs = if (totalDuration > 0L && startPositionMs >= totalDuration - 5_000L) {
-                        0L
-                    } else {
-                        startPositionMs.coerceAtLeast(0L)
-                    }
-                    val startSec = (safeStartMs / 1000L).coerceAtLeast(0L)
-                    media.applyClotubeMediaOptions(startSec)
-                    if (startSec > 0L) {
-                        media.addOption(":start-time=$startSec")
-                    }
-                    media.setHWDecoderEnabled(true, true)
+                val totalDuration = targetEpisode.durationMs
+                val safeStartMs = if (totalDuration > 0L && startPositionMs >= totalDuration - 5_000L) {
+                    0L
+                } else {
+                    startPositionMs.coerceAtLeast(0L)
+                }
+                val startSec = (safeStartMs / 1000L).coerceAtLeast(0L)
 
+                Log.i("ClotubePlayer", "--> loadAndPlayStream creating LibVLC Media: ep=${targetEpisode.id}, streamUrl=$streamUrl, startPositionMs=$startPositionMs, startSec=$startSec")
+                val media = Media(libVLCInstance, Uri.parse(streamUrl)).apply {
+                    if (isLocalFile) {
+                        addOption(":file-caching=1500")
+                        addOption(":clock-jitter=0")
+                        addOption(":clock-synchro=0")
+                    } else {
+                        addOption(":network-caching=2000")
+                        addOption(":file-caching=2000")
+                        addOption(":http-reconnect")
+                        addOption(":clock-jitter=0")
+                        addOption(":clock-synchro=0")
+                    }
+                    applyClotubeMediaOptions(startSec)
+                    if (startSec > 0L) {
+                        addOption(":start-time=$startSec")
+                    }
+                    setHWDecoderEnabled(true, true)
+                }
+                try {
                     withContext(Dispatchers.Main) {
                         if (!isActive || isPlayerDisposed || currentEpisodeState.id != targetEpisode.id) {
                             return@withContext
@@ -419,6 +426,7 @@ fun ClotubeVideoPlayer(
                             Log.i("ClotubePlayer", "--> Calling mediaPlayer.play() for ep=${targetEpisode.id}, startSec=$startSec, isLocal=$isLocalFile")
                             audioFocusManager.requestAudioFocus()
                             mediaPlayer.safeCall(Unit) { play() }
+                            Log.i("ClotubePlayer", "--> MediaPlayer.play() invoked (offline=$isLocalFile)")
                         } else {
                             mediaPlayer.safeCall(Unit) { pause() }
                         }
@@ -649,9 +657,27 @@ fun ClotubeVideoPlayer(
         mediaPlayer.safeCall(Unit) { setEventListener(null) }
         mediaPlayer.safeCall(Unit) { stop() }
 
-        // 3. Resolve stream URL and start position
-        val streamUrl = withContext(Dispatchers.IO) {
-            viewModel.getStreamUrlForEpisode(episode.id)
+        // 3. Resolve playback source (offline-first check) and start position
+        Log.i("ClotubePlayer", "--> Resolving playback source for ${episode.id} (${episode.displayTitle})")
+        val (localFile, resumePos) = withContext(Dispatchers.IO) {
+            val offlineFile = downloadRepository.resolveVerifiedOfflineFile(episode.id)
+            val savedPos = if (forceExplicitStartPosition) {
+                effectiveStartPositionMs
+            } else if (effectiveStartPositionMs > 0L) {
+                effectiveStartPositionMs
+            } else {
+                viewModel.playbackHistoryManager.getResumePosition(episode.id)
+            }
+            Pair(offlineFile, savedPos)
+        }
+
+        val streamUrl = if (localFile != null) {
+            Log.i("ClotubePlayer", "--> Playing OFFLINE file: ${localFile.absolutePath} (${localFile.length()} bytes)")
+            Uri.fromFile(localFile).toString()
+        } else {
+            val onlineUrl = com.clotube.app.media.DriveStreamEngine.getStreamUrl(episode.id)
+            Log.i("ClotubePlayer", "--> Playing ONLINE proxy stream: $onlineUrl | Resume:${resumePos}ms")
+            onlineUrl
         }
         if (streamUrl.isBlank()) {
             loadedEpisodeId = null
@@ -660,18 +686,6 @@ fun ClotubeVideoPlayer(
             return@LaunchedEffect
         }
         activeStreamUrl = streamUrl
-
-        val resumePos = if (forceExplicitStartPosition) {
-            effectiveStartPositionMs
-        } else {
-            withContext(Dispatchers.IO) {
-                if (effectiveStartPositionMs > 0L) {
-                    effectiveStartPositionMs
-                } else {
-                    viewModel.playbackHistoryManager.getResumePosition(episode.id)
-                }
-            }
-        }
 
         computedInitialPositionMs = resumePos
         resetUiForEpisodeCallback?.invoke(resumePos, episode.durationMs)
@@ -686,6 +700,9 @@ fun ClotubeVideoPlayer(
                 loadedEpisodeId = null
             }
             throw ce
+        } catch (e: Exception) {
+            Log.e("ClotubePlayer", "Failed to load media: ${e.message}", e)
+            isLoading = false
         }
     }
 
@@ -749,8 +766,16 @@ fun ClotubeVideoPlayer(
             val targetEp = currentEpisodeState
             streamLoadJob?.cancel()
             streamLoadJob = coroutineScope.launch {
-                val url = activeStreamUrl.ifBlank {
-                    withContext(Dispatchers.IO) { viewModel.getStreamUrlForEpisode(targetEp.id) }
+                val url = withContext(Dispatchers.IO) {
+                    val offline = downloadRepository.resolveVerifiedOfflineFile(targetEp.id)
+                    if (offline != null) {
+                        Log.i("ClotubePlayer", "--> Reloading OFFLINE file: ${offline.absolutePath}")
+                        Uri.fromFile(offline).toString()
+                    } else {
+                        val onlineUrl = activeStreamUrl.ifBlank { viewModel.getStreamUrlForEpisode(targetEp.id) }
+                        Log.i("ClotubePlayer", "--> Reloading ONLINE stream: $onlineUrl")
+                        onlineUrl
+                    }
                 }
                 if (url.isNotBlank()) {
                     loadAndPlayStream(
@@ -813,6 +838,7 @@ fun ClotubeVideoPlayer(
     onBindListenerAndReset: ((ensureAttached: () -> Unit, resetUi: (Long, Long) -> Unit) -> Unit)? = null
 ) {
     val context = LocalContext.current
+    val downloadRepository = remember { com.clotube.app.data.DownloadRepository(context) }
     LaunchedEffect(mediaPlayer) {
         onPlayerCreated?.invoke(mediaPlayer)
     }
@@ -1192,14 +1218,20 @@ fun ClotubeVideoPlayer(
                     isReconnecting = false
                 } else {
                     val downloadRepo = com.clotube.app.data.DownloadRepository(context)
-                    val localFile = downloadRepo.getLocalFileIfDownloaded(currentMediaId)
+                    val localFile = withContext(Dispatchers.IO) { downloadRepo.resolveVerifiedOfflineFile(currentMediaId) }
                     if (localFile != null && localFile.exists()) {
                         mediaPlayer.safeCall(Unit) { stop() }
-                        val media = Media(mediaPlayer.libVLC, Uri.fromFile(localFile))
+                        val media = Media(mediaPlayer.libVLC, Uri.fromFile(localFile)).apply {
+                            addOption(":file-caching=1500")
+                            addOption(":clock-jitter=0")
+                            addOption(":clock-synchro=0")
+                            if (resumeMs > 3000L) {
+                                addOption(":start-time=${resumeMs / 1000L}")
+                            }
+                            applyClotubeMediaOptions(resumeSec)
+                            setHWDecoderEnabled(true, true)
+                        }
                         try {
-                            media.addOption(":file-caching=1500")
-                            media.applyClotubeMediaOptions(resumeSec)
-                            media.setHWDecoderEnabled(true, false)
                             mediaPlayer.safeCall(Unit) { this.media = media }
                         } finally {
                             try { media.release() } catch (_: Throwable) {}
@@ -1219,14 +1251,22 @@ fun ClotubeVideoPlayer(
                         }
                         if (streamUrl.isNotBlank()) {
                             mediaPlayer.safeCall(Unit) { stop() }
-                            val media = Media(mediaPlayer.libVLC, Uri.parse(streamUrl))
-                            try {
-                                media.addOption(":network-caching=1500")
+                            val media = Media(mediaPlayer.libVLC, Uri.parse(streamUrl)).apply {
+                                addOption(":network-caching=2000")
+                                addOption(":file-caching=2000")
+                                addOption(":http-reconnect")
+                                addOption(":clock-jitter=0")
+                                addOption(":clock-synchro=0")
                                 if (currentAccessToken.isNotBlank()) {
-                                    media.addOption(":http-header=Authorization: Bearer $currentAccessToken")
+                                    addOption(":http-header=Authorization: Bearer $currentAccessToken")
                                 }
-                                media.applyClotubeMediaOptions(resumeSec)
-                                media.setHWDecoderEnabled(true, false)
+                                if (resumeMs > 3000L) {
+                                    addOption(":start-time=${resumeMs / 1000L}")
+                                }
+                                applyClotubeMediaOptions(resumeSec)
+                                setHWDecoderEnabled(true, true)
+                            }
+                            try {
                                 mediaPlayer.safeCall(Unit) { this.media = media }
                             } finally {
                                 try { media.release() } catch (_: Throwable) {}
