@@ -9,10 +9,13 @@ signing.properties
 
 # Google Cloud, Firebase & OAuth Credentials
 google-services.json
+client_secret*.json
 *client_secret*.json
 *credentials*.json
 *service_account*.json
-oauth*.json
+*oauth*.json
+.env
+.env.*
 
 # Gradle & Local Configuration
 gradle.properties
@@ -27,12 +30,17 @@ cache/
 
 # Build outputs
 build/
+app/build/
 **/build/
 *.apk
 *.aab
 *.ap_
 *.dex
+
+# Local source dumps & notes
 clotube_source_bundle.md
+clotube_desktop_source_bundle.md
+Bundle the codes (Android).txt
 
 # IDE & Editor files
 .gradle/
@@ -46,4 +54,3 @@ clotube_source_bundle.md
 captures/
 .externalNativeBuild/
 .cxx/
-

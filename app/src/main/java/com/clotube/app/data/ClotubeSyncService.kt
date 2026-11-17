@@ -4,6 +4,7 @@ import android.app.Service
 import android.content.Intent
 import android.os.IBinder
 import android.util.Log
+import com.clotube.app.sync.DriveSyncWorker
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -18,8 +19,8 @@ class ClotubeSyncService : Service() {
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
-        Log.d("ClotubeSync", "App task removed from Recents. Triggering persistent WorkManager sync and resuming downloads...")
-        DriveSyncWorker.enqueue(applicationContext)
+        Log.i("ClotubeSync", "App task removed from Recents. Triggering persistent WorkManager sync and resuming downloads...")
+        DriveSyncWorker.enqueueImmediateSync(applicationContext)
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 DownloadRepository(applicationContext).resumeAllInterruptedDownloads()

@@ -1,6 +1,9 @@
 package com.clotube.app.data
 
 import android.content.Context
+import com.clotube.app.model.ContinueWatchingItem
+import com.clotube.app.model.Movie
+import com.clotube.app.model.Series
 import com.google.gson.GsonBuilder
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
@@ -288,36 +291,42 @@ object AndroidWatchHistoryManager {
         try {
             val payload = WatchHistoryPayloadV2.fromJsonString(remoteJson)
             synchronized(local) {
-                val remoteWatchedSet = payload.watchedIds.toSet()
+                val remoteWatchedSet = (payload.watchedIds + payload.active.filter { it.isWatched }.map { it.id })
+                    .filter { it.isNotBlank() }
+                    .toSet()
 
-                // 1. Reconcile active items: adopt remote isWatched flag when remote is newer.
+                // 1. Reconcile active items: adopt remote isWatched flag and progress when remote is newer.
                 for (item in payload.active) {
                     if (item.id.isBlank()) continue
+                    val itemTs = WatchHistoryPayloadV2.normalizeTimestampMs(item.timestamp)
                     val localTs = (local["${item.id}_timestamp"]?.value as? Number)?.toLong() ?: 0L
                     val isMissing = !local.containsKey("${item.id}_pos") &&
                         !local.containsKey("${item.id}_is_watched")
-                    if (item.timestamp > localTs || isMissing) {
+                    if (itemTs > localTs || isMissing) {
                         if (item.title.isNotBlank()) {
                             local["${item.id}_title"] = AndroidTypedEntry("string", item.title)
                         }
-                        // When unmarked (isWatched=false), write pos=0 and fraction=0
-                        val effectivePos = if (item.isWatched) item.positionMs else 0L
-                        val effectiveFrac = if (item.isWatched) {
-                            if (item.durationMs > 0L)
-                                (item.positionMs.toFloat() / item.durationMs.toFloat()).coerceIn(0f, 1f)
-                            else 1.0f
+                        val isItemWatched = item.isWatched || item.id in remoteWatchedSet
+                        val effectiveFrac = if (isItemWatched) {
+                            1.0f
+                        } else if (item.durationMs > 0L) {
+                            (item.positionMs.toFloat() / item.durationMs.toFloat()).coerceIn(0f, 1f)
                         } else {
-                            0.0f
+                            item.progressFraction.coerceIn(0f, 1f)
+                        }
+                        val effectivePos = if (isItemWatched) {
+                            if (item.positionMs > 0L) item.positionMs else item.durationMs
+                        } else {
+                            item.positionMs
                         }
                         local["${item.id}_pos"] = AndroidTypedEntry("long", effectivePos)
                         local["${item.id}_dur"] = AndroidTypedEntry("long", item.durationMs)
                         local["${item.id}_fraction"] = AndroidTypedEntry("float", effectiveFrac)
-                        local["${item.id}_timestamp"] = AndroidTypedEntry("long", item.timestamp)
-                        // Authoritative: use the item's explicit isWatched from remote,
-                        // also checking remoteWatchedSet for IDs that are only in watchedIds.
-                        val watchedValue = item.isWatched || item.id in remoteWatchedSet
-                        local["${item.id}_is_watched"] = AndroidTypedEntry("boolean", watchedValue)
-                        local["${item.id}_is_series"] = AndroidTypedEntry("boolean", !item.seriesId.isNullOrBlank())
+                        local["${item.id}_timestamp"] = AndroidTypedEntry("long", itemTs)
+                        local["${item.id}_is_watched"] = AndroidTypedEntry("boolean", isItemWatched)
+                        val isSeries = !item.seriesId.isNullOrBlank() ||
+                            item.seasonNumber != null || item.episodeNumber != null
+                        local["${item.id}_is_series"] = AndroidTypedEntry("boolean", isSeries)
                         if (!item.seriesId.isNullOrBlank()) {
                             local["${item.id}_series_id"] = AndroidTypedEntry("string", item.seriesId)
                         }
@@ -338,8 +347,9 @@ object AndroidWatchHistoryManager {
                     if (id.isBlank() || id in coveredByActive) continue
                     val localTs = (local["${id}_timestamp"]?.value as? Number)?.toLong() ?: 0L
                     val localExplicit = local["${id}_is_watched"]?.value as? Boolean
+                    val remoteUpdatedAt = WatchHistoryPayloadV2.normalizeTimestampMs(payload.updatedAt)
                     // Only override if the remote payload is authoritative (newer) or not set locally
-                    if (localExplicit != false || payload.updatedAt > localTs) {
+                    if (localExplicit != false || remoteUpdatedAt > localTs) {
                         if (localExplicit != true) {
                             local["${id}_is_watched"] = AndroidTypedEntry("boolean", true)
                             changed = true
@@ -348,26 +358,56 @@ object AndroidWatchHistoryManager {
                             local["${id}_fraction"] = AndroidTypedEntry("float", 1.0f)
                             changed = true
                         }
-                        if (!local.containsKey("${id}_timestamp")) {
-                            local["${id}_timestamp"] = AndroidTypedEntry("long", payload.updatedAt)
+                        if (!local.containsKey("${id}_timestamp") || remoteUpdatedAt > localTs) {
+                            local["${id}_timestamp"] = AndroidTypedEntry("long", remoteUpdatedAt)
                             changed = true
                         }
                     }
                 }
 
-                // 3. Merge series resume pointers by timestamp-wins.
+                // 3. Merge series resume pointers AND sync target episodeId record
                 for ((sid, res) in payload.resume) {
                     if (sid.isBlank() || res.episodeId.isBlank()) continue
+                    val resTs = WatchHistoryPayloadV2.normalizeTimestampMs(res.timestamp)
                     val prefix = "series_resume_$sid"
                     val localTs = (local["${prefix}_timestamp"]?.value as? Number)?.toLong() ?: 0L
                     val isMissing = !local.containsKey("${prefix}_episode_id")
-                    if (res.timestamp > localTs || isMissing) {
+                    if (resTs > localTs || isMissing) {
+                        val frac = if (res.durationMs > 0L) {
+                            (res.positionMs.toFloat() / res.durationMs.toFloat()).coerceIn(0f, 1f)
+                        } else {
+                            0f
+                        }
                         local["${prefix}_episode_id"] = AndroidTypedEntry("string", res.episodeId)
                         local["${prefix}_season_num"] = AndroidTypedEntry("int", res.seasonNumber)
                         local["${prefix}_episode_num"] = AndroidTypedEntry("int", res.episodeNumber)
                         local["${prefix}_pos_ms"] = AndroidTypedEntry("long", res.positionMs)
                         local["${prefix}_dur_ms"] = AndroidTypedEntry("long", res.durationMs)
-                        local["${prefix}_timestamp"] = AndroidTypedEntry("long", res.timestamp)
+                        local["${prefix}_fraction"] = AndroidTypedEntry("float", frac)
+                        local["${prefix}_timestamp"] = AndroidTypedEntry("long", resTs)
+
+                        // Synchronize target episodeId record
+                        val epPrefix = res.episodeId
+                        val localEpTs = (local["${epPrefix}_timestamp"]?.value as? Number)?.toLong() ?: 0L
+                        val targetEpTs = maxOf(localEpTs, resTs)
+                        local["${epPrefix}_timestamp"] = AndroidTypedEntry("long", targetEpTs)
+                        val isResumeCompleted = res.durationMs > 0L && res.positionMs >= (res.durationMs * 0.90f)
+                        if (!isResumeCompleted) {
+                            local["${epPrefix}_is_watched"] = AndroidTypedEntry("boolean", false)
+                        }
+                        if (!local.containsKey("${epPrefix}_pos") || resTs >= localEpTs) {
+                            local["${epPrefix}_pos"] = AndroidTypedEntry("long", res.positionMs)
+                        }
+                        if (!local.containsKey("${epPrefix}_dur") || resTs >= localEpTs) {
+                            local["${epPrefix}_dur"] = AndroidTypedEntry("long", res.durationMs)
+                        }
+                        if (!local.containsKey("${epPrefix}_fraction") || resTs >= localEpTs) {
+                            local["${epPrefix}_fraction"] = AndroidTypedEntry("float", frac)
+                        }
+                        local["${epPrefix}_is_series"] = AndroidTypedEntry("boolean", true)
+                        local["${epPrefix}_series_id"] = AndroidTypedEntry("string", sid)
+                        local["${epPrefix}_season_num"] = AndroidTypedEntry("int", res.seasonNumber)
+                        local["${epPrefix}_episode_num"] = AndroidTypedEntry("int", res.episodeNumber)
                         changed = true
                     }
                 }
@@ -661,5 +701,34 @@ object AndroidWatchHistoryManager {
             local["${nextEpId}_episode_num"] = AndroidTypedEntry("int", nextEpNum)
         }
         saveLocal(context, email, local)
+    }
+
+    fun removeEntriesForMedia(context: Context, email: String, mediaId: String, seriesId: String?) {
+        val local = loadLocalSync(context, email)
+        synchronized(local) {
+            val keysToRemove = local.keys.filter { key ->
+                (mediaId.isNotBlank() && key.contains(mediaId)) ||
+                (!seriesId.isNullOrBlank() && key.startsWith("series_resume_${seriesId}"))
+            }
+            if (keysToRemove.isNotEmpty()) {
+                keysToRemove.forEach { local.remove(it) }
+                saveLocal(context, email, local)
+            }
+        }
+    }
+
+    suspend fun removeContinueWatchingItem(context: Context, mediaId: String, seriesId: String?) {
+        val account = com.google.android.gms.auth.api.signin.GoogleSignIn.getLastSignedInAccount(context)
+        val email = account?.email ?: "default"
+        removeEntriesForMedia(context, email, mediaId, seriesId)
+        PlaybackHistoryManager(context).removeContinueWatchingItem(context, mediaId, seriesId)
+    }
+
+    suspend fun getAllContinueWatchingItems(
+        context: Context,
+        movies: List<Movie>,
+        seriesList: List<Series>
+    ): List<ContinueWatchingItem> {
+        return PlaybackHistoryManager(context).getAllContinueWatchingItems(movies, seriesList)
     }
 }

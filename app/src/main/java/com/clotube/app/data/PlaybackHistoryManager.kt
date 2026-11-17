@@ -16,6 +16,8 @@ import com.google.gson.annotations.SerializedName
 import com.google.gson.reflect.TypeToken
 import com.clotube.app.model.ContinueWatchingItem
 import com.clotube.app.model.Episode
+import com.clotube.app.model.Movie
+import com.clotube.app.model.Series
 import androidx.annotation.Keep
 import java.io.Serializable
 import kotlinx.coroutines.Dispatchers
@@ -1340,10 +1342,11 @@ class PlaybackHistoryManager(
         return dataStore.data.map { prefs ->
             val candidates = mutableListOf<ContinueWatchingItem>()
 
-            // 1. Candidate from Snapshot (if present)
+            // 1. Candidate from Snapshot (if present and unwatched)
             val snapFileId = prefs[SNAPSHOT_FILE_ID]
             val snapTs = prefs[SNAPSHOT_TIMESTAMP] ?: 0L
-            if (!snapFileId.isNullOrBlank() && snapTs > 0L) {
+            val snapExplicitWatched = snapFileId?.let { prefs[booleanPreferencesKey("${it}_is_watched")] } ?: false
+            if (!snapFileId.isNullOrBlank() && snapTs > 0L && !snapExplicitWatched) {
                 val title = prefs[SNAPSHOT_TITLE] ?: "Video"
                 val sTitle = prefs[SNAPSHOT_SERIES_NAME]
                 val sId = prefs[SNAPSHOT_SERIES_ID]
@@ -1398,73 +1401,83 @@ class PlaybackHistoryManager(
             }
 
             // 2. Candidate from series_resume_${seriesId} pointers
+            val resumeEpisodeIds = mutableSetOf<String>()
             prefs.asMap().keys.forEach { key ->
                 if (key.name.startsWith("series_resume_") && key.name.endsWith("_episode_id")) {
                     val sId = key.name.removePrefix("series_resume_").removeSuffix("_episode_id")
                     val p = "series_resume_${sId}"
                     val epId = prefs[stringPreferencesKey("${p}_episode_id")] ?: ""
                     if (epId.isNotBlank()) {
+                        resumeEpisodeIds.add(epId)
+                        val epWatched = prefs[booleanPreferencesKey("${epId}_is_watched")] ?: false
                         val ts = prefs[longPreferencesKey("${p}_timestamp")] ?: 0L
                         val epTs = prefs[longPreferencesKey("${epId}_timestamp")] ?: 0L
                         val effectiveTs = maxOf(ts, epTs)
-                        val rawSeriesTitle = prefs[stringPreferencesKey("${p}_series_title")] ?: "The Mentalist"
-                        val seriesTitle = cleanSeriesTitle(rawSeriesTitle).ifBlank { rawSeriesTitle.trim() }
-                        val rawEpTitle = prefs[stringPreferencesKey("${p}_episode_title")] ?: ""
-                        val parsedEp = com.clotube.app.data.metadata.OnlineMetadataResolver.extractSeasonAndEpisode(rawEpTitle)
-                            ?: com.clotube.app.data.metadata.OnlineMetadataResolver.extractSeasonAndEpisode(prefs[stringPreferencesKey("${epId}_title")].orEmpty())
-                        val sNumStored = prefs[intPreferencesKey("${p}_season_num")] ?: 0
-                        val eNumStored = prefs[intPreferencesKey("${p}_episode_num")] ?: 0
-                        val actualSNum = when {
-                            sNumStored > 0 -> sNumStored
-                            parsedEp != null -> parsedEp.first
-                            else -> 1
-                        }
-                        val actualENum = when {
-                            eNumStored > 0 -> eNumStored
-                            parsedEp != null -> parsedEp.second
-                            else -> 1
-                        }
-                        val cleanEpTitle = rawEpTitle
-                            .replace(Regex("(?i)\\bcompleted\\b"), "")
-                            .replace(Regex("(?i)\\bcomplete\\b"), "")
-                            .replace(Regex("(?i)^.*?S0*\\d+[:\\s._-]*E0*\\d+[:\\s-]*"), "")
-                            .replace(Regex("(?i)^${Regex.escape(seriesTitle)}[:\\s-]*"), "")
-                            .trim(' ', '-', '•', ':')
-                            .ifBlank { "Episode $actualENum" }
-                        val epCode = "S${actualSNum.toString().padStart(2, '0')}:E${actualENum.toString().padStart(2, '0')}"
-                        val displaySubtitle = "$epCode • $cleanEpTitle"
-
                         val pos = prefs[longPreferencesKey("${p}_pos_ms")] ?: prefs[longPreferencesKey("${epId}_pos")] ?: 0L
                         val dur = prefs[longPreferencesKey("${p}_dur_ms")] ?: prefs[longPreferencesKey("${epId}_dur")] ?: 0L
                         val frac = prefs[floatPreferencesKey("${p}_fraction")]
                             ?: prefs[floatPreferencesKey("${epId}_fraction")]
                             ?: (if (dur > 0L) (pos.toFloat() / dur.toFloat()).coerceIn(0f, 1f) else 0f)
 
-                        val rawThumb = prefs[stringPreferencesKey("${epId}_thumb")]
-                            ?: prefs[stringPreferencesKey("${p}_thumb")] ?: ""
-                        val thumb = if (rawThumb.isNotBlank() && !rawThumb.contains("drive.google.com")) {
-                            rawThumb
-                        } else if (actualSNum == 5 && actualENum == 1) {
-                            "https://static.tvmaze.com/uploads/images/original_untouched/184/462089.jpg"
-                        } else rawThumb
+                        if (!epWatched && frac < 0.95f && effectiveTs > 0L) {
+                            val rawEpTitle = prefs[stringPreferencesKey("${p}_episode_title")]
+                                ?: prefs[stringPreferencesKey("${epId}_title")] ?: ""
+                            val extractedPrefix = rawEpTitle
+                                .replace(Regex("(?i)\\s*[-•:]?\\s*S0*\\d+[:\\s._-]*E0*\\d+.*$"), "")
+                                .trim(' ', '-', '•', ':')
+                            val rawSeriesTitle = prefs[stringPreferencesKey("${p}_series_title")]?.ifBlank { null }
+                                ?: prefs[stringPreferencesKey("${epId}_series_title")]?.ifBlank { null }
+                                ?: extractedPrefix.ifBlank { null }
+                                ?: "TV Series"
+                            val seriesTitle = cleanSeriesTitle(rawSeriesTitle).ifBlank { rawSeriesTitle.trim() }
+                            val parsedEp = com.clotube.app.data.metadata.OnlineMetadataResolver.extractSeasonAndEpisode(rawEpTitle)
+                                ?: com.clotube.app.data.metadata.OnlineMetadataResolver.extractSeasonAndEpisode(prefs[stringPreferencesKey("${epId}_title")].orEmpty())
+                            val sNumStored = prefs[intPreferencesKey("${p}_season_num")] ?: 0
+                            val eNumStored = prefs[intPreferencesKey("${p}_episode_num")] ?: 0
+                            val actualSNum = when {
+                                sNumStored > 0 -> sNumStored
+                                parsedEp != null -> parsedEp.first
+                                else -> 1
+                            }
+                            val actualENum = when {
+                                eNumStored > 0 -> eNumStored
+                                parsedEp != null -> parsedEp.second
+                                else -> 1
+                            }
+                            val cleanEpTitle = rawEpTitle
+                                .replace(Regex("(?i)\\bcompleted\\b"), "")
+                                .replace(Regex("(?i)\\bcomplete\\b"), "")
+                                .replace(Regex("(?i)^.*?S0*\\d+[:\\s._-]*E0*\\d+[:\\s-]*"), "")
+                                .replace(Regex("(?i)^${Regex.escape(seriesTitle)}[:\\s-]*"), "")
+                                .trim(' ', '-', '•', ':')
+                                .ifBlank { "Episode $actualENum" }
+                            val epCode = "S${actualSNum.toString().padStart(2, '0')}:E${actualENum.toString().padStart(2, '0')}"
+                            val displaySubtitle = "$epCode • $cleanEpTitle"
 
-                        candidates.add(
-                            ContinueWatchingItem(
-                                mediaId = epId,
-                                seriesId = sId,
-                                isSeries = true,
-                                seriesTitle = seriesTitle,
-                                seasonNumber = actualSNum,
-                                episodeNumber = actualENum,
-                                episodeTitle = cleanEpTitle,
-                                displaySubtitle = displaySubtitle,
-                                thumbnailUrl = thumb,
-                                progressFraction = frac,
-                                currentPositionMs = pos,
-                                durationMs = dur,
-                                lastWatchedTimestamp = effectiveTs
+                            val rawThumb = prefs[stringPreferencesKey("${epId}_thumb")]
+                                ?: prefs[stringPreferencesKey("${p}_thumb")] ?: ""
+                            val thumb = if (rawThumb.isNotBlank() && !rawThumb.contains("drive.google.com")) {
+                                rawThumb
+                            } else rawThumb
+
+                            candidates.add(
+                                ContinueWatchingItem(
+                                    mediaId = epId,
+                                    seriesId = sId,
+                                    isSeries = true,
+                                    seriesTitle = seriesTitle,
+                                    seasonNumber = actualSNum,
+                                    episodeNumber = actualENum,
+                                    episodeTitle = cleanEpTitle,
+                                    displaySubtitle = displaySubtitle,
+                                    thumbnailUrl = thumb,
+                                    progressFraction = frac,
+                                    currentPositionMs = pos,
+                                    durationMs = dur,
+                                    lastWatchedTimestamp = effectiveTs
+                                )
                             )
-                        )
+                        }
                     }
                 }
             }
@@ -1474,11 +1487,19 @@ class PlaybackHistoryManager(
                 if (key.name.endsWith("_timestamp") &&
                     !key.name.startsWith("series_resume_") &&
                     !key.name.startsWith("global_") &&
+                    !key.name.startsWith("last_global_") &&
+                    !key.name.startsWith("snapshot_") &&
                     key.name != "global_latest_timestamp"
                 ) {
                     val fileId = key.name.removeSuffix("_timestamp")
                     val ts = prefs[longPreferencesKey("${fileId}_timestamp")] ?: 0L
-                    if (ts > 0L) {
+                    val pos = prefs[longPreferencesKey("${fileId}_pos")] ?: 0L
+                    val dur = prefs[longPreferencesKey("${fileId}_dur")] ?: 0L
+                    val frac = prefs[floatPreferencesKey("${fileId}_fraction")] ?: (if (dur > 0L) (pos.toFloat() / dur.toFloat()).coerceIn(0f, 1f) else 0f)
+                    val explicitWatched = prefs[booleanPreferencesKey("${fileId}_is_watched")]
+                    val isWatched = explicitWatched ?: (frac >= 0.90f)
+
+                    if (ts > 0L && !isWatched && frac < 0.95f && (pos >= 1000L || fileId in resumeEpisodeIds)) {
                         val rawTitle = prefs[stringPreferencesKey("${fileId}_title")] ?: "Video"
                         val title = cleanTitleFormatting(rawTitle)
                         val sId = prefs[stringPreferencesKey("${fileId}_series_id")]
@@ -1489,10 +1510,6 @@ class PlaybackHistoryManager(
                         val isSeriesExplicit = prefs[booleanPreferencesKey("${fileId}_is_series")] ?: false
                         val parsedDisc = com.clotube.app.data.metadata.OnlineMetadataResolver.extractSeasonAndEpisode(title)
                         val isSeries = isSeriesExplicit || sId != null || (sNum != null && sNum > 0) || sTitle != null || parsedDisc != null
-
-                        val pos = prefs[longPreferencesKey("${fileId}_pos")] ?: 0L
-                        val dur = prefs[longPreferencesKey("${fileId}_dur")] ?: 0L
-                        val frac = prefs[floatPreferencesKey("${fileId}_fraction")] ?: (if (dur > 0L) (pos.toFloat() / dur.toFloat()).coerceIn(0f, 1f) else 0f)
                         val rawThumb = prefs[stringPreferencesKey("${fileId}_thumb")] ?: ""
 
                         if (isSeries) {
@@ -1508,10 +1525,13 @@ class PlaybackHistoryManager(
                             }
                             val thumb = if (rawThumb.isNotBlank() && !rawThumb.contains("drive.google.com")) {
                                 rawThumb
-                            } else if (actualSNum == 5 && actualENum == 1) {
-                                "https://static.tvmaze.com/uploads/images/original_untouched/184/462089.jpg"
                             } else rawThumb
-                            val seriesName = sTitle?.ifBlank { null } ?: "The Mentalist"
+                            val extractedPrefix = title
+                                .replace(Regex("(?i)\\s*[-•:]?\\s*S0*\\d+[:\\s._-]*E0*\\d+.*$"), "")
+                                .trim(' ', '-', '•', ':')
+                            val seriesName = sTitle?.ifBlank { null }
+                                ?: extractedPrefix.ifBlank { null }
+                                ?: "TV Series"
                             val cleanEpTitle = title
                                 .replace(Regex("(?i)\\bcompleted\\b"), "")
                                 .replace(Regex("(?i)\\bcomplete\\b"), "")
@@ -1566,50 +1586,462 @@ class PlaybackHistoryManager(
         }
     }
 
+    private fun safeNotBlank(str: String?): String? = if (!str.isNullOrBlank()) str else null
+
+    /**
+     * Scans all saved ${fileId}_* and series_resume_${seriesId}_* entries in DataStore to produce
+     * a multi-item Continue Watching list for the Home Screen.
+     *
+     * Rules:
+     * - Only includes titles where positionMs > 5000L (5 seconds) and !isWatched (progressFraction < 0.90f and _is_watched != true).
+     * - Deduplicates per series using the latest series_resume_${seriesId}_timestamp so each active series appears once with its current ongoing episode.
+     * - Sorts descending by timestamp so the most recently watched title is always first.
+     */
+    suspend fun getAllContinueWatchingItems(
+        movies: List<Movie>,
+        seriesList: List<Series>
+    ): List<ContinueWatchingItem> = withContext(Dispatchers.IO) {
+        val prefs = dataStore.data.first()
+        val allEntries = prefs.asMap()
+        val result = mutableListOf<ContinueWatchingItem>()
+        val seenSeriesIds = mutableSetOf<String>()
+        val seenMediaIds = mutableSetOf<String>()
+
+        // 1. Scan series_resume_${seriesId}_* pointers
+        allEntries.keys
+            .filter { it.name.startsWith("series_resume_") && it.name.endsWith("_episode_id") }
+            .forEach { epKey ->
+                val sId = epKey.name.removePrefix("series_resume_").removeSuffix("_episode_id")
+                val p = "series_resume_${sId}"
+                val epId = prefs[stringPreferencesKey("${p}_episode_id")].orEmpty()
+                if (epId.isNotBlank()) {
+                    val resumeTs = prefs[longPreferencesKey("${p}_timestamp")] ?: 0L
+                    val epTs = prefs[longPreferencesKey("${epId}_timestamp")] ?: 0L
+                    val ts = maxOf(resumeTs, epTs)
+                    val pos = prefs[longPreferencesKey("${p}_pos_ms")]
+                        ?: prefs[longPreferencesKey("${epId}_pos")] ?: 0L
+                    val dur = prefs[longPreferencesKey("${p}_dur_ms")]
+                        ?: prefs[longPreferencesKey("${epId}_dur")] ?: 0L
+                    val frac = prefs[floatPreferencesKey("${p}_fraction")]
+                        ?: prefs[floatPreferencesKey("${epId}_fraction")]
+                        ?: (if (dur > 0L) (pos.toFloat() / dur.toFloat()).coerceIn(0f, 1f) else 0f)
+                    val isWatched = (prefs[booleanPreferencesKey("${epId}_is_watched")] ?: false) || frac >= 0.90f
+
+                    if (!isWatched && frac < 0.90f && (pos > 5000L || ts > 0L)) {
+                        val matchedSeries = seriesList.firstOrNull { it.id == sId }
+                        val allEpisodes = matchedSeries?.seasons?.flatMap { it.episodes } ?: emptyList()
+                        val matchedEp = allEpisodes.firstOrNull { it.id == epId }
+
+                        val sNumStored = prefs[intPreferencesKey("${p}_season_num")] ?: 0
+                        val eNumStored = prefs[intPreferencesKey("${p}_episode_num")] ?: 0
+                        val seasonNum = when {
+                            matchedEp?.seasonNumber != null && matchedEp.seasonNumber > 0 -> matchedEp.seasonNumber
+                            sNumStored > 0 -> sNumStored
+                            else -> 1
+                        }
+                        val episodeNum = when {
+                            matchedEp?.episodeNumber != null && matchedEp.episodeNumber > 0 -> matchedEp.episodeNumber
+                            eNumStored > 0 -> eNumStored
+                            else -> 1
+                        }
+
+                        val rawSeriesTitle = matchedSeries?.title?.ifBlank { null }
+                            ?: prefs[stringPreferencesKey("${p}_series_title")] ?: "TV Series"
+                        val seriesTitle = cleanSeriesTitle(rawSeriesTitle).ifBlank { rawSeriesTitle.trim() }
+
+                        val rawEpTitle = matchedEp?.displayTitle?.ifBlank { null }
+                            ?: prefs[stringPreferencesKey("${p}_episode_title")] ?: ""
+                        val cleanEp = rawEpTitle
+                            .replace(Regex("(?i)\\bcompleted\\b"), "")
+                            .replace(Regex("(?i)\\bcomplete\\b"), "")
+                            .replace(Regex("(?i)^.*?S0*\\d+[:\\s._-]*E0*\\d+[:\\s-]*"), "")
+                            .replace(Regex("(?i)^${Regex.escape(seriesTitle)}[:\\s-]*"), "")
+                            .trim(' ', '-', '•', ':')
+                            .ifBlank { "Episode $episodeNum" }
+
+                        val epCode = "S${seasonNum.toString().padStart(2, '0')}:E${episodeNum.toString().padStart(2, '0')}"
+                        val displaySubtitle = "$epCode • $cleanEp"
+
+                        val thumb = safeNotBlank(matchedEp?.thumbnailUrl)
+                            ?: safeNotBlank(prefs[stringPreferencesKey("${epId}_thumb")])
+                            ?: safeNotBlank(prefs[stringPreferencesKey("${p}_thumb")])
+                            ?: safeNotBlank(matchedSeries?.backdropUrl)
+                            ?: safeNotBlank(matchedSeries?.posterUrl)
+                            ?: ""
+
+                        result.add(
+                            ContinueWatchingItem(
+                                mediaId = epId,
+                                seriesId = sId,
+                                isSeries = true,
+                                seriesTitle = seriesTitle,
+                                seasonNumber = seasonNum,
+                                episodeNumber = episodeNum,
+                                episodeTitle = cleanEp,
+                                displaySubtitle = displaySubtitle,
+                                thumbnailUrl = thumb,
+                                progressFraction = frac,
+                                currentPositionMs = pos,
+                                durationMs = dur,
+                                lastWatchedTimestamp = ts,
+                                title = seriesTitle,
+                                subtitle = displaySubtitle,
+                                positionMs = pos,
+                                timestamp = ts,
+                                backdropUrl = thumb
+                            )
+                        )
+                        seenSeriesIds.add(sId)
+                        seenMediaIds.add(epId)
+                    }
+                }
+            }
+
+        // 2. Scan all discrete ${fileId}_* entries in DataStore
+        allEntries.keys
+            .filter {
+                it.name.endsWith("_timestamp") &&
+                !it.name.startsWith("series_resume_") &&
+                !it.name.startsWith("global_") &&
+                !it.name.startsWith("snapshot_") &&
+                it.name != "global_latest_timestamp"
+            }
+            .forEach { key ->
+                val fileId = key.name.removeSuffix("_timestamp")
+                if (!seenMediaIds.contains(fileId)) {
+                    val ts = prefs[longPreferencesKey("${fileId}_timestamp")] ?: 0L
+                    val pos = prefs[longPreferencesKey("${fileId}_pos")] ?: 0L
+                    val dur = prefs[longPreferencesKey("${fileId}_dur")] ?: 0L
+                    val frac = prefs[floatPreferencesKey("${fileId}_fraction")]
+                        ?: (if (dur > 0L) (pos.toFloat() / dur.toFloat()).coerceIn(0f, 1f) else 0f)
+                    val isWatched = (prefs[booleanPreferencesKey("${fileId}_is_watched")] ?: false) || frac >= 0.90f
+
+                    if (pos > 5000L && !isWatched && frac < 0.90f && ts > 0L) {
+                        val sId = prefs[stringPreferencesKey("${fileId}_series_id")]
+                        val isSeriesExplicit = prefs[booleanPreferencesKey("${fileId}_is_series")] ?: false
+                        val matchedSeries = if (!sId.isNullOrBlank()) seriesList.firstOrNull { it.id == sId }
+                            else seriesList.firstOrNull { s -> s.seasons.any { season -> season.episodes.any { ep -> ep.id == fileId } } }
+                        val matchedMovie = movies.firstOrNull { it.id == fileId }
+
+                        val isSeries = isSeriesExplicit || sId != null || matchedSeries != null
+
+                        if (isSeries) {
+                            val effectiveSeriesId = sId ?: matchedSeries?.id ?: ""
+                            if (effectiveSeriesId.isNotBlank() && seenSeriesIds.contains(effectiveSeriesId)) {
+                                return@forEach
+                            }
+                            val allEpisodes = matchedSeries?.seasons?.flatMap { it.episodes } ?: emptyList()
+                            val matchedEp = allEpisodes.firstOrNull { it.id == fileId }
+                            val seasonNum = matchedEp?.seasonNumber ?: prefs[intPreferencesKey("${fileId}_season_num")] ?: 1
+                            val episodeNum = matchedEp?.episodeNumber ?: prefs[intPreferencesKey("${fileId}_episode_num")] ?: 1
+
+                            val rawSeriesTitle = matchedSeries?.title?.ifBlank { null }
+                                ?: prefs[stringPreferencesKey("${fileId}_series_title")] ?: "TV Series"
+                            val seriesTitle = cleanSeriesTitle(rawSeriesTitle).ifBlank { rawSeriesTitle.trim() }
+
+                            val rawEpTitle = matchedEp?.displayTitle?.ifBlank { null }
+                                ?: prefs[stringPreferencesKey("${fileId}_title")] ?: ""
+                            val cleanEp = rawEpTitle
+                                .replace(Regex("(?i)\\bcompleted\\b"), "")
+                                .replace(Regex("(?i)\\bcomplete\\b"), "")
+                                .replace(Regex("(?i)^.*?S0*\\d+[:\\s._-]*E0*\\d+[:\\s-]*"), "")
+                                .replace(Regex("(?i)^${Regex.escape(seriesTitle)}[:\\s-]*"), "")
+                                .trim(' ', '-', '•', ':')
+                                .ifBlank { "Episode $episodeNum" }
+
+                            val epCode = "S${seasonNum.toString().padStart(2, '0')}:E${episodeNum.toString().padStart(2, '0')}"
+                            val displaySubtitle = "$epCode • $cleanEp"
+
+                            val thumb = safeNotBlank(matchedEp?.thumbnailUrl)
+                                ?: safeNotBlank(prefs[stringPreferencesKey("${fileId}_thumb")])
+                                ?: safeNotBlank(matchedSeries?.backdropUrl)
+                                ?: safeNotBlank(matchedSeries?.posterUrl)
+                                ?: ""
+
+                            result.add(
+                                ContinueWatchingItem(
+                                    mediaId = fileId,
+                                    seriesId = effectiveSeriesId.ifBlank { null },
+                                    isSeries = true,
+                                    seriesTitle = seriesTitle,
+                                    seasonNumber = seasonNum,
+                                    episodeNumber = episodeNum,
+                                    episodeTitle = cleanEp,
+                                    displaySubtitle = displaySubtitle,
+                                    thumbnailUrl = thumb,
+                                    progressFraction = frac,
+                                    currentPositionMs = pos,
+                                    durationMs = dur,
+                                    lastWatchedTimestamp = ts,
+                                    title = seriesTitle,
+                                    subtitle = displaySubtitle,
+                                    positionMs = pos,
+                                    timestamp = ts,
+                                    backdropUrl = thumb
+                                )
+                            )
+                            if (effectiveSeriesId.isNotBlank()) {
+                                seenSeriesIds.add(effectiveSeriesId)
+                            }
+                            seenMediaIds.add(fileId)
+                        } else {
+                            // Movie
+                            val title = safeNotBlank(matchedMovie?.title)
+                                ?: prefs[stringPreferencesKey("${fileId}_title")] ?: "Movie"
+                            val thumb = safeNotBlank(matchedMovie?.thumbnailUrl)
+                                ?: prefs[stringPreferencesKey("${fileId}_thumb")] ?: ""
+
+                            result.add(
+                                ContinueWatchingItem(
+                                    mediaId = fileId,
+                                    seriesId = null,
+                                    isSeries = false,
+                                    seriesTitle = title,
+                                    seasonNumber = 0,
+                                    episodeNumber = 0,
+                                    episodeTitle = title,
+                                    displaySubtitle = "Movie • Cinema",
+                                    thumbnailUrl = thumb,
+                                    progressFraction = frac,
+                                    currentPositionMs = pos,
+                                    durationMs = if (dur > 0L) dur else matchedMovie?.durationMs ?: 0L,
+                                    lastWatchedTimestamp = ts,
+                                    title = title,
+                                    subtitle = "Movie • Cinema",
+                                    positionMs = pos,
+                                    timestamp = ts,
+                                    backdropUrl = thumb
+                                )
+                            )
+                            seenMediaIds.add(fileId)
+                        }
+                    }
+                }
+            }
+
+        // Deduplicate series by keeping highest timestamp
+        val finalItems = mutableListOf<ContinueWatchingItem>()
+        val groupedBySeries = result.filter { it.isSeries && !it.seriesId.isNullOrBlank() }.groupBy { it.seriesId }
+        for ((_, items) in groupedBySeries) {
+            items.maxByOrNull { it.lastWatchedTimestamp }?.let { finalItems.add(it) }
+        }
+        finalItems.addAll(result.filter { !it.isSeries || it.seriesId.isNullOrBlank() })
+
+        finalItems.sortedByDescending { it.lastWatchedTimestamp }
+    }
+
+    /**
+     * Purges all DataStore keys matching ${mediaId}_* and (if seriesId != null) series_resume_${seriesId}_*,
+     * then immediately synchronizes the removal to Google Drive with force = true.
+     */
+    suspend fun removeContinueWatchingItem(
+        context: Context,
+        mediaId: String,
+        seriesId: String?
+    ) = withContext(Dispatchers.IO) {
+        historyMutex.withLock {
+            Log.d("ClotubeSync", "removeContinueWatchingItem: mediaId=$mediaId, seriesId=$seriesId")
+            dataStore.edit { preferences ->
+                val keysToRemove = preferences.asMap().keys.filter { key ->
+                    (mediaId.isNotBlank() && key.name.contains(mediaId)) ||
+                    (!seriesId.isNullOrBlank() && key.name.startsWith("series_resume_${seriesId}"))
+                }
+                keysToRemove.forEach { preferences.remove(it) }
+
+                // Clean up history JSON list if present
+                val json = preferences[HISTORY_JSON_KEY]
+                if (!json.isNullOrBlank()) {
+                    try {
+                        val type = object : TypeToken<MutableList<WatchHistoryItem>>() {}.type
+                        val list: MutableList<WatchHistoryItem>? = gson.fromJson(json, type)
+                        if (list != null) {
+                            val modified = list.removeAll { it.fileId == mediaId || (!seriesId.isNullOrBlank() && it.seriesId == seriesId) }
+                            if (modified) {
+                                preferences[HISTORY_JSON_KEY] = gson.toJson(list)
+                            }
+                        }
+                    } catch (_: Exception) {}
+                }
+
+                // Clean up snapshot if it points to mediaId or seriesId
+                if (preferences[SNAPSHOT_FILE_ID] == mediaId || (!seriesId.isNullOrBlank() && preferences[SNAPSHOT_SERIES_ID] == seriesId)) {
+                    preferences.remove(SNAPSHOT_FILE_ID)
+                    preferences.remove(SNAPSHOT_TITLE)
+                    preferences.remove(SNAPSHOT_SERIES_NAME)
+                    preferences.remove(SNAPSHOT_SERIES_ID)
+                    preferences.remove(SNAPSHOT_SEASON_NUMBER)
+                    preferences.remove(SNAPSHOT_EPISODE_NUMBER)
+                    preferences.remove(SNAPSHOT_IS_SERIES)
+                    preferences.remove(SNAPSHOT_THUMBNAIL_URL)
+                    preferences.remove(SNAPSHOT_POSITION_MS)
+                    preferences.remove(SNAPSHOT_DURATION_MS)
+                    preferences.remove(SNAPSHOT_FRACTION)
+                    preferences.remove(SNAPSHOT_TIMESTAMP)
+                }
+            }
+
+            try {
+                val account = com.google.android.gms.auth.api.signin.GoogleSignIn.getLastSignedInAccount(context)
+                val email = account?.email ?: "default"
+                AndroidWatchHistoryManager.removeEntriesForMedia(context, email, mediaId, seriesId)
+            } catch (_: Exception) {}
+
+            DriveWatchHistorySync.pushHistoryAsync(context, force = true)
+        }
+    }
+
     val lastWatchedFlow: Flow<WatchProgress?> get() = getLastWatchedMedia()
 
     /**
      * Home Screen "Continue Watching" query: Returns the most recently watched title.
-     * Evaluates all discrete records with timestamp, selecting the newest active candidate.
+     * Evaluates both active discrete records (${fileId}_timestamp) and series_resume_${seriesId}_timestamp
+     * pointers, selecting the highest timestamp overall (even if pos_ms == 0L after episode rollover).
      */
     fun getLastWatchedMedia(): Flow<WatchProgress?> = dataStore.data.map { prefs ->
         val allEntries = prefs.asMap()
+        val candidates = mutableListOf<WatchProgress>()
+        val resumeEpisodeIds = mutableSetOf<String>()
 
-        val candidates = allEntries.keys
-            .filter { it.name.endsWith("_timestamp") && !it.name.startsWith("series_resume_") && !it.name.startsWith("global_") }
-            .mapNotNull { timestampKey ->
+        // 1. Evaluate series_resume_${seriesId}_* pointers (allows pos_ms == 0L when rolled over on PC)
+        allEntries.keys
+            .filter { it.name.startsWith("series_resume_") && it.name.endsWith("_episode_id") }
+            .forEach { epKey ->
+                val sId = epKey.name.removePrefix("series_resume_").removeSuffix("_episode_id")
+                val p = "series_resume_${sId}"
+                val epId = (allEntries[stringPreferencesKey("${p}_episode_id")] as? String).orEmpty()
+                if (epId.isNotBlank()) {
+                    resumeEpisodeIds.add(epId)
+                    val explicitWatched = allEntries[booleanPreferencesKey("${epId}_is_watched")] as? Boolean
+                    val resumeTs = (allEntries[longPreferencesKey("${p}_timestamp")] as? Long) ?: 0L
+                    val epTs = (allEntries[longPreferencesKey("${epId}_timestamp")] as? Long) ?: 0L
+                    val ts = maxOf(resumeTs, epTs)
+                    val pos = (allEntries[longPreferencesKey("${p}_pos_ms")] as? Long)
+                        ?: (allEntries[longPreferencesKey("${epId}_pos")] as? Long) ?: 0L
+                    val dur = (allEntries[longPreferencesKey("${p}_dur_ms")] as? Long)
+                        ?: (allEntries[longPreferencesKey("${epId}_dur")] as? Long) ?: 0L
+                    val fraction = (allEntries[floatPreferencesKey("${p}_fraction")] as? Float)
+                        ?: (allEntries[floatPreferencesKey("${epId}_fraction")] as? Float)
+                        ?: if (dur > 0L) (pos.toFloat() / dur.toFloat()).coerceIn(0f, 1f) else 0f
+                    val isWatched = explicitWatched ?: (fraction >= 0.90f)
+
+                    if (!isWatched && fraction < 0.95f && ts > 0L) {
+                        val sNum = (allEntries[intPreferencesKey("${p}_season_num")] as? Int)
+                            ?: (allEntries[intPreferencesKey("${epId}_season_num")] as? Int) ?: 1
+                        val eNum = (allEntries[intPreferencesKey("${p}_episode_num")] as? Int)
+                            ?: (allEntries[intPreferencesKey("${epId}_episode_num")] as? Int) ?: 1
+                        val title = (allEntries[stringPreferencesKey("${p}_episode_title")] as? String)
+                            ?: (allEntries[stringPreferencesKey("${epId}_title")] as? String) ?: ""
+                        val sTitle = (allEntries[stringPreferencesKey("${p}_series_title")] as? String)
+                            ?: (allEntries[stringPreferencesKey("${epId}_series_title")] as? String)
+                        val thumb = (allEntries[stringPreferencesKey("${epId}_thumb")] as? String)
+                            ?: (allEntries[stringPreferencesKey("${p}_thumb")] as? String)
+
+                        candidates.add(
+                            WatchProgress(
+                                fileId = epId,
+                                title = title,
+                                seriesTitle = sTitle,
+                                positionMs = pos,
+                                durationMs = dur,
+                                progressFraction = fraction,
+                                lastWatchedTimestamp = ts,
+                                isSeries = true,
+                                seriesId = sId,
+                                seasonNumber = sNum,
+                                episodeNumber = eNum,
+                                thumbnailUrl = thumb,
+                                backdropUrl = thumb,
+                                isWatched = false
+                            )
+                        )
+                    }
+                }
+            }
+
+        // 2. Evaluate discrete episode/movie records with timestamps
+        allEntries.keys
+            .filter {
+                it.name.endsWith("_timestamp") &&
+                    !it.name.startsWith("series_resume_") &&
+                    !it.name.startsWith("global_") &&
+                    !it.name.startsWith("last_global_") &&
+                    !it.name.startsWith("snapshot_") &&
+                    it.name != "global_latest_timestamp"
+            }
+            .forEach { timestampKey ->
                 val fileId = timestampKey.name.removeSuffix("_timestamp")
                 val timestamp = (allEntries[timestampKey] as? Long) ?: 0L
                 val pos = (allEntries[longPreferencesKey("${fileId}_pos")] as? Long) ?: 0L
                 val dur = (allEntries[longPreferencesKey("${fileId}_dur")] as? Long) ?: 0L
                 val fraction = (allEntries[floatPreferencesKey("${fileId}_fraction")] as? Float)
                     ?: if (dur > 0L) (pos.toFloat() / dur.toFloat()).coerceIn(0f, 1f) else 0f
-                val isSeries = (allEntries[booleanPreferencesKey("${fileId}_is_series")] as? Boolean) ?: false
-                val seriesId = allEntries[stringPreferencesKey("${fileId}_series_id")] as? String
-                val seasonNum = allEntries[intPreferencesKey("${fileId}_season_num")] as? Int
-                val episodeNum = allEntries[intPreferencesKey("${fileId}_episode_num")] as? Int
-                val title = (allEntries[stringPreferencesKey("${fileId}_title")] as? String) ?: ""
-                val sTitle = (allEntries[stringPreferencesKey("${fileId}_series_title")] as? String)
-                val thumb = (allEntries[stringPreferencesKey("${fileId}_thumb")] as? String)
+                val explicitWatched = allEntries[booleanPreferencesKey("${fileId}_is_watched")] as? Boolean
+                val isWatched = explicitWatched ?: (fraction >= 0.90f)
 
-                if (pos >= 1000L && fraction < 0.95f && timestamp > 0L) {
+                if (!isWatched && fraction < 0.95f && timestamp > 0L && (pos >= 1000L || fileId in resumeEpisodeIds)) {
+                    val isSeriesExplicit = (allEntries[booleanPreferencesKey("${fileId}_is_series")] as? Boolean) ?: false
+                    val seriesId = allEntries[stringPreferencesKey("${fileId}_series_id")] as? String
+                    val seasonNum = allEntries[intPreferencesKey("${fileId}_season_num")] as? Int
+                    val episodeNum = allEntries[intPreferencesKey("${fileId}_episode_num")] as? Int
+                    val title = (allEntries[stringPreferencesKey("${fileId}_title")] as? String) ?: ""
+                    val sTitle = (allEntries[stringPreferencesKey("${fileId}_series_title")] as? String)
+                    val thumb = (allEntries[stringPreferencesKey("${fileId}_thumb")] as? String)
+
+                    candidates.add(
+                        WatchProgress(
+                            fileId = fileId,
+                            title = title,
+                            seriesTitle = sTitle,
+                            positionMs = pos,
+                            durationMs = dur,
+                            progressFraction = fraction,
+                            lastWatchedTimestamp = timestamp,
+                            isSeries = isSeriesExplicit || !seriesId.isNullOrBlank() || (seasonNum != null && seasonNum > 0),
+                            seriesId = seriesId,
+                            seasonNumber = seasonNum ?: 0,
+                            episodeNumber = episodeNum ?: 0,
+                            thumbnailUrl = thumb,
+                            backdropUrl = thumb,
+                            isWatched = false
+                        )
+                    )
+                }
+            }
+
+        // 3. Evaluate unwatched snapshot candidate (allows pos_ms == 0L after remote sync)
+        val snapFileId = prefs[SNAPSHOT_FILE_ID]
+        val snapTs = prefs[SNAPSHOT_TIMESTAMP] ?: 0L
+        val snapExplicitWatched = snapFileId?.let { prefs[booleanPreferencesKey("${it}_is_watched")] } ?: false
+        if (!snapFileId.isNullOrBlank() && snapTs > 0L && !snapExplicitWatched) {
+            val pos = prefs[SNAPSHOT_POSITION_MS] ?: 0L
+            val dur = prefs[SNAPSHOT_DURATION_MS] ?: 0L
+            val frac = prefs[SNAPSHOT_FRACTION]
+                ?: if (dur > 0L) (pos.toFloat() / dur.toFloat()).coerceIn(0f, 1f) else 0f
+            if (frac < 0.95f) {
+                val snapSeriesId = prefs[SNAPSHOT_SERIES_ID]
+                val snapSNum = prefs[SNAPSHOT_SEASON_NUMBER] ?: 0
+                val snapENum = prefs[SNAPSHOT_EPISODE_NUMBER] ?: 0
+                val snapIsSeries = (prefs[SNAPSHOT_IS_SERIES] ?: false) || !snapSeriesId.isNullOrBlank() || snapSNum > 0
+                candidates.add(
                     WatchProgress(
-                        fileId = fileId,
-                        title = title,
-                        seriesTitle = sTitle,
+                        fileId = snapFileId,
+                        title = prefs[SNAPSHOT_TITLE] ?: "",
+                        seriesTitle = prefs[SNAPSHOT_SERIES_NAME],
                         positionMs = pos,
                         durationMs = dur,
-                        progressFraction = fraction,
-                        lastWatchedTimestamp = timestamp,
-                        isSeries = isSeries,
-                        seriesId = seriesId,
-                        seasonNumber = seasonNum ?: 0,
-                        episodeNumber = episodeNum ?: 0,
-                        thumbnailUrl = thumb,
-                        backdropUrl = thumb
+                        progressFraction = frac,
+                        lastWatchedTimestamp = snapTs,
+                        isSeries = snapIsSeries,
+                        seriesId = snapSeriesId,
+                        seasonNumber = snapSNum,
+                        episodeNumber = snapENum,
+                        thumbnailUrl = prefs[SNAPSHOT_THUMBNAIL_URL],
+                        backdropUrl = prefs[SNAPSHOT_THUMBNAIL_URL],
+                        isWatched = false
                     )
-                } else null
+                )
             }
+        }
 
         candidates.maxByOrNull { it.lastWatchedTimestamp }
     }

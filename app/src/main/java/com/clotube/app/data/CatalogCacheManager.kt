@@ -27,7 +27,7 @@ data class CachedCatalog(
 ) : Serializable
 
 /**
- * Manages unified local disk caching of the Google Drive catalog using internal app storage.
+ * Manages isolated local disk caching of the Google Drive catalog per user profile.
  * Implements in-memory read-through caching and atomic temp-file writes to eliminate
  * duplicate JSON serialization and prevent read corruption.
  */
@@ -35,10 +35,18 @@ class CatalogCacheManager(private val context: Context) {
 
     private val appContext = context.applicationContext
     private val gson = Gson()
+
     private val cacheFile: File
-        get() = File(appContext.filesDir, "cached_catalog.json")
+        get() {
+            val dir = ProfileManager.getProfileDir(appContext)
+            return File(dir, "cached_catalog.json")
+        }
+
     private val legacySeriesCacheFile: File
         get() = File(appContext.filesDir, "cached_series_catalog.json")
+
+    private val legacyRootCacheFile: File
+        get() = File(appContext.filesDir, "cached_catalog.json")
 
     companion object {
         private val cacheMutex = Mutex()
@@ -46,6 +54,15 @@ class CatalogCacheManager(private val context: Context) {
 
         @Volatile
         private var cachedInMemory: CachedCatalog? = null
+
+        /**
+         * Clears in-memory catalog cache when switching profiles.
+         */
+        fun clearInMemoryCache() {
+            synchronized(diskLock) {
+                cachedInMemory = null
+            }
+        }
     }
 
     private fun readCatalogFromDiskSync(): CachedCatalog {
@@ -53,11 +70,27 @@ class CatalogCacheManager(private val context: Context) {
         synchronized(diskLock) {
             cachedInMemory?.let { return it }
             val loaded = try {
-                if (cacheFile.exists()) {
-                    val jsonString = cacheFile.readText(Charsets.UTF_8)
+                val targetFile = cacheFile
+                if (targetFile.exists()) {
+                    val jsonString = targetFile.readText(Charsets.UTF_8)
                     if (jsonString.isNotBlank()) {
                         val type = object : TypeToken<CachedCatalog>() {}.type
                         gson.fromJson<CachedCatalog>(jsonString, type) ?: CachedCatalog()
+                    } else {
+                        CachedCatalog()
+                    }
+                } else if (legacyRootCacheFile.exists()) {
+                    // One-time migration from legacy root directory to profile directory
+                    val legacyJson = legacyRootCacheFile.readText(Charsets.UTF_8)
+                    if (legacyJson.isNotBlank()) {
+                        val type = object : TypeToken<CachedCatalog>() {}.type
+                        val migrated = gson.fromJson<CachedCatalog>(legacyJson, type) ?: CachedCatalog()
+                        try {
+                            val targetDir = targetFile.parentFile ?: appContext.filesDir
+                            if (!targetDir.exists()) targetDir.mkdirs()
+                            targetFile.writeText(legacyJson, Charsets.UTF_8)
+                        } catch (_: Exception) {}
+                        migrated
                     } else {
                         CachedCatalog()
                     }
@@ -85,11 +118,16 @@ class CatalogCacheManager(private val context: Context) {
         synchronized(diskLock) {
             try {
                 cachedInMemory = catalog
+                val targetFile = cacheFile
+                val targetDir = targetFile.parentFile ?: appContext.filesDir
+                if (!targetDir.exists()) {
+                    targetDir.mkdirs()
+                }
                 val jsonString = gson.toJson(catalog)
-                val tempFile = File(appContext.filesDir, "cached_catalog.json.tmp")
+                val tempFile = File(targetDir, "cached_catalog.json.tmp")
                 tempFile.writeText(jsonString, Charsets.UTF_8)
-                if (!tempFile.renameTo(cacheFile)) {
-                    cacheFile.writeText(jsonString, Charsets.UTF_8)
+                if (!tempFile.renameTo(targetFile)) {
+                    targetFile.writeText(jsonString, Charsets.UTF_8)
                     tempFile.delete()
                 }
             } catch (e: Exception) {
@@ -167,8 +205,10 @@ class CatalogCacheManager(private val context: Context) {
             synchronized(diskLock) {
                 cachedInMemory = null
                 try {
-                    if (cacheFile.exists()) cacheFile.delete()
+                    val targetFile = cacheFile
+                    if (targetFile.exists()) targetFile.delete()
                     if (legacySeriesCacheFile.exists()) legacySeriesCacheFile.delete()
+                    if (legacyRootCacheFile.exists()) legacyRootCacheFile.delete()
                 } catch (e: Exception) {
                     e.printStackTrace()
                 }

@@ -79,16 +79,35 @@ class DriveWatchHistorySync(private val context: Context) {
 
         val v2Res = driveService.files().list()
             .setQ("'$historyFolderId' in parents and name = '$ACTIVE_SYNC_FILE' and trashed = false")
-            .setFields("files(id)")
+            .setOrderBy("modifiedTime desc")
+            .setFields("files(id, parents, modifiedTime)")
             .setSupportsAllDrives(true)
             .setIncludeItemsFromAllDrives(true)
-            .setPageSize(1)
+            .setPageSize(5)
             .execute()
 
         val v2Id = v2Res.files?.firstOrNull()?.id
         if (v2Id != null) {
             cachedFileId.set(v2Id)
             return@withContext SyncTarget(v2Id, historyFolderId, isV2 = true)
+        }
+
+        // Fallback: locate clotube_active_sync.json anywhere in Drive (e.g., if PC created a sibling Clotube/History folder)
+        val globalV2Res = driveService.files().list()
+            .setQ("name = '$ACTIVE_SYNC_FILE' and trashed = false")
+            .setOrderBy("modifiedTime desc")
+            .setFields("files(id, parents, modifiedTime)")
+            .setSupportsAllDrives(true)
+            .setIncludeItemsFromAllDrives(true)
+            .setPageSize(5)
+            .execute()
+
+        val globalV2 = globalV2Res.files?.firstOrNull()
+        if (globalV2 != null && !globalV2.id.isNullOrBlank()) {
+            val resolvedParent = globalV2.parents?.firstOrNull()?.takeIf { it.isNotBlank() } ?: historyFolderId
+            cachedFileId.set(globalV2.id)
+            cachedHistoryFolderId.set(resolvedParent)
+            return@withContext SyncTarget(globalV2.id, resolvedParent, isV2 = true)
         }
 
         val scopedLegacy = driveService.files().list()
@@ -105,7 +124,10 @@ class DriveWatchHistorySync(private val context: Context) {
         }
 
         val rootLegacyId = findLegacyRootHistoryFileId(driveService)
-        SyncTarget(rootLegacyId, historyFolderId, isV2 = false)
+        if (rootLegacyId != null) {
+            return@withContext SyncTarget(rootLegacyId, historyFolderId, isV2 = false)
+        }
+        SyncTarget(null, historyFolderId, isV2 = true)
     }
 
     // Priority-based task request holder
@@ -463,43 +485,70 @@ class DriveWatchHistorySync(private val context: Context) {
     suspend fun mergeRemotePayload(dataStore: DataStore<Preferences>, remoteJson: String): Boolean {
         if (remoteJson.isBlank()) return false
         return try {
-            val email = GoogleSignIn.getLastSignedInAccount(appContext)?.email.orEmpty()
+            val email = ProfileManager.activeProfileEmail.value?.takeIf { it.isNotBlank() }
+                ?: GoogleSignIn.getLastSignedInAccount(appContext)?.email.orEmpty()
 
             if (AndroidWatchHistoryManager.isV2Payload(remoteJson)) {
                 val payload = WatchHistoryPayloadV2.fromJsonString(remoteJson)
+                val normalizedUpdatedAt = WatchHistoryPayloadV2.normalizeTimestampMs(payload.updatedAt)
                 val activeById = payload.active.associateBy { it.id }
-                val remoteWatchedSet = payload.watchedIds.toSet()
+                val remoteWatchedSet = (payload.watchedIds + payload.active.filter { it.isWatched }.map { it.id })
+                    .filter { it.isNotBlank() }
+                    .toSet()
 
                 dataStore.edit { prefs ->
                     val existingKeyNames = prefs.asMap().keys.map { it.name }.toSet()
 
-                    // 1. Reconcile active items: when remote timestamp wins, write the exact
-                    //    isWatched state from remote (supports unwatch propagation).
+                    // 1. Apply watchedIds and active[].w == true:
+                    //    Write ${id}_is_watched = true and ${id}_fraction = 1.0f into playbackDataStore
+                    //    (unless local ${id}_timestamp is strictly newer and explicitly marked unwatched),
+                    //    so episodes completed on PC immediately stop appearing as in-progress candidates.
+                    for (id in remoteWatchedSet) {
+                        val localTs = prefs[longPreferencesKey("${id}_timestamp")] ?: 0L
+                        val localExplicitWatched = prefs[booleanPreferencesKey("${id}_is_watched")]
+                        val remoteItemTs = WatchHistoryPayloadV2.normalizeTimestampMs(
+                            activeById[id]?.timestamp ?: normalizedUpdatedAt
+                        )
+                        val localStrictlyNewerUnwatched = localExplicitWatched == false && localTs > remoteItemTs
+                        if (!localStrictlyNewerUnwatched) {
+                            prefs[booleanPreferencesKey("${id}_is_watched")] = true
+                            prefs[floatPreferencesKey("${id}_fraction")] = 1.0f
+                            if (!existingKeyNames.contains("${id}_timestamp") || remoteItemTs > localTs) {
+                                prefs[longPreferencesKey("${id}_timestamp")] = remoteItemTs
+                            }
+                        }
+                    }
+
+                    // 2. Apply active items: compare remote.timestamp > localTimestamp (or missing locally);
+                    //    preserve actual in-progress positionMs and fraction for unwatched items.
                     for (item in payload.active) {
                         if (item.id.isBlank()) continue
+                        val itemTs = WatchHistoryPayloadV2.normalizeTimestampMs(item.timestamp)
                         val localTs = prefs[longPreferencesKey("${item.id}_timestamp")] ?: 0L
                         val isMissing = !existingKeyNames.contains("${item.id}_pos") &&
                             !existingKeyNames.contains("${item.id}_is_watched")
-                        if (item.timestamp > localTs || isMissing) {
+                        if (itemTs > localTs || isMissing) {
                             if (item.title.isNotBlank()) {
                                 prefs[stringPreferencesKey("${item.id}_title")] = item.title
                             }
-                            // For unwatched items reset pos/fraction to 0 so progress bars clear
-                            val effectivePos = if (item.isWatched) item.positionMs else 0L
-                            val effectiveFrac = if (item.isWatched) {
-                                if (item.durationMs > 0L)
-                                    (item.positionMs.toFloat() / item.durationMs.toFloat()).coerceIn(0f, 1f)
-                                else 1.0f
+                            val isItemWatched = item.isWatched || item.id in remoteWatchedSet
+                            val effectiveFrac = if (isItemWatched) {
+                                1.0f
+                            } else if (item.durationMs > 0L) {
+                                (item.positionMs.toFloat() / item.durationMs.toFloat()).coerceIn(0f, 1f)
                             } else {
-                                0.0f
+                                item.progressFraction.coerceIn(0f, 1f)
+                            }
+                            val effectivePos = if (isItemWatched) {
+                                if (item.positionMs > 0L) item.positionMs else item.durationMs
+                            } else {
+                                item.positionMs
                             }
                             prefs[longPreferencesKey("${item.id}_pos")] = effectivePos
                             prefs[longPreferencesKey("${item.id}_dur")] = item.durationMs
                             prefs[floatPreferencesKey("${item.id}_fraction")] = effectiveFrac
-                            prefs[longPreferencesKey("${item.id}_timestamp")] = item.timestamp
-                            // Authoritative watched state: item flag OR in remoteWatchedSet
-                            prefs[booleanPreferencesKey("${item.id}_is_watched")] =
-                                item.isWatched || item.id in remoteWatchedSet
+                            prefs[longPreferencesKey("${item.id}_timestamp")] = itemTs
+                            prefs[booleanPreferencesKey("${item.id}_is_watched")] = isItemWatched
                             val isSeries = !item.seriesId.isNullOrBlank() ||
                                 item.seasonNumber != null || item.episodeNumber != null
                             prefs[booleanPreferencesKey("${item.id}_is_series")] = isSeries
@@ -515,76 +564,165 @@ class DriveWatchHistorySync(private val context: Context) {
                         }
                     }
 
-                    // 2. For IDs in remoteWatchedSet that have no active entry, merge additively
-                    //    with timestamp-wins guard (these are historical, never-played-again IDs).
-                    val coveredByActive = payload.active.map { it.id }.toSet()
-                    for (id in remoteWatchedSet) {
-                        if (id.isBlank() || id in coveredByActive) continue
-                        val localTs = prefs[longPreferencesKey("${id}_timestamp")] ?: 0L
-                        val localExplicit = prefs[booleanPreferencesKey("${id}_is_watched")]
-                        if (localExplicit != false || payload.updatedAt > localTs) {
-                            prefs[booleanPreferencesKey("${id}_is_watched")] = true
-                            if (!existingKeyNames.contains("${id}_fraction")) {
-                                prefs[floatPreferencesKey("${id}_fraction")] = 1.0f
-                            }
-                            if (!existingKeyNames.contains("${id}_timestamp")) {
-                                prefs[longPreferencesKey("${id}_timestamp")] = payload.updatedAt
-                            }
-                        }
-                    }
-
-                    // 3. Merge series resume pointers (timestamp-wins, unchanged logic)
+                    // 3. Apply resume series pointers AND synchronize target episodeId keys so
+                    //    rolled-over episodes (e.g., S07:E10 with pos=0) are immediately selected.
                     for ((sid, res) in payload.resume) {
                         if (sid.isBlank() || res.episodeId.isBlank()) continue
+                        val resTs = WatchHistoryPayloadV2.normalizeTimestampMs(res.timestamp)
                         val prefix = "series_resume_$sid"
                         val localTs = prefs[longPreferencesKey("${prefix}_timestamp")] ?: 0L
                         val isMissing = !existingKeyNames.contains("${prefix}_episode_id")
-                        if (res.timestamp > localTs || isMissing) {
+                        if (resTs > localTs || isMissing) {
+                            val frac = if (res.durationMs > 0L) {
+                                (res.positionMs.toFloat() / res.durationMs.toFloat()).coerceIn(0f, 1f)
+                            } else {
+                                0f
+                            }
                             prefs[stringPreferencesKey("${prefix}_episode_id")] = res.episodeId
                             prefs[intPreferencesKey("${prefix}_season_num")] = res.seasonNumber
                             prefs[intPreferencesKey("${prefix}_episode_num")] = res.episodeNumber
                             prefs[longPreferencesKey("${prefix}_pos_ms")] = res.positionMs
                             prefs[longPreferencesKey("${prefix}_dur_ms")] = res.durationMs
-                            val frac = if (res.durationMs > 0L) (res.positionMs.toFloat() / res.durationMs.toFloat()).coerceIn(0f, 1f) else 0f
                             prefs[floatPreferencesKey("${prefix}_fraction")] = frac
-                            prefs[longPreferencesKey("${prefix}_timestamp")] = res.timestamp
-                            activeById[res.episodeId]?.title?.takeIf { it.isNotBlank() }?.let { epTitle ->
+                            prefs[longPreferencesKey("${prefix}_timestamp")] = resTs
+                            val epTitle = activeById[res.episodeId]?.title?.takeIf { it.isNotBlank() }
+                            if (epTitle != null) {
                                 prefs[stringPreferencesKey("${prefix}_episode_title")] = epTitle
+                            }
+
+                            // Synchronize target episodeId record so PlaybackHistoryManager & VideoViewModel pick it up immediately
+                            val epId = res.episodeId
+                            val localEpTs = prefs[longPreferencesKey("${epId}_timestamp")] ?: 0L
+                            val targetEpTs = maxOf(localEpTs, resTs)
+                            prefs[longPreferencesKey("${epId}_timestamp")] = targetEpTs
+                            val isResumeCompleted = res.durationMs > 0L && res.positionMs >= (res.durationMs * 0.90f)
+                            if (!isResumeCompleted) {
+                                prefs[booleanPreferencesKey("${epId}_is_watched")] = false
+                            }
+                            if (!existingKeyNames.contains("${epId}_pos") || resTs >= localEpTs) {
+                                prefs[longPreferencesKey("${epId}_pos")] = res.positionMs
+                            }
+                            if (!existingKeyNames.contains("${epId}_dur") || resTs >= localEpTs) {
+                                prefs[longPreferencesKey("${epId}_dur")] = res.durationMs
+                            }
+                            if (!existingKeyNames.contains("${epId}_fraction") || resTs >= localEpTs) {
+                                prefs[floatPreferencesKey("${epId}_fraction")] = frac
+                            }
+                            prefs[booleanPreferencesKey("${epId}_is_series")] = true
+                            prefs[stringPreferencesKey("${epId}_series_id")] = sid
+                            prefs[intPreferencesKey("${epId}_season_num")] = res.seasonNumber
+                            prefs[intPreferencesKey("${epId}_episode_num")] = res.episodeNumber
+                            if (epTitle != null) {
+                                prefs[stringPreferencesKey("${epId}_title")] = epTitle
                             }
                         }
                     }
 
-                    // 4. Update global latest timestamp & snapshot if remote is newer
-                    val newestActive = payload.active.maxByOrNull { it.timestamp }
+                    // 4. Update / Invalidate global_latest_* Snapshot Keys:
+                    //    Compare newest remote unwatched active/resume entry against prefs[SNAPSHOT_TIMESTAMP].
+                    val currentSnapTs = prefs[PlaybackHistoryManager.SNAPSHOT_TIMESTAMP] ?: 0L
+                    val currentSnapId = prefs[PlaybackHistoryManager.SNAPSHOT_FILE_ID]
+
+                    val candidateResume = payload.resume.entries
+                        .filter { (_, res) ->
+                            res.episodeId.isNotBlank() &&
+                                res.episodeId !in remoteWatchedSet &&
+                                (res.durationMs == 0L || res.positionMs < (res.durationMs * 0.90f))
+                        }
+                        .maxByOrNull { WatchHistoryPayloadV2.normalizeTimestampMs(it.value.timestamp) }
+
+                    val candidateActive = payload.active
+                        .filter {
+                            it.id.isNotBlank() &&
+                                !it.isWatched &&
+                                it.id !in remoteWatchedSet &&
+                                it.progressFraction < 0.90f
+                        }
+                        .maxByOrNull { WatchHistoryPayloadV2.normalizeTimestampMs(it.timestamp) }
+
+                    val resumeWinnerTs = candidateResume?.let {
+                        WatchHistoryPayloadV2.normalizeTimestampMs(it.value.timestamp)
+                    } ?: 0L
+                    val activeWinnerTs = candidateActive?.let {
+                        WatchHistoryPayloadV2.normalizeTimestampMs(it.timestamp)
+                    } ?: 0L
+                    val bestRemoteTs = maxOf(resumeWinnerTs, activeWinnerTs)
+
+                    if (bestRemoteTs > currentSnapTs) {
+                        if (candidateResume != null && resumeWinnerTs >= activeWinnerTs) {
+                            val sid = candidateResume.key
+                            val res = candidateResume.value
+                            val epTitle = activeById[res.episodeId]?.title?.takeIf { it.isNotBlank() }
+                                ?: prefs[stringPreferencesKey("${res.episodeId}_title")]
+                                ?: ""
+                            val frac = if (res.durationMs > 0L) {
+                                (res.positionMs.toFloat() / res.durationMs.toFloat()).coerceIn(0f, 1f)
+                            } else {
+                                0f
+                            }
+                            prefs[PlaybackHistoryManager.SNAPSHOT_FILE_ID] = res.episodeId
+                            if (epTitle.isNotBlank()) {
+                                prefs[PlaybackHistoryManager.SNAPSHOT_TITLE] = epTitle
+                            } else {
+                                prefs.remove(PlaybackHistoryManager.SNAPSHOT_TITLE)
+                            }
+                            prefs[PlaybackHistoryManager.SNAPSHOT_SERIES_ID] = sid
+                            prefs[PlaybackHistoryManager.SNAPSHOT_IS_SERIES] = true
+                            prefs[PlaybackHistoryManager.SNAPSHOT_SEASON_NUMBER] = res.seasonNumber
+                            prefs[PlaybackHistoryManager.SNAPSHOT_EPISODE_NUMBER] = res.episodeNumber
+                            prefs[PlaybackHistoryManager.SNAPSHOT_POSITION_MS] = res.positionMs
+                            prefs[PlaybackHistoryManager.SNAPSHOT_DURATION_MS] = res.durationMs
+                            prefs[PlaybackHistoryManager.SNAPSHOT_FRACTION] = frac
+                            prefs[PlaybackHistoryManager.SNAPSHOT_TIMESTAMP] = resumeWinnerTs
+                        } else if (candidateActive != null) {
+                            val act = candidateActive
+                            prefs[PlaybackHistoryManager.SNAPSHOT_FILE_ID] = act.id
+                            if (act.title.isNotBlank()) {
+                                prefs[PlaybackHistoryManager.SNAPSHOT_TITLE] = act.title
+                            }
+                            if (!act.seriesId.isNullOrBlank()) {
+                                prefs[PlaybackHistoryManager.SNAPSHOT_SERIES_ID] = act.seriesId
+                                prefs[PlaybackHistoryManager.SNAPSHOT_IS_SERIES] = true
+                            } else {
+                                prefs.remove(PlaybackHistoryManager.SNAPSHOT_SERIES_ID)
+                                prefs[PlaybackHistoryManager.SNAPSHOT_IS_SERIES] =
+                                    act.seasonNumber != null || act.episodeNumber != null
+                            }
+                            act.seasonNumber?.let { prefs[PlaybackHistoryManager.SNAPSHOT_SEASON_NUMBER] = it }
+                            act.episodeNumber?.let { prefs[PlaybackHistoryManager.SNAPSHOT_EPISODE_NUMBER] = it }
+                            prefs[PlaybackHistoryManager.SNAPSHOT_POSITION_MS] = act.positionMs
+                            prefs[PlaybackHistoryManager.SNAPSHOT_DURATION_MS] = act.durationMs
+                            prefs[PlaybackHistoryManager.SNAPSHOT_FRACTION] = act.progressFraction
+                            prefs[PlaybackHistoryManager.SNAPSHOT_TIMESTAMP] = activeWinnerTs
+                        }
+                    } else if (currentSnapId != null &&
+                        (currentSnapId in remoteWatchedSet || prefs[booleanPreferencesKey("${currentSnapId}_is_watched")] == true)
+                    ) {
+                        // Invalidate stale snapshot pointing to a completed item
+                        prefs.remove(PlaybackHistoryManager.SNAPSHOT_FILE_ID)
+                        prefs.remove(PlaybackHistoryManager.SNAPSHOT_TITLE)
+                        prefs.remove(PlaybackHistoryManager.SNAPSHOT_SERIES_NAME)
+                        prefs.remove(PlaybackHistoryManager.SNAPSHOT_SERIES_ID)
+                        prefs.remove(PlaybackHistoryManager.SNAPSHOT_SEASON_NUMBER)
+                        prefs.remove(PlaybackHistoryManager.SNAPSHOT_EPISODE_NUMBER)
+                        prefs.remove(PlaybackHistoryManager.SNAPSHOT_IS_SERIES)
+                        prefs.remove(PlaybackHistoryManager.SNAPSHOT_THUMBNAIL_URL)
+                        prefs.remove(PlaybackHistoryManager.SNAPSHOT_POSITION_MS)
+                        prefs.remove(PlaybackHistoryManager.SNAPSHOT_DURATION_MS)
+                        prefs.remove(PlaybackHistoryManager.SNAPSHOT_FRACTION)
+                        prefs.remove(PlaybackHistoryManager.SNAPSHOT_TIMESTAMP)
+                    }
+
+                    // 5. Update global metadata timestamps if remote is newer
                     val remoteGlobalTs = maxOf(
-                        newestActive?.timestamp ?: 0L,
-                        payload.resume.values.maxOfOrNull { it.timestamp } ?: 0L,
-                        payload.updatedAt
+                        payload.active.maxOfOrNull { WatchHistoryPayloadV2.normalizeTimestampMs(it.timestamp) } ?: 0L,
+                        payload.resume.values.maxOfOrNull { WatchHistoryPayloadV2.normalizeTimestampMs(it.timestamp) } ?: 0L,
+                        normalizedUpdatedAt
                     )
-                    val localGlobalTs = prefs[longPreferencesKey("global_latest_timestamp")] ?: 0L
+                    val localGlobalTs = prefs[longPreferencesKey("last_global_watch_timestamp")] ?: 0L
                     if (remoteGlobalTs > localGlobalTs) {
                         prefs[longPreferencesKey("last_global_watch_timestamp")] = remoteGlobalTs
                         prefs[longPreferencesKey("global_last_watched_timestamp")] = remoteGlobalTs
-                        prefs[longPreferencesKey("global_latest_timestamp")] = remoteGlobalTs
-
-                        if (newestActive != null && newestActive.timestamp > localGlobalTs) {
-                            prefs[PlaybackHistoryManager.SNAPSHOT_FILE_ID] = newestActive.id
-                            if (newestActive.title.isNotBlank()) {
-                                prefs[PlaybackHistoryManager.SNAPSHOT_TITLE] = newestActive.title
-                            }
-                            if (!newestActive.seriesId.isNullOrBlank()) {
-                                prefs[PlaybackHistoryManager.SNAPSHOT_SERIES_ID] = newestActive.seriesId
-                                prefs[PlaybackHistoryManager.SNAPSHOT_IS_SERIES] = true
-                            } else {
-                                prefs[PlaybackHistoryManager.SNAPSHOT_IS_SERIES] = false
-                            }
-                            newestActive.seasonNumber?.let { prefs[PlaybackHistoryManager.SNAPSHOT_SEASON_NUMBER] = it }
-                            newestActive.episodeNumber?.let { prefs[PlaybackHistoryManager.SNAPSHOT_EPISODE_NUMBER] = it }
-                            prefs[PlaybackHistoryManager.SNAPSHOT_POSITION_MS] = newestActive.positionMs
-                            prefs[PlaybackHistoryManager.SNAPSHOT_DURATION_MS] = newestActive.durationMs
-                            prefs[PlaybackHistoryManager.SNAPSHOT_FRACTION] = newestActive.progressFraction
-                            prefs[PlaybackHistoryManager.SNAPSHOT_TIMESTAMP] = newestActive.timestamp
-                        }
                     }
                 }
 
@@ -597,7 +735,7 @@ class DriveWatchHistorySync(private val context: Context) {
 
             val rootJson = JSONObject(remoteJson)
             val entriesJson = rootJson.optJSONObject("entries") ?: return false
-            val remoteUpdatedAt = rootJson.optLong("updatedAt", 0L)
+            val remoteUpdatedAt = WatchHistoryPayloadV2.normalizeTimestampMs(rootJson.optLong("updatedAt", 0L))
 
             dataStore.edit { prefs ->
                 val currentPrefs = prefs.asMap()
@@ -609,8 +747,10 @@ class DriveWatchHistorySync(private val context: Context) {
                     val entryObj = entriesJson.optJSONObject(keyName)
                     val tsKey = resolveTimestampKey(keyName)
                     val remoteTsEntry = entriesJson.optJSONObject(tsKey)
-                    val remoteTs = remoteTsEntry?.optLong("value", 0L)
-                        ?: if (keyName == tsKey) (entryObj?.optLong("value", 0L) ?: 0L) else remoteUpdatedAt
+                    val remoteTs = WatchHistoryPayloadV2.normalizeTimestampMs(
+                        remoteTsEntry?.optLong("value", 0L)
+                            ?: if (keyName == tsKey) (entryObj?.optLong("value", 0L) ?: 0L) else remoteUpdatedAt
+                    )
 
                     val localTs = (currentPrefs[longPreferencesKey(tsKey)] as? Long)
                         ?: if (keyName == tsKey) (currentPrefs[longPreferencesKey(keyName)] as? Long ?: 0L) else 0L
@@ -712,6 +852,9 @@ class DriveWatchHistorySync(private val context: Context) {
 
         try {
             val driveService = getDriveService() ?: return@withContext false
+            if (force) {
+                cachedFileId.set(null)
+            }
             var target = resolveTarget(driveService)
             val fileId = target.fileId ?: run {
                 lastCloudPullTimeMs.set(System.currentTimeMillis())
@@ -757,6 +900,28 @@ class DriveWatchHistorySync(private val context: Context) {
     }
 
     suspend fun syncFromCloud(): Boolean = syncFromCloud(appContext.playbackDataStore)
+
+    /**
+     * Non-blocking trigger to pull watch history from cloud if cooldown expired or forced.
+     * When !force, applies a 5-second cooldown.
+     * When force=true, bypasses cooldown unconditionally.
+     */
+    fun pullFromCloudIfNeeded(
+        dataStore: DataStore<Preferences>? = null,
+        force: Boolean = false
+    ) {
+        val targetDataStore = dataStore ?: appContext.playbackDataStore
+        val now = System.currentTimeMillis()
+        val lastPull = lastCloudPullTimeMs.get()
+        val cooldown = if (force) 0L else 5000L
+        if (!force && (now - lastPull < cooldown)) {
+            Log.d(TAG, "Skipping pullFromCloudIfNeeded (cooldown active: ${now - lastPull}ms)")
+            return
+        }
+        syncScope.launch(Dispatchers.IO) {
+            syncFromCloud(targetDataStore, force = force)
+        }
+    }
 
     suspend fun pullAndMerge(): Boolean = syncFromCloud(appContext.playbackDataStore)
 
@@ -864,7 +1029,7 @@ class DriveWatchHistorySync(private val context: Context) {
         private const val TAG = "ClotubeSync"
         private const val ACTIVE_SYNC_FILE = "clotube_active_sync.json"
         private const val LEGACY_SYNC_FILE = "clotube_watch_history.json"
-        private const val CLOUD_PULL_COOLDOWN_MS = 10_000L
+        private const val CLOUD_PULL_COOLDOWN_MS = 5_000L
 
         @Volatile
         private var defaultInstance: DriveWatchHistorySync? = null
@@ -953,6 +1118,15 @@ class DriveWatchHistorySync(private val context: Context) {
 
         suspend fun pullAndMerge(context: Context): Boolean {
             return getInstance(context).pullAndMerge()
+        }
+
+        fun pullFromCloudIfNeeded(
+            context: Context? = null,
+            dataStore: DataStore<Preferences>? = null,
+            force: Boolean = false
+        ) {
+            val inst = context?.let { getInstance(it) } ?: defaultInstance
+            inst?.pullFromCloudIfNeeded(dataStore, force)
         }
 
         fun backupToCloudImmediately(dataStore: DataStore<Preferences>? = null) {

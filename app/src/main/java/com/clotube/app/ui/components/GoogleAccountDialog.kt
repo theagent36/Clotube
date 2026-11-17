@@ -8,14 +8,18 @@ import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ExitToApp
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.PersonAdd
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.outlined.AccountCircle
@@ -30,10 +34,17 @@ import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
+import com.clotube.app.data.SavedAccountProfile
 
+/**
+ * Obsidian Cinema styled Google Account & Multi-Profile Switcher Dialog.
+ * Allows users to inspect their active profile, switch between isolated Google Drive
+ * accounts with zero data bleeding, add a new Google account, or manage app settings.
+ */
 @Composable
 fun GoogleAccountDialog(
     isOpen: Boolean,
@@ -41,9 +52,12 @@ fun GoogleAccountDialog(
     userDisplayName: String,
     userEmail: String,
     userPhotoUrl: String?,
-    onRefreshClick: () -> Unit,
-    onSettingsClick: () -> Unit,
-    onSignOutClick: () -> Unit,
+    savedProfiles: List<SavedAccountProfile> = emptyList(),
+    onSwitchProfile: (String) -> Unit = {},
+    onAddAccountClick: () -> Unit = {},
+    onRefreshClick: () -> Unit = {},
+    onSettingsClick: () -> Unit = {},
+    onSignOutClick: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     AnimatedVisibility(
@@ -58,7 +72,7 @@ fun GoogleAccountDialog(
         Box(
             modifier = modifier
                 .fillMaxSize()
-                .background(Color.Black.copy(alpha = 0.65f))
+                .background(Color.Black.copy(alpha = 0.68f))
                 .clickable(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null
@@ -80,148 +94,287 @@ fun GoogleAccountDialog(
                         ) + fadeOut(animationSpec = tween(durationMillis = 160))
                     )
                     .statusBarsPadding()
-                    .padding(top = 16.dp, start = 16.dp, end = 16.dp)
+                    .padding(top = 16.dp, start = 16.dp, end = 16.dp, bottom = 24.dp)
                     .fillMaxWidth()
-                    .widthIn(max = 390.dp)
+                    .widthIn(max = 400.dp)
                     .clickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null
                     ) { /* Absorb clicks inside dialog */ },
-                shape = RoundedCornerShape(28.dp),
-                color = Color(0xFF1E1F24),
-                border = BorderStroke(1.dp, Color(0xFF2E3138)),
-                shadowElevation = 10.dp
+                shape = RoundedCornerShape(24.dp),
+                color = Color(0xFF13151B),
+                border = BorderStroke(1.dp, Color(0xFF262A36)),
+                shadowElevation = 16.dp
             ) {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 18.dp, vertical = 16.dp),
+                        .padding(horizontal = 18.dp, vertical = 14.dp)
+                        .verticalScroll(rememberScrollState()),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    // Top Bar: Close Button
-                    Box(
+                    // Top Bar: Header label & Close Button
+                    Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(32.dp)
+                            .height(36.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
                     ) {
+                        Text(
+                            text = "Google Account",
+                            color = Color(0xFF94A3B8),
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            letterSpacing = 0.8.sp
+                        )
+
                         IconButton(
                             onClick = onDismissRequest,
-                            modifier = Modifier
-                                .size(32.dp)
-                                .align(Alignment.CenterEnd)
+                            modifier = Modifier.size(32.dp)
                         ) {
                             Icon(
                                 imageVector = Icons.Default.Close,
                                 contentDescription = "Close",
-                                tint = Color(0xFFC4C7C5),
-                                modifier = Modifier.size(20.dp)
+                                tint = Color(0xFF94A3B8),
+                                modifier = Modifier.size(18.dp)
                             )
                         }
                     }
 
-                    // User Profile Header
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 6.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                    Spacer(modifier = Modifier.height(6.dp))
+
+                    // Active User Profile Header Card
+                    Surface(
+                        shape = RoundedCornerShape(16.dp),
+                        color = Color(0xFF1A1E29),
+                        border = BorderStroke(1.dp, Color(0xFF2A3142)),
+                        modifier = Modifier.fillMaxWidth()
                     ) {
-                        if (!userPhotoUrl.isNullOrBlank()) {
-                            AsyncImage(
-                                model = userPhotoUrl,
-                                contentDescription = "Profile Photo",
-                                modifier = Modifier
-                                    .size(48.dp)
-                                    .clip(CircleShape),
-                                contentScale = ContentScale.Crop
-                            )
-                        } else {
-                            Icon(
-                                imageVector = Icons.Outlined.AccountCircle,
-                                contentDescription = null,
-                                tint = Color(0xFFA8C7FA),
-                                modifier = Modifier.size(48.dp)
-                            )
-                        }
-
-                        Spacer(modifier = Modifier.width(14.dp))
-
-                        Column(modifier = Modifier.weight(1f)) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    text = userDisplayName.ifBlank { "Clotube User" },
-                                    color = Color.White,
-                                    fontSize = 15.sp,
-                                    fontWeight = FontWeight.SemiBold
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            if (!userPhotoUrl.isNullOrBlank()) {
+                                AsyncImage(
+                                    model = userPhotoUrl,
+                                    contentDescription = "Profile Photo",
+                                    modifier = Modifier
+                                        .size(46.dp)
+                                        .clip(CircleShape),
+                                    contentScale = ContentScale.Crop
                                 )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Surface(
-                                    color = Color(0xFF263238),
-                                    shape = RoundedCornerShape(4.dp)
+                            } else {
+                                Icon(
+                                    imageVector = Icons.Outlined.AccountCircle,
+                                    contentDescription = null,
+                                    tint = Color(0xFF3877EE),
+                                    modifier = Modifier.size(46.dp)
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.width(12.dp))
+
+                            Column(modifier = Modifier.weight(1f)) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    modifier = Modifier.fillMaxWidth()
                                 ) {
                                     Text(
-                                        text = "Pro",
-                                        color = Color(0xFF80D8FF),
-                                        fontSize = 10.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                                        text = userDisplayName.ifBlank { "Clotube User" },
+                                        color = Color.White,
+                                        fontSize = 15.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f, fill = false)
                                     )
+
+                                    Spacer(modifier = Modifier.width(6.dp))
+
+                                    Surface(
+                                        color = Color(0xFF064E3B),
+                                        shape = RoundedCornerShape(4.dp)
+                                    ) {
+                                        Text(
+                                            text = "Active",
+                                            color = Color(0xFF34D399),
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                        )
+                                    }
                                 }
+
+                                Spacer(modifier = Modifier.height(2.dp))
+
+                                Text(
+                                    text = userEmail.ifBlank { "account@gmail.com" },
+                                    color = Color(0xFF94A3B8),
+                                    fontSize = 12.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
                             }
-                            Spacer(modifier = Modifier.height(2.dp))
-                            Text(
-                                text = userEmail.ifBlank { "account@gmail.com" },
-                                color = Color(0xFF9AA0A6),
-                                fontSize = 12.sp
-                            )
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(14.dp))
-                    HorizontalDivider(color = Color(0xFF2F3238), thickness = 0.8.dp)
+                    // Saved Accounts Section
+                    val otherProfiles = savedProfiles.filter {
+                        !it.email.equals(userEmail, ignoreCase = true)
+                    }
+
+                    if (otherProfiles.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(14.dp))
+
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 4.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "SWITCH ACCOUNT",
+                                color = Color(0xFF64748B),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                letterSpacing = 1.sp
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(4.dp))
+
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(Color(0xFF181C26))
+                                .border(BorderStroke(1.dp, Color(0xFF222838)), RoundedCornerShape(14.dp))
+                        ) {
+                            otherProfiles.forEachIndexed { index, profile ->
+                                Surface(
+                                    onClick = {
+                                        onDismissRequest()
+                                        onSwitchProfile(profile.email)
+                                    },
+                                    color = Color.Transparent,
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        if (!profile.photoUrl.isNullOrBlank()) {
+                                            AsyncImage(
+                                                model = profile.photoUrl,
+                                                contentDescription = profile.displayName,
+                                                modifier = Modifier
+                                                    .size(34.dp)
+                                                    .clip(CircleShape),
+                                                contentScale = ContentScale.Crop
+                                            )
+                                        } else {
+                                            Icon(
+                                                imageVector = Icons.Outlined.AccountCircle,
+                                                contentDescription = null,
+                                                tint = Color(0xFF94A3B8),
+                                                modifier = Modifier.size(34.dp)
+                                            )
+                                        }
+
+                                        Spacer(modifier = Modifier.width(10.dp))
+
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                text = profile.displayName.ifBlank { "User" },
+                                                color = Color(0xFFE2E8F0),
+                                                fontSize = 13.sp,
+                                                fontWeight = FontWeight.Medium,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                            Text(
+                                                text = profile.email,
+                                                color = Color(0xFF64748B),
+                                                fontSize = 11.sp,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
+                                    }
+                                }
+
+                                if (index < otherProfiles.size - 1) {
+                                    HorizontalDivider(color = Color(0xFF222838), thickness = 0.8.dp)
+                                }
+                            }
+                        }
+                    }
+
                     Spacer(modifier = Modifier.height(10.dp))
+
+                    // Add Another Account Item
+                    AccountDialogActionItem(
+                        icon = Icons.Default.PersonAdd,
+                        label = "Add another account",
+                        iconTint = Color(0xFF3877EE),
+                        textColor = Color(0xFF3877EE),
+                        onClick = {
+                            onDismissRequest()
+                            onAddAccountClick()
+                        }
+                    )
+
+                    Spacer(modifier = Modifier.height(8.dp))
+                    HorizontalDivider(color = Color(0xFF222838), thickness = 0.8.dp)
+                    Spacer(modifier = Modifier.height(8.dp))
 
                     // Menu Action 1: Refresh Library
                     AccountDialogActionItem(
                         icon = Icons.Default.Refresh,
                         label = "Refresh Library",
-                        iconTint = Color(0xFF8AB4F8),
+                        iconTint = Color(0xFF3877EE),
                         onClick = {
                             onDismissRequest()
                             onRefreshClick()
                         }
                     )
 
-                    Spacer(modifier = Modifier.height(4.dp))
+                    Spacer(modifier = Modifier.height(2.dp))
 
                     // Menu Action 2: Settings
                     AccountDialogActionItem(
                         icon = Icons.Default.Settings,
                         label = "Settings",
-                        iconTint = Color(0xFFC4C7C5),
+                        iconTint = Color(0xFF94A3B8),
                         onClick = {
                             onDismissRequest()
                             onSettingsClick()
                         }
                     )
 
-                    Spacer(modifier = Modifier.height(4.dp))
+                    Spacer(modifier = Modifier.height(2.dp))
 
                     // Menu Action 3: Sign out
                     AccountDialogActionItem(
                         icon = Icons.AutoMirrored.Filled.ExitToApp,
                         label = "Sign out",
-                        iconTint = Color(0xFFF28B82),
-                        textColor = Color(0xFFF28B82),
+                        iconTint = Color(0xFFEF4444),
+                        textColor = Color(0xFFEF4444),
                         onClick = {
                             onDismissRequest()
                             onSignOutClick()
                         }
                     )
 
-                    Spacer(modifier = Modifier.height(16.dp))
-                    HorizontalDivider(color = Color(0xFF2F3238), thickness = 0.8.dp)
-                    Spacer(modifier = Modifier.height(12.dp))
+                    Spacer(modifier = Modifier.height(14.dp))
+                    HorizontalDivider(color = Color(0xFF222838), thickness = 0.8.dp)
+                    Spacer(modifier = Modifier.height(10.dp))
 
                     // Legal Footer
                     Row(
@@ -231,17 +384,17 @@ fun GoogleAccountDialog(
                     ) {
                         Text(
                             text = "Privacy Policy",
-                            color = Color(0xFF9AA0A6),
+                            color = Color(0xFF64748B),
                             fontSize = 11.sp
                         )
                         Text(
                             text = "  •  ",
-                            color = Color(0xFF5F6368),
+                            color = Color(0xFF334155),
                             fontSize = 11.sp
                         )
                         Text(
                             text = "Terms of Service",
-                            color = Color(0xFF9AA0A6),
+                            color = Color(0xFF64748B),
                             fontSize = 11.sp
                         )
                     }
@@ -261,9 +414,12 @@ fun GoogleAccountDialog(
     userDisplayName: String,
     userEmail: String,
     userPhotoUrl: Uri?,
-    onRefreshClick: () -> Unit,
-    onSettingsClick: () -> Unit,
-    onSignOutClick: () -> Unit,
+    savedProfiles: List<SavedAccountProfile> = emptyList(),
+    onSwitchProfile: (String) -> Unit = {},
+    onAddAccountClick: () -> Unit = {},
+    onRefreshClick: () -> Unit = {},
+    onSettingsClick: () -> Unit = {},
+    onSignOutClick: () -> Unit = {},
     modifier: Modifier = Modifier
 ) = GoogleAccountDialog(
     isOpen = isOpen,
@@ -271,6 +427,9 @@ fun GoogleAccountDialog(
     userDisplayName = userDisplayName,
     userEmail = userEmail,
     userPhotoUrl = userPhotoUrl?.toString(),
+    savedProfiles = savedProfiles,
+    onSwitchProfile = onSwitchProfile,
+    onAddAccountClick = onAddAccountClick,
     onRefreshClick = onRefreshClick,
     onSettingsClick = onSettingsClick,
     onSignOutClick = onSignOutClick,
@@ -281,8 +440,8 @@ fun GoogleAccountDialog(
 private fun AccountDialogActionItem(
     icon: ImageVector,
     label: String,
-    iconTint: Color = Color(0xFFC4C7C5),
-    textColor: Color = Color(0xFFE3E3E3),
+    iconTint: Color = Color(0xFF94A3B8),
+    textColor: Color = Color(0xFFE2E8F0),
     onClick: () -> Unit
 ) {
     Surface(
@@ -294,16 +453,16 @@ private fun AccountDialogActionItem(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 10.dp, vertical = 12.dp),
+                .padding(horizontal = 10.dp, vertical = 11.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Icon(
                 imageVector = icon,
                 contentDescription = label,
                 tint = iconTint,
-                modifier = Modifier.size(22.dp)
+                modifier = Modifier.size(20.dp)
             )
-            Spacer(modifier = Modifier.width(16.dp))
+            Spacer(modifier = Modifier.width(14.dp))
             Text(
                 text = label,
                 color = textColor,

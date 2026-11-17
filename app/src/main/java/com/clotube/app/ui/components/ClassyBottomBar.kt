@@ -27,8 +27,10 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Bookmarks
 import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.Home
+import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
@@ -70,6 +72,16 @@ val DefaultClassyNavTabs = listOf(
         tab = NavigationTab.LIBRARY,
         label = "Home",
         icon = Icons.Rounded.Home
+    ),
+    ClassyNavTabItem(
+        tab = NavigationTab.SEARCH,
+        label = "Search",
+        icon = Icons.Rounded.Search
+    ),
+    ClassyNavTabItem(
+        tab = NavigationTab.WATCHLIST,
+        label = "Watchlist",
+        icon = Icons.Rounded.Bookmarks
     ),
     ClassyNavTabItem(
         tab = NavigationTab.RECENT,

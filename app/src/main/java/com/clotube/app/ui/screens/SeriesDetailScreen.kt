@@ -36,7 +36,15 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.rounded.Bookmark
+import androidx.compose.material.icons.rounded.BookmarkBorder
+import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.Replay
+import com.clotube.app.data.WatchlistManager
+import com.clotube.app.model.WatchlistMediaType
+import com.clotube.app.model.WatchlistStatus
+import com.clotube.app.ui.components.WatchlistStatusBottomSheet
 import androidx.compose.material3.*
 import androidx.compose.material3.ripple
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
@@ -99,6 +107,10 @@ fun SeriesDetailScreen(
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
     var isFullscreen by rememberSaveable(series.id) { mutableStateOf(isLandscape) }
+
+    val watchlistRevision = WatchlistManager.watchlistRevision
+    val currentWatchlistStatus = WatchlistManager.getStatus(series.id, series.title)
+    var showWatchlistSheet by remember { mutableStateOf(false) }
 
     // Restore portrait orientation and system bars ONLY when leaving SeriesDetailScreen entirely—
     // never when switching between episodes.
@@ -387,7 +399,9 @@ fun SeriesDetailScreen(
             onToggleFullscreen = stableOnToggleFullscreen,
             onBackdropBackClick = stableOnBackdropBackClick,
             onResumeClick = stableOnResumeClick,
-            onStartWatchingClick = stableOnStartWatchingClick
+            onStartWatchingClick = stableOnStartWatchingClick,
+            watchlistStatus = currentWatchlistStatus,
+            onWatchlistClick = { showWatchlistSheet = true }
         )
 
         // ========================================================
@@ -406,11 +420,34 @@ fun SeriesDetailScreen(
                 upNextEpisode = upNextEpisode,
                 isLoadingEpisodes = isLoadingEpisodes,
                 onEpisodePlaybackRequested = stableOnEpisodeClicked,
+                currentWatchlistStatus = currentWatchlistStatus,
+                onWatchlistClick = { showWatchlistSheet = true },
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f)
             )
         }
+    }
+
+    if (showWatchlistSheet) {
+        val thumbUrl = series.thumbnailUrl.ifBlank { series.backdropUrl ?: series.posterUrl ?: "" }
+        WatchlistStatusBottomSheet(
+            title = series.title,
+            currentStatus = currentWatchlistStatus,
+            onSelectStatus = { newStatus ->
+                WatchlistManager.setStatus(
+                    context = context,
+                    id = series.id,
+                    title = series.title,
+                    mediaType = WatchlistMediaType.SERIES,
+                    status = newStatus,
+                    posterUrl = series.posterUrl ?: thumbUrl,
+                    backdropUrl = series.backdropUrl ?: "",
+                    genre = series.genre
+                )
+            },
+            onDismiss = { showWatchlistSheet = false }
+        )
     }
 }
 
@@ -435,7 +472,9 @@ private fun SeriesTopPlayerViewport(
     onToggleFullscreen: () -> Unit,
     onBackdropBackClick: () -> Unit,
     onResumeClick: (Episode, Long) -> Unit,
-    onStartWatchingClick: () -> Unit
+    onStartWatchingClick: () -> Unit,
+    watchlistStatus: WatchlistStatus = WatchlistStatus.UNWATCHED,
+    onWatchlistClick: () -> Unit = {}
 ) {
     Box(
         modifier = if (isLandscape) {
@@ -484,13 +523,17 @@ private fun SeriesTopPlayerViewport(
                 currentPositionMs = targetResumePosMs,
                 durationMs = targetDurationMs,
                 onBackClick = onBackdropBackClick,
-                onResumeClick = onResumeClick
+                onResumeClick = onResumeClick,
+                watchlistStatus = watchlistStatus,
+                onWatchlistClick = onWatchlistClick
             )
         } else {
             StaticSeriesBackdropHeader(
                 series = series,
                 onBackClick = onBackdropBackClick,
-                onStartWatchingClick = onStartWatchingClick
+                onStartWatchingClick = onStartWatchingClick,
+                watchlistStatus = watchlistStatus,
+                onWatchlistClick = onWatchlistClick
             )
         }
     }
@@ -510,7 +553,9 @@ private fun SeriesEpisodesSection(
     upNextEpisode: Episode?,
     isLoadingEpisodes: Boolean,
     onEpisodePlaybackRequested: (Episode) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    currentWatchlistStatus: WatchlistStatus = WatchlistStatus.UNWATCHED,
+    onWatchlistClick: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val view = LocalView.current
@@ -724,48 +769,65 @@ private fun SeriesEpisodesSection(
                         .fillMaxWidth()
                         .padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 14.dp)
                 ) {
-                    Text(
-                        text = series.title,
-                        color = Color.White,
-                        fontSize = 20.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-
-                    Spacer(modifier = Modifier.height(4.dp))
-
                     Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        if (series.genre.isNotBlank()) {
+                        Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = series.genre,
-                                color = Color(0xFF8899A6),
-                                fontSize = 12.sp
+                                text = series.title,
+                                color = Color.White,
+                                fontSize = 20.sp,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
-                            Text(
-                                text = "•",
-                                color = Color(0xFF8899A6),
-                                fontSize = 12.sp
-                            )
+
+                            Spacer(modifier = Modifier.height(4.dp))
+
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                if (series.genre.isNotBlank()) {
+                                    Text(
+                                        text = series.genre,
+                                        color = Color(0xFF8899A6),
+                                        fontSize = 12.sp
+                                    )
+                                    Text(
+                                        text = "•",
+                                        color = Color(0xFF8899A6),
+                                        fontSize = 12.sp
+                                    )
+                                }
+
+                                if (isLoadingEpisodes) {
+                                    Box(
+                                        modifier = Modifier
+                                            .width(60.dp)
+                                            .height(14.dp)
+                                            .clip(RoundedCornerShape(4.dp))
+                                            .shimmerEffect()
+                                    )
+                                } else {
+                                    val seasonCount = series.seasons.size
+                                    Text(
+                                        text = "$seasonCount ${if (seasonCount == 1) "Season" else "Seasons"}",
+                                        color = Color(0xFF8899A6),
+                                        fontSize = 12.sp
+                                    )
+                                }
+                            }
                         }
 
-                        if (isLoadingEpisodes) {
-                            Box(
-                                modifier = Modifier
-                                    .width(60.dp)
-                                    .height(14.dp)
-                                    .clip(RoundedCornerShape(4.dp))
-                                    .shimmerEffect()
-                            )
-                        } else {
-                            val seasonCount = series.seasons.size
-                            Text(
-                                text = "$seasonCount ${if (seasonCount == 1) "Season" else "Seasons"}",
-                                color = Color(0xFF8899A6),
-                                fontSize = 12.sp
-                            )
-                        }
+                        Spacer(modifier = Modifier.width(10.dp))
+
+                        SeriesWatchlistActionPill(
+                            status = currentWatchlistStatus,
+                            onClick = onWatchlistClick
+                        )
                     }
                 }
 
@@ -1399,7 +1461,9 @@ fun StaticSeriesBackdropHeader(
     series: Series,
     onBackClick: () -> Unit,
     onStartWatchingClick: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    watchlistStatus: WatchlistStatus = WatchlistStatus.UNWATCHED,
+    onWatchlistClick: () -> Unit = {}
 ) {
     val displayArtworkUrl = series.backdropUrl?.ifBlank { null }
         ?: series.posterUrl?.ifBlank { null }
@@ -1458,7 +1522,7 @@ fun StaticSeriesBackdropHeader(
             }
         }
 
-        // 4. Center / Bottom Content: Title + "Start Watching" Button
+        // 4. Center / Bottom Content: Title + "Start Watching" & Watchlist Buttons
         Column(
             modifier = Modifier
                 .align(Alignment.BottomStart)
@@ -1477,27 +1541,86 @@ fun StaticSeriesBackdropHeader(
 
             Spacer(modifier = Modifier.height(10.dp))
 
-            Button(
-                onClick = onStartWatchingClick,
-                colors = ButtonDefaults.buttonColors(containerColor = AccentBlue),
-                shape = RoundedCornerShape(10.dp),
-                contentPadding = PaddingValues(horizontal = 20.dp, vertical = 10.dp)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Icon(
-                    imageVector = Icons.Rounded.PlayArrow,
-                    contentDescription = "Start Watching",
-                    tint = Color.White,
-                    modifier = Modifier.size(18.dp)
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = "Start Watching",
-                    style = MaterialTheme.typography.labelLarge.copy(
-                        fontWeight = FontWeight.SemiBold,
-                        color = Color.White
+                Button(
+                    onClick = onStartWatchingClick,
+                    colors = ButtonDefaults.buttonColors(containerColor = AccentBlue),
+                    shape = RoundedCornerShape(10.dp),
+                    contentPadding = PaddingValues(horizontal = 20.dp, vertical = 10.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.PlayArrow,
+                        contentDescription = "Start Watching",
+                        tint = Color.White,
+                        modifier = Modifier.size(18.dp)
                     )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "Start Watching",
+                        style = MaterialTheme.typography.labelLarge.copy(
+                            fontWeight = FontWeight.SemiBold,
+                            color = Color.White
+                        )
+                    )
+                }
+
+                SeriesWatchlistActionPill(
+                    status = watchlistStatus,
+                    onClick = onWatchlistClick
                 )
             }
+        }
+    }
+}
+
+/**
+ * Sleek Obsidian Cinema Watchlist action pill button for Series details.
+ * Renders status icon + label ("Add to Watchlist", "Watch Later", "Watched", or "Rewatch").
+ */
+@Composable
+fun SeriesWatchlistActionPill(
+    status: WatchlistStatus,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val haptic = LocalHapticFeedback.current
+    val (icon, label, tint) = when (status) {
+        WatchlistStatus.UNWATCHED -> Triple(Icons.Rounded.BookmarkBorder, "Add to Watchlist", Color.White.copy(alpha = 0.9f))
+        WatchlistStatus.WATCH_LATER -> Triple(Icons.Rounded.Bookmark, "Watch Later", AccentBlue)
+        WatchlistStatus.WATCHED -> Triple(Icons.Rounded.CheckCircle, "Watched", Color(0xFF10B981))
+        WatchlistStatus.REWATCH -> Triple(Icons.Rounded.Replay, "Rewatch", Color(0xFFF59E0B))
+    }
+
+    Surface(
+        onClick = {
+            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+            onClick()
+        },
+        shape = RoundedCornerShape(10.dp),
+        color = Color(0xCC181C26),
+        border = BorderStroke(0.5.dp, SurfaceBorder),
+        modifier = modifier.height(38.dp)
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = label,
+                tint = tint,
+                modifier = Modifier.size(16.dp)
+            )
+            Text(
+                text = label,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = if (status == WatchlistStatus.UNWATCHED) Color.White else tint
+            )
         }
     }
 }

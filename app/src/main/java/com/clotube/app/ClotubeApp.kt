@@ -7,6 +7,11 @@ import coil.disk.DiskCache
 import coil.memory.MemoryCache
 import coil.request.CachePolicy
 import com.clotube.app.data.DriveWatchHistorySync
+import com.clotube.app.data.TokenRepository
+import com.clotube.app.network.ClotubeNetworkMonitor
+import kotlinx.coroutines.runBlocking
+import okhttp3.OkHttpClient
+import java.util.concurrent.TimeUnit
 
 class ClotubeApp : Application(), ImageLoaderFactory {
 
@@ -19,10 +24,45 @@ class ClotubeApp : Application(), ImageLoaderFactory {
         super.onCreate()
         instance = this
         DriveWatchHistorySync.init(this)
+        ClotubeNetworkMonitor.startMonitoring(this)
     }
 
     override fun newImageLoader(): ImageLoader {
+        val okHttpClient = OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(20, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .addInterceptor { chain ->
+                val request = chain.request()
+                val url = request.url.toString()
+                val isDriveUrl = url.contains("lh3.googleusercontent.com") ||
+                        url.contains("googleapis.com/drive/v3/files") ||
+                        url.contains("drive.google.com")
+
+                if (isDriveUrl && request.header("Authorization") == null) {
+                    val token = runCatching {
+                        runBlocking {
+                            TokenRepository(this@ClotubeApp).getValidAccessToken(forceRefresh = false)
+                        }
+                    }.getOrNull()
+
+                    if (!token.isNullOrBlank()) {
+                        val authRequest = request.newBuilder()
+                            .header("Authorization", "Bearer $token")
+                            .build()
+                        chain.proceed(authRequest)
+                    } else {
+                        chain.proceed(request)
+                    }
+                } else {
+                    chain.proceed(request)
+                }
+            }
+            .build()
+
         return ImageLoader.Builder(this)
+            .okHttpClient(okHttpClient)
             .memoryCachePolicy(CachePolicy.ENABLED)
             .memoryCache {
                 MemoryCache.Builder(this)

@@ -36,7 +36,9 @@ fun SeriesResumeHeaderCard(
     durationMs: Long,
     onBackClick: () -> Unit,
     onResumeClick: (Episode, Long) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    watchlistStatus: com.clotube.app.model.WatchlistStatus = com.clotube.app.model.WatchlistStatus.UNWATCHED,
+    onWatchlistClick: () -> Unit = {}
 ) {
     val progressFraction = if (durationMs > 0L) {
         (currentPositionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
@@ -214,29 +216,40 @@ fun SeriesResumeHeaderCard(
                 )
             }
 
-            // Prominent Action Button
-            Button(
-                onClick = { onResumeClick(episode, currentPositionMs) },
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Color.White,
-                    contentColor = CanvasDeep
-                ),
-                shape = RoundedCornerShape(20.dp),
-                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
-                modifier = Modifier.height(36.dp)
+            // Prominent Action Button & Watchlist Button
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Icon(
-                    imageVector = Icons.Rounded.PlayArrow,
-                    contentDescription = null,
-                    tint = CanvasDeep,
-                    modifier = Modifier.size(18.dp)
-                )
-                Spacer(modifier = Modifier.width(4.dp))
-                Text(
-                    text = if (isResume) "Resume Watching" else "Start Watching",
-                    color = CanvasDeep,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold
+                Button(
+                    onClick = { onResumeClick(episode, currentPositionMs) },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color.White,
+                        contentColor = CanvasDeep
+                    ),
+                    shape = RoundedCornerShape(20.dp),
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
+                    modifier = Modifier.height(36.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.PlayArrow,
+                        contentDescription = null,
+                        tint = CanvasDeep,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = if (isResume) "Resume Watching" else "Start Watching",
+                        color = CanvasDeep,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                com.clotube.app.ui.components.WatchlistBookmarkButton(
+                    status = watchlistStatus,
+                    onClick = onWatchlistClick,
+                    size = 36.dp
                 )
             }
         }

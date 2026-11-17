@@ -27,6 +27,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.VideoLibrary
+import androidx.compose.material.icons.rounded.Bookmarks
+import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -65,6 +67,16 @@ val DefaultNavTabs = listOf(
         tab = NavigationTab.LIBRARY,
         label = "Home",
         icon = Icons.Default.VideoLibrary
+    ),
+    BottomNavTabItem(
+        tab = NavigationTab.SEARCH,
+        label = "Search",
+        icon = Icons.Rounded.Search
+    ),
+    BottomNavTabItem(
+        tab = NavigationTab.WATCHLIST,
+        label = "Watchlist",
+        icon = Icons.Rounded.Bookmarks
     ),
     BottomNavTabItem(
         tab = NavigationTab.RECENT,

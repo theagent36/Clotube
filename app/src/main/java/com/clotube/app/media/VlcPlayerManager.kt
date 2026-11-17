@@ -4,9 +4,11 @@ import android.content.Context
 import android.net.Uri
 import android.util.Log
 import com.clotube.app.data.LocalStreamProxy
+import com.clotube.app.data.PlaybackTrackPreferences
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.videolan.libvlc.LibVLC
@@ -266,12 +268,31 @@ class VlcPlayerManager(
         if (!mediaPlayer.isReleased) {
             try { mediaPlayer.spuTrack = trackId } catch (_: Throwable) {}
         }
+        CoroutineScope(NonCancellable + Dispatchers.IO).launch {
+            try {
+                if (trackId == -1) {
+                    PlaybackTrackPreferences.saveSubtitleSelection(context, -1, "Off", -1)
+                } else {
+                    val tracks = mediaPlayer.spuTracks?.filter { it.id != -1 }
+                    val match = tracks?.firstOrNull { it.id == trackId }
+                    val activeIdx = tracks?.indexOfFirst { it.id == trackId } ?: 0
+                    PlaybackTrackPreferences.saveSubtitleSelection(context, trackId, match?.name, activeIdx)
+                }
+            } catch (_: Exception) {}
+        }
     }
 
     fun setAudioTrack(trackId: Int) {
         userSelectedAudioTrackId = trackId
         if (!mediaPlayer.isReleased) {
             try { mediaPlayer.audioTrack = trackId } catch (_: Throwable) {}
+        }
+        CoroutineScope(NonCancellable + Dispatchers.IO).launch {
+            try {
+                val tracks = mediaPlayer.audioTracks?.filter { it.id != -1 }
+                val match = tracks?.firstOrNull { it.id == trackId }
+                PlaybackTrackPreferences.saveAudioSelection(context, trackId, match?.name)
+            } catch (_: Exception) {}
         }
     }
 

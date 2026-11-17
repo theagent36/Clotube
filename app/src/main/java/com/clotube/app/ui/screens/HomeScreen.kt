@@ -14,9 +14,11 @@ import androidx.compose.animation.scaleIn
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -103,8 +105,11 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.platform.LocalContext
@@ -134,7 +139,19 @@ import com.clotube.app.ui.theme.BadgeBackground
 import com.clotube.app.ui.theme.BadgeBorder
 import com.clotube.app.ui.theme.BorderOutline
 import com.clotube.app.ui.theme.CardContainer
+import androidx.compose.material.icons.rounded.Bookmarks
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Movie
+import androidx.compose.material.icons.rounded.Tv
+import com.clotube.app.data.WatchlistManager
+import com.clotube.app.data.metadata.GlobalCatalogSearchEngine
+import com.clotube.app.data.metadata.OnlineMetadataResolver
+import com.clotube.app.model.WatchlistMediaType
+import com.clotube.app.model.WatchlistStatus
+import com.clotube.app.ui.components.WatchlistBookmarkButton
+import com.clotube.app.ui.components.WatchlistStatusBottomSheet
+import com.clotube.app.ui.components.WatchlistStatusPill
+import com.clotube.app.ui.screens.WatchlistScreen
 import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.rounded.PlayArrow
@@ -178,6 +195,8 @@ enum class HomeCatalogFilter(val title: String) {
 @Keep
 enum class HomeNavigationTab(val title: String, val icon: ImageVector) {
     HOME("Home", Icons.Rounded.Home),
+    SEARCH("Search", Icons.Rounded.Search),
+    WATCHLIST("Watchlist", Icons.Rounded.Bookmarks),
     RECENT("Recent", Icons.Rounded.History),
     SETTINGS("Settings", Icons.Rounded.Settings)
 }
@@ -255,6 +274,8 @@ fun HomeScreen(
     val continueWatchingDisplayData by viewModel.continueWatchingDisplayState.collectAsState()
     val continueWatchingData by viewModel.continueWatchingState.collectAsState()
     val continueWatchingItem by viewModel.continueWatchingItem.collectAsState()
+    val driveMovies by viewModel.moviesList.collectAsState()
+    val driveSeries by viewModel.seriesList.collectAsState()
     val lastWatchedDirect by viewModel.playbackHistoryManager.getLastWatchedMedia().collectAsState(initial = null)
     val isHistoryLoaded by viewModel.isHistoryLoaded.collectAsState()
     var showAccountDialog by remember { mutableStateOf(false) }
@@ -294,6 +315,8 @@ fun HomeScreen(
             onDismiss = { viewModel.dismissOnboardingDialog() }
         )
     }
+
+    val savedProfiles by viewModel.savedProfiles.collectAsState()
 
     // Manual Folder Picker Dialog
     if (showFolderPickerType != null) {
@@ -499,6 +522,82 @@ fun HomeScreen(
                     .fillMaxSize()
                     .padding(bottom = paddingValues.calculateBottomPadding())
             )
+        } else if (uiState.currentTab == NavigationTab.SEARCH) {
+            SearchScreen(
+                viewModel = viewModel,
+                onMovieSelected = { movie ->
+                    if (onPlayMovie != null) {
+                        onPlayMovie(movie.id)
+                    } else {
+                        val matchedMovie = uiState.moviesList.find { it.id == movie.id }
+                            ?: uiState.videos.find { it.id == movie.id }
+                        if (matchedMovie != null) {
+                            onVideoSelected(matchedMovie)
+                        } else {
+                            onVideoSelected(
+                                VideoItem(
+                                    id = movie.id,
+                                    displayTitle = movie.title,
+                                    durationFormatted = movie.formattedDuration,
+                                    fileSizeFormatted = movie.fileSize,
+                                    genreFormatted = movie.genre,
+                                    resolutionBadge = movie.resolution,
+                                    streamUri = movie.streamUri,
+                                    thumbnailUrl = movie.thumbnailUrl.orEmpty()
+                                )
+                            )
+                        }
+                    }
+                },
+                onSeriesSelected = { series ->
+                    if (onNavigateToSeriesDetail != null) {
+                        onNavigateToSeriesDetail(series.id, null)
+                    } else {
+                        onSeriesSelected(series)
+                    }
+                },
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(bottom = paddingValues.calculateBottomPadding())
+            )
+        } else if (uiState.currentTab == NavigationTab.WATCHLIST) {
+            WatchlistScreen(
+                movies = driveMovies,
+                seriesList = driveSeries,
+                onMovieSelected = { entry ->
+                    val matchedMovie = uiState.moviesList.find { it.id == entry.id }
+                        ?: uiState.videos.find { it.id == entry.id }
+                    if (matchedMovie != null) {
+                        onVideoSelected(matchedMovie)
+                    } else if (onPlayMovie != null) {
+                        onPlayMovie(entry.id)
+                    } else {
+                        onVideoSelected(
+                            VideoItem(
+                                id = entry.id,
+                                displayTitle = entry.title,
+                                durationFormatted = "",
+                                fileSizeFormatted = "",
+                                genreFormatted = entry.genre.ifBlank { "Movie" },
+                                resolutionBadge = "HD",
+                                streamUri = DriveMediaSourceFactory.buildDriveStreamUri(entry.id).toString(),
+                                thumbnailUrl = entry.posterUrl.ifBlank { entry.backdropUrl }
+                            )
+                        )
+                    }
+                },
+                onSeriesSelected = { entry ->
+                    val matchedSeries = uiState.tvSeriesList.find { it.id == entry.id }
+                    if (matchedSeries != null) {
+                        onSeriesSelected(matchedSeries)
+                    } else if (onNavigateToSeriesDetail != null) {
+                        onNavigateToSeriesDetail(entry.id, null)
+                    }
+                },
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(bottom = paddingValues.calculateBottomPadding())
+            )
         } else {
             val isInitialLoading = uiState.isInitialLoading
             val isCatalogEmpty = uiState.moviesList.isEmpty() && uiState.tvSeriesList.isEmpty()
@@ -516,13 +615,34 @@ fun HomeScreen(
             }
         } else {
             val searchQuery = uiState.searchQuery.trim()
-            val displayMovies = uiState.filteredVideos
-            val displaySeries = if (searchQuery.isBlank()) {
-                uiState.tvSeriesList
-            } else {
-                uiState.tvSeriesList.filter {
-                    it.title.contains(searchQuery, ignoreCase = true) ||
-                    it.genre.contains(searchQuery, ignoreCase = true)
+            val rawMovies = uiState.filteredVideos
+            val displayMovies = remember(rawMovies) {
+                val seenIds = HashSet<String>()
+                val seenNorms = HashSet<String>()
+                rawMovies.filter { movie ->
+                    val norm = WatchlistManager.normalizeTitle(movie.displayTitle.ifBlank { movie.title })
+                    val idAdded = seenIds.add(movie.id)
+                    val normAdded = norm.isBlank() || seenNorms.add(norm)
+                    idAdded && normAdded
+                }
+            }
+            val rawSeries = uiState.tvSeriesList
+            val displaySeries = remember(rawSeries, searchQuery) {
+                val filtered = if (searchQuery.isBlank()) {
+                    rawSeries
+                } else {
+                    rawSeries.filter {
+                        it.title.contains(searchQuery, ignoreCase = true) ||
+                        it.genre.contains(searchQuery, ignoreCase = true)
+                    }
+                }
+                val seenIds = HashSet<String>()
+                val seenNorms = HashSet<String>()
+                filtered.filter { series ->
+                    val norm = WatchlistManager.normalizeTitle(series.title)
+                    val idAdded = seenIds.add(series.id)
+                    val normAdded = norm.isBlank() || seenNorms.add(norm)
+                    idAdded && normAdded
                 }
             }
 
@@ -719,8 +839,6 @@ fun HomeScreen(
                                     val heroSeries = uiState.heroSeries
                                     val lastWatched = lastWatchedDirect ?: uiState.lastWatchedMedia
 
-
-
                                     when {
                                         continueWatchingDisplayData != null -> {
                                             val item = continueWatchingDisplayData!!
@@ -915,6 +1033,17 @@ fun HomeScreen(
         userDisplayName = currentUser?.displayName ?: uiState.userName ?: "User",
         userEmail = currentUser?.email ?: uiState.userEmail ?: "",
         userPhotoUrl = currentUser?.photoUrl?.toString() ?: uiState.userAvatarUrl,
+        savedProfiles = savedProfiles,
+        onSwitchProfile = { email ->
+            viewModel.switchProfile(email)
+        },
+        onAddAccountClick = {
+            if (activity != null) {
+                com.clotube.app.auth.GoogleAuthManager.launchGoogleSignIn(activity, signInLauncher)
+            } else {
+                com.clotube.app.auth.GoogleAuthManager.launchGoogleSignIn(context, signInLauncher)
+            }
+        },
         onRefreshClick = {
             viewModel.refreshCatalog(forceSync = true)
         },
@@ -1318,6 +1447,40 @@ fun MovieCard(
     onClick: () -> Unit,
     modifier: Modifier = Modifier.width(220.dp)
 ) {
+    val context = LocalContext.current
+    val revision = WatchlistManager.watchlistRevision
+    val currentStatus = WatchlistManager.getStatus(movie.id, movie.displayTitle)
+    var showBottomSheet by remember { mutableStateOf(false) }
+
+    var fallbackPoster by remember(movie.id) { mutableStateOf("") }
+    var imageLoadFailed by remember(movie.thumbnailUrl) { mutableStateOf(false) }
+
+    val effectiveThumb = when {
+        fallbackPoster.isNotBlank() -> fallbackPoster
+        !imageLoadFailed && !movie.thumbnailUrl.isNullOrBlank() -> movie.thumbnailUrl
+        else -> ""
+    }
+
+    LaunchedEffect(movie.id, movie.displayTitle, imageLoadFailed, movie.thumbnailUrl) {
+        if ((movie.thumbnailUrl.isNullOrBlank() || imageLoadFailed) && fallbackPoster.isBlank()) {
+            withContext(Dispatchers.IO) {
+                try {
+                    val searchResults = GlobalCatalogSearchEngine.searchOnlineCatalog(movie.displayTitle)
+                    val best = searchResults.firstOrNull { it.posterUrl.isNotBlank() }?.posterUrl
+                        ?: searchResults.firstOrNull { it.backdropUrl.isNotBlank() }?.backdropUrl
+                    if (!best.isNullOrBlank()) {
+                        fallbackPoster = best
+                    } else {
+                        val resolved = OnlineMetadataResolver.resolveMovie(movie.displayTitle).posterUrl
+                        if (!resolved.isNullOrBlank()) {
+                            fallbackPoster = resolved
+                        }
+                    }
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
     val interactionSource = remember { MutableInteractionSource() }
     Card(
         modifier = modifier
@@ -1334,38 +1497,83 @@ fun MovieCard(
         border = BorderStroke(1.dp, SurfaceBorder)
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
-            // Layer 1 (Base): Coil AsyncImage with downsampling & HARDWARE bitmap
-            AsyncImage(
-                model = ImageRequest.Builder(LocalContext.current)
-                    .data(movie.thumbnailUrl)
-                    .crossfade(150)
-                    .size(width = 440, height = 248) // Exact 2x pixel density for 220dp x 124dp card
-                    .bitmapConfig(Bitmap.Config.HARDWARE) // Direct GPU texture
-                    .memoryCacheKey("thumb_${movie.id}_${movie.thumbnailUrl.hashCode()}")
-                    .diskCacheKey("thumb_${movie.id}_${movie.thumbnailUrl.hashCode()}")
-                    .build(),
-                contentDescription = movie.displayTitle,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize()
-            )
-
-            // Duration tag anchored to TopEnd (resolution / 1080p FHD pill tag removed)
-            if (movie.durationFormatted.isNotBlank() && movie.durationFormatted != "00:00") {
+            if (effectiveThumb.isNotBlank()) {
+                // Layer 1 (Base): Coil AsyncImage with downsampling & HARDWARE bitmap
+                AsyncImage(
+                    model = ImageRequest.Builder(LocalContext.current)
+                        .data(effectiveThumb)
+                        .crossfade(150)
+                        .size(width = 440, height = 248) // Exact 2x pixel density for 220dp x 124dp card
+                        .bitmapConfig(Bitmap.Config.HARDWARE) // Direct GPU texture
+                        .memoryCacheKey("thumb_${movie.id}_${effectiveThumb.hashCode()}")
+                        .diskCacheKey("thumb_${movie.id}_${effectiveThumb.hashCode()}")
+                        .build(),
+                    contentDescription = movie.displayTitle,
+                    contentScale = ContentScale.Crop,
+                    onError = { imageLoadFailed = true },
+                    onSuccess = { imageLoadFailed = false },
+                    modifier = Modifier.fillMaxSize()
+                )
+            } else {
                 Box(
                     modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .padding(8.dp)
-                        .background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(6.dp))
-                        .border(0.5.dp, SurfaceBorder, RoundedCornerShape(6.dp))
-                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                        .fillMaxSize()
+                        .background(
+                            Brush.verticalGradient(
+                                colors = listOf(Color(0xFF1E2638), Color(0xFF0F1420))
+                            )
+                        ),
+                    contentAlignment = Alignment.Center
                 ) {
-                    Text(
-                        text = movie.durationFormatted,
-                        fontSize = 9.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = Color.White
+                    Icon(
+                        imageVector = Icons.Rounded.Movie,
+                        contentDescription = null,
+                        tint = TextTertiary,
+                        modifier = Modifier.size(32.dp)
                     )
                 }
+            }
+
+            // Top-Start Status Pill
+            if (currentStatus != WatchlistStatus.UNWATCHED) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(8.dp)
+                ) {
+                    WatchlistStatusPill(status = currentStatus)
+                }
+            }
+
+            // Top-End: Duration tag and Bookmark Button
+            Row(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (movie.durationFormatted.isNotBlank() && movie.durationFormatted != "00:00") {
+                    Box(
+                        modifier = Modifier
+                            .background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(6.dp))
+                            .border(0.5.dp, SurfaceBorder, RoundedCornerShape(6.dp))
+                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                    ) {
+                        Text(
+                            text = movie.durationFormatted,
+                            fontSize = 9.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = Color.White
+                        )
+                    }
+                }
+
+                WatchlistBookmarkButton(
+                    status = currentStatus,
+                    onClick = { showBottomSheet = true },
+                    size = 28.dp
+                )
             }
 
             // Layer 3 (Bottom Scrim Gradient): covers lower 50% of card height
@@ -1443,6 +1651,25 @@ fun MovieCard(
             }
         }
     }
+
+    if (showBottomSheet) {
+        WatchlistStatusBottomSheet(
+            title = movie.displayTitle,
+            currentStatus = currentStatus,
+            onSelectStatus = { newStatus ->
+                WatchlistManager.setStatus(
+                    context = context,
+                    id = movie.id,
+                    title = movie.displayTitle,
+                    mediaType = WatchlistMediaType.MOVIE,
+                    status = newStatus,
+                    posterUrl = movie.thumbnailUrl,
+                    genre = movie.genreFormatted
+                )
+            },
+            onDismiss = { showBottomSheet = false }
+        )
+    }
 }
 
 @Composable
@@ -1467,6 +1694,11 @@ fun MoviePosterCard(
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
+    val revision = WatchlistManager.watchlistRevision
+    val currentStatus = WatchlistManager.getStatus(movie.id, movie.displayTitle)
+    var showBottomSheet by remember { mutableStateOf(false) }
+
     val is4k = movie.resolutionBadge.contains("4K", ignoreCase = true) ||
                movie.resolutionBadge.contains("2160", ignoreCase = true) ||
                movie.width >= 3840 ||
@@ -1477,6 +1709,35 @@ fun MoviePosterCard(
         ?: ""
 
     val interactionSource = remember { MutableInteractionSource() }
+    var fallbackPoster by remember(movie.id) { mutableStateOf("") }
+    var imageLoadFailed by remember(movie.thumbnailUrl) { mutableStateOf(false) }
+
+    val effectiveThumb = when {
+        fallbackPoster.isNotBlank() -> fallbackPoster
+        !imageLoadFailed && !movie.thumbnailUrl.isNullOrBlank() -> movie.thumbnailUrl
+        else -> ""
+    }
+
+    LaunchedEffect(movie.id, movie.displayTitle, imageLoadFailed, movie.thumbnailUrl) {
+        if ((movie.thumbnailUrl.isNullOrBlank() || imageLoadFailed) && fallbackPoster.isBlank()) {
+            withContext(Dispatchers.IO) {
+                try {
+                    val searchResults = GlobalCatalogSearchEngine.searchOnlineCatalog(movie.displayTitle)
+                    val best = searchResults.firstOrNull { it.posterUrl.isNotBlank() }?.posterUrl
+                        ?: searchResults.firstOrNull { it.backdropUrl.isNotBlank() }?.backdropUrl
+                    if (!best.isNullOrBlank()) {
+                        fallbackPoster = best
+                    } else {
+                        val resolved = OnlineMetadataResolver.resolveMovie(movie.displayTitle).posterUrl
+                        if (!resolved.isNullOrBlank()) {
+                            fallbackPoster = resolved
+                        }
+                    }
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
     Column(
         modifier = modifier
             .fillMaxWidth()
@@ -1498,20 +1759,58 @@ fun MoviePosterCard(
             border = BorderStroke(0.5.dp, SurfaceBorder)
         ) {
             Box(modifier = Modifier.fillMaxSize()) {
-                // Full bleed AsyncImage with ContentScale.Crop
-                AsyncImage(
-                    model = ImageRequest.Builder(LocalContext.current)
-                        .data(movie.thumbnailUrl)
-                        .crossfade(150)
-                        .size(width = 300, height = 450)
-                        .bitmapConfig(Bitmap.Config.HARDWARE)
-                        .memoryCacheKey("poster_${movie.id}_${movie.thumbnailUrl.hashCode()}")
-                        .diskCacheKey("poster_${movie.id}_${movie.thumbnailUrl.hashCode()}")
-                        .build(),
-                    contentDescription = movie.displayTitle,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxSize()
-                )
+                if (effectiveThumb.isNotBlank()) {
+                    // Full bleed AsyncImage with ContentScale.Crop
+                    AsyncImage(
+                        model = ImageRequest.Builder(LocalContext.current)
+                            .data(effectiveThumb)
+                            .crossfade(150)
+                            .size(width = 300, height = 450)
+                            .bitmapConfig(Bitmap.Config.HARDWARE)
+                            .memoryCacheKey("poster_${movie.id}_${effectiveThumb.hashCode()}")
+                            .diskCacheKey("poster_${movie.id}_${effectiveThumb.hashCode()}")
+                            .build(),
+                        contentDescription = movie.displayTitle,
+                        contentScale = ContentScale.Crop,
+                        onError = { imageLoadFailed = true },
+                        onSuccess = { imageLoadFailed = false },
+                        modifier = Modifier.fillMaxSize()
+                    )
+                } else {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(
+                                Brush.verticalGradient(
+                                    colors = listOf(Color(0xFF1E2638), Color(0xFF0F1420))
+                                )
+                            ),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.Center,
+                            modifier = Modifier.padding(6.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.Movie,
+                                contentDescription = null,
+                                tint = TextTertiary,
+                                modifier = Modifier.size(28.dp)
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = movie.displayTitle,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = TextSecondary,
+                                textAlign = TextAlign.Center,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                }
 
                 // Subtle vertical shadow on bottom 30% of image
                 Box(
@@ -1529,23 +1828,46 @@ fun MoviePosterCard(
                         )
                 )
 
-                // Quality Tag: Display ONLY if 4K (translucent tag "4K HDR", font size 8.sp, top-right corner)
-                if (is4k) {
+                // Top-Start Status Pill
+                if (currentStatus != WatchlistStatus.UNWATCHED) {
                     Box(
                         modifier = Modifier
-                            .align(Alignment.TopEnd)
+                            .align(Alignment.TopStart)
                             .padding(6.dp)
-                            .background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(4.dp))
-                            .border(0.5.dp, SurfaceBorder, RoundedCornerShape(4.dp))
-                            .padding(horizontal = 4.dp, vertical = 2.dp)
                     ) {
-                        Text(
-                            text = "4K HDR",
-                            color = Color.White,
-                            fontSize = 8.sp,
-                            fontWeight = FontWeight.Bold
-                        )
+                        WatchlistStatusPill(status = currentStatus)
                     }
+                }
+
+                // Top-End: 4K Tag & Bookmark Button
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (is4k) {
+                        Box(
+                            modifier = Modifier
+                                .background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(4.dp))
+                                .border(0.5.dp, SurfaceBorder, RoundedCornerShape(4.dp))
+                                .padding(horizontal = 4.dp, vertical = 2.dp)
+                        ) {
+                            Text(
+                                text = "4K HDR",
+                                color = Color.White,
+                                fontSize = 8.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+
+                    WatchlistBookmarkButton(
+                        status = currentStatus,
+                        onClick = { showBottomSheet = true },
+                        size = 26.dp
+                    )
                 }
 
                 // Bottom Watch Progress Bar flush against bottom edge
@@ -1593,6 +1915,25 @@ fun MoviePosterCard(
             )
         }
     }
+
+    if (showBottomSheet) {
+        WatchlistStatusBottomSheet(
+            title = movie.displayTitle,
+            currentStatus = currentStatus,
+            onSelectStatus = { newStatus ->
+                WatchlistManager.setStatus(
+                    context = context,
+                    id = movie.id,
+                    title = movie.displayTitle,
+                    mediaType = WatchlistMediaType.MOVIE,
+                    status = newStatus,
+                    posterUrl = movie.thumbnailUrl,
+                    genre = movie.genreFormatted
+                )
+            },
+            onDismiss = { showBottomSheet = false }
+        )
+    }
 }
 
 /**
@@ -1605,6 +1946,41 @@ fun SeriesCard(
     onClick: () -> Unit,
     modifier: Modifier = Modifier.width(220.dp)
 ) {
+    val context = LocalContext.current
+    val revision = WatchlistManager.watchlistRevision
+    val currentStatus = WatchlistManager.getStatus(series.id, series.title)
+    var showBottomSheet by remember { mutableStateOf(false) }
+
+    var fallbackPoster by remember(series.id) { mutableStateOf("") }
+    var imageLoadFailed by remember(series.id) { mutableStateOf(false) }
+
+    val initialThumb = series.thumbnailUrl.ifBlank { series.backdropUrl ?: series.posterUrl ?: "" }
+    val effectiveThumb = when {
+        fallbackPoster.isNotBlank() -> fallbackPoster
+        !imageLoadFailed && initialThumb.isNotBlank() -> initialThumb
+        else -> ""
+    }
+
+    LaunchedEffect(series.id, series.title, imageLoadFailed) {
+        if ((initialThumb.isBlank() || imageLoadFailed) && fallbackPoster.isBlank()) {
+            withContext(Dispatchers.IO) {
+                try {
+                    val searchResults = GlobalCatalogSearchEngine.searchOnlineCatalog(series.title)
+                    val best = searchResults.firstOrNull { it.posterUrl.isNotBlank() }?.posterUrl
+                        ?: searchResults.firstOrNull { it.backdropUrl.isNotBlank() }?.backdropUrl
+                    if (!best.isNullOrBlank()) {
+                        fallbackPoster = best
+                    } else {
+                        val resolved = OnlineMetadataResolver.resolveSeries(series.title).posterUrl
+                        if (!resolved.isNullOrBlank()) {
+                            fallbackPoster = resolved
+                        }
+                    }
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
     val interactionSource = remember { MutableInteractionSource() }
     Card(
         modifier = modifier
@@ -1621,20 +1997,41 @@ fun SeriesCard(
         border = BorderStroke(1.dp, SurfaceBorder)
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
-            val thumbUrl = series.thumbnailUrl.ifBlank { series.backdropUrl ?: series.posterUrl ?: "" }
-            AsyncImage(
-                model = ImageRequest.Builder(LocalContext.current)
-                    .data(thumbUrl)
-                    .crossfade(150)
-                    .size(width = 440, height = 248) // Exact 2x pixel density for 220dp x 124dp card
-                    .bitmapConfig(Bitmap.Config.HARDWARE) // Direct GPU texture
-                    .memoryCacheKey("thumb_${series.id}_${thumbUrl.hashCode()}")
-                    .diskCacheKey("thumb_${series.id}_${thumbUrl.hashCode()}")
-                    .build(),
-                contentDescription = series.title,
-                modifier = Modifier.fillMaxSize(),
-                contentScale = ContentScale.Crop
-            )
+            if (effectiveThumb.isNotBlank()) {
+                AsyncImage(
+                    model = ImageRequest.Builder(LocalContext.current)
+                        .data(effectiveThumb)
+                        .crossfade(150)
+                        .size(width = 440, height = 248) // Exact 2x pixel density for 220dp x 124dp card
+                        .bitmapConfig(Bitmap.Config.HARDWARE) // Direct GPU texture
+                        .memoryCacheKey("thumb_${series.id}_${effectiveThumb.hashCode()}")
+                        .diskCacheKey("thumb_${series.id}_${effectiveThumb.hashCode()}")
+                        .build(),
+                    contentDescription = series.title,
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Crop,
+                    onError = { imageLoadFailed = true },
+                    onSuccess = { imageLoadFailed = false }
+                )
+            } else {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(
+                            Brush.verticalGradient(
+                                colors = listOf(Color(0xFF1E2638), Color(0xFF0F1420))
+                            )
+                        ),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Tv,
+                        contentDescription = null,
+                        tint = TextTertiary,
+                        modifier = Modifier.size(32.dp)
+                    )
+                }
+            }
 
             // Season count tag anchored to TopEnd ("OTT SERIES" and "Tap to explore" removed)
             val seasonDisplay = when {
@@ -1644,22 +2041,47 @@ fun SeriesCard(
                 series.totalSeasonsFormatted != "TV Series" -> series.totalSeasonsFormatted
                 else -> null
             }
-            if (seasonDisplay != null) {
+
+            // Top-Start Status Pill
+            if (currentStatus != WatchlistStatus.UNWATCHED) {
                 Box(
                     modifier = Modifier
-                        .align(Alignment.TopEnd)
+                        .align(Alignment.TopStart)
                         .padding(8.dp)
-                        .background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(6.dp))
-                        .border(0.5.dp, SurfaceBorder, RoundedCornerShape(6.dp))
-                        .padding(horizontal = 6.dp, vertical = 2.dp)
                 ) {
-                    Text(
-                        text = seasonDisplay,
-                        fontSize = 9.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = Color.White
-                    )
+                    WatchlistStatusPill(status = currentStatus)
                 }
+            }
+
+            // Top-End: Season count tag and Bookmark Button
+            Row(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (seasonDisplay != null) {
+                    Box(
+                        modifier = Modifier
+                            .background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(6.dp))
+                            .border(0.5.dp, SurfaceBorder, RoundedCornerShape(6.dp))
+                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                    ) {
+                        Text(
+                            text = seasonDisplay,
+                            fontSize = 9.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = Color.White
+                        )
+                    }
+                }
+
+                WatchlistBookmarkButton(
+                    status = currentStatus,
+                    onClick = { showBottomSheet = true },
+                    size = 28.dp
+                )
             }
 
             // Layer 3 (Bottom Scrim Gradient): covers lower 50% of card height
@@ -1734,6 +2156,27 @@ fun SeriesCard(
                 }
             }
         }
+    }
+
+    if (showBottomSheet) {
+        val thumbUrl = series.thumbnailUrl.ifBlank { series.backdropUrl ?: series.posterUrl ?: "" }
+        WatchlistStatusBottomSheet(
+            title = series.title,
+            currentStatus = currentStatus,
+            onSelectStatus = { newStatus ->
+                WatchlistManager.setStatus(
+                    context = context,
+                    id = series.id,
+                    title = series.title,
+                    mediaType = WatchlistMediaType.SERIES,
+                    status = newStatus,
+                    posterUrl = series.posterUrl ?: thumbUrl,
+                    backdropUrl = series.backdropUrl ?: "",
+                    genre = series.genre
+                )
+            },
+            onDismiss = { showBottomSheet = false }
+        )
     }
 }
 
@@ -2072,6 +2515,11 @@ fun SeriesRowCard(
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
+    val revision = WatchlistManager.watchlistRevision
+    val currentStatus = WatchlistManager.getStatus(series.id, series.title)
+    var showBottomSheet by remember { mutableStateOf(false) }
+
     val interactionSource = remember { MutableInteractionSource() }
     Card(
         modifier = modifier
@@ -2113,6 +2561,17 @@ fun SeriesRowCard(
                     modifier = Modifier.fillMaxSize()
                 )
 
+                // Top-Start Status Pill
+                if (currentStatus != WatchlistStatus.UNWATCHED) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            .padding(6.dp)
+                    ) {
+                        WatchlistStatusPill(status = currentStatus)
+                    }
+                }
+
                 // Right edge gradient to blend seamlessly into card surface
                 Box(
                     modifier = Modifier
@@ -2152,15 +2611,28 @@ fun SeriesRowCard(
                     .padding(horizontal = 14.dp, vertical = 12.dp),
                 verticalArrangement = Arrangement.Center
             ) {
-                // Title in 16.sp
-                Text(
-                    text = series.title,
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.White,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+                // Title and Quick Bookmark Action Row
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = series.title,
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    WatchlistBookmarkButton(
+                        status = currentStatus,
+                        onClick = { showBottomSheet = true },
+                        size = 26.dp
+                    )
+                }
 
                 Spacer(modifier = Modifier.height(6.dp))
 
@@ -2208,6 +2680,27 @@ fun SeriesRowCard(
                 )
             }
         }
+    }
+
+    if (showBottomSheet) {
+        val thumbUrl = series.thumbnailUrl.ifBlank { series.backdropUrl ?: series.posterUrl ?: "" }
+        WatchlistStatusBottomSheet(
+            title = series.title,
+            currentStatus = currentStatus,
+            onSelectStatus = { newStatus ->
+                WatchlistManager.setStatus(
+                    context = context,
+                    id = series.id,
+                    title = series.title,
+                    mediaType = WatchlistMediaType.SERIES,
+                    status = newStatus,
+                    posterUrl = series.posterUrl ?: thumbUrl,
+                    backdropUrl = series.backdropUrl ?: "",
+                    genre = series.genre
+                )
+            },
+            onDismiss = { showBottomSheet = false }
+        )
     }
 }
 
@@ -2343,7 +2836,7 @@ fun ContinueWatchingCard(
                 interactionSource = interactionSource,
                 indication = ripple(bounded = true)
             ) { onResumeClick() },
-        colors = CardDefaults.cardColors(containerColor = SurfaceDefault),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF0F141E)),
         border = BorderStroke(1.dp, SurfaceBorder)
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
@@ -2379,19 +2872,26 @@ fun ContinueWatchingCard(
                     .padding(16.dp),
                 verticalArrangement = Arrangement.SpaceBetween
             ) {
-                // Top Row: Subtle off-white label
+                // Top Row: Cyan-bordered "CONTINUE WATCHING" pill
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.Start,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        text = "CONTINUE WATCHING",
-                        color = Color(0xFF94A3B8),
-                        fontSize = 9.sp,
-                        fontWeight = FontWeight.Bold,
-                        letterSpacing = 1.sp
-                    )
+                    Surface(
+                        shape = RoundedCornerShape(6.dp),
+                        color = Color(0xCC0E1A2B),
+                        border = BorderStroke(1.dp, Color(0xFF00E5FF).copy(alpha = 0.5f))
+                    ) {
+                        Text(
+                            text = "CONTINUE WATCHING",
+                            color = Color(0xFF00E5FF),
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            letterSpacing = 0.5.sp,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                        )
+                    }
                 }
 
                 // Bottom Row: Title, Episode Details, Watched Stats & Resume Action
@@ -2956,6 +3456,33 @@ fun HomeScreen(
                 }
             }
             }
+        }
+
+        if (currentNavTab == HomeNavigationTab.SEARCH) {
+            SearchScreen(
+                viewModel = viewModel,
+                onMovieSelected = onMovieClick,
+                onSeriesSelected = onSeriesClick,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(bottom = 70.dp)
+            )
+        } else if (currentNavTab == HomeNavigationTab.WATCHLIST) {
+            WatchlistScreen(
+                movies = movies,
+                seriesList = series,
+                onMovieSelected = { entry ->
+                    val matched = movies.find { it.id == entry.id }
+                    if (matched != null) onMovieClick(matched)
+                },
+                onSeriesSelected = { entry ->
+                    val matched = series.find { it.id == entry.id }
+                    if (matched != null) onSeriesClick(matched)
+                },
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(bottom = 70.dp)
+            )
         }
 
         // ========================================================

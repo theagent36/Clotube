@@ -1,6 +1,10 @@
 package com.clotube.app.data.metadata
 
 import android.util.Log
+import com.clotube.app.ClotubeApp
+import com.clotube.app.data.CachedMetadataRecord
+import com.clotube.app.data.MetadataDiskCache
+import com.clotube.app.data.WatchlistManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -83,6 +87,19 @@ object OnlineMetadataResolver {
         val trimmed = rawFileName.trim()
         movieCache[trimmed]?.let { return@withContext it }
 
+        val normTitle = WatchlistManager.normalizeTitle(trimmed)
+        val diskKey = "movie_$normTitle"
+        MetadataDiskCache.get(diskKey)?.let { cached ->
+            val meta = MovieMetadata(
+                officialTitle = cached.title,
+                posterUrl = cached.posterUrl,
+                releaseYear = cached.year,
+                genre = cached.genre.ifBlank { "Movie • Cinema" }
+            )
+            movieCache[trimmed] = meta
+            return@withContext meta
+        }
+
         val (cleanQuery, releaseYear) = extractMovieQueryAndYear(trimmed)
         if (cleanQuery.isBlank()) {
             val fallback = MovieMetadata(officialTitle = toTitleCase(trimmed.substringBeforeLast('.')))
@@ -94,6 +111,18 @@ object OnlineMetadataResolver {
         val imdbResult = fetchFromImdb(cleanQuery, releaseYear)
         if (imdbResult != null && imdbResult.posterUrl.isNotBlank()) {
             movieCache[trimmed] = imdbResult
+            try {
+                MetadataDiskCache.put(
+                    ClotubeApp.instance,
+                    CachedMetadataRecord(
+                        cacheKey = diskKey,
+                        title = imdbResult.officialTitle,
+                        posterUrl = imdbResult.posterUrl,
+                        year = imdbResult.releaseYear,
+                        genre = imdbResult.genre
+                    )
+                )
+            } catch (_: Exception) {}
             return@withContext imdbResult
         }
 
@@ -106,6 +135,18 @@ object OnlineMetadataResolver {
                 itunesResult
             }
             movieCache[trimmed] = mergedResult
+            try {
+                MetadataDiskCache.put(
+                    ClotubeApp.instance,
+                    CachedMetadataRecord(
+                        cacheKey = diskKey,
+                        title = mergedResult.officialTitle,
+                        posterUrl = mergedResult.posterUrl,
+                        year = mergedResult.releaseYear,
+                        genre = mergedResult.genre
+                    )
+                )
+            } catch (_: Exception) {}
             return@withContext mergedResult
         }
 
@@ -282,6 +323,19 @@ object OnlineMetadataResolver {
         seriesCache[trimmed]?.let { return@withContext it }
 
         val cleanTitle = cleanSeriesTitle(trimmed)
+        val norm = WatchlistManager.normalizeTitle(cleanTitle)
+        val diskKey = "series_$norm"
+        MetadataDiskCache.get(diskKey)?.let { cached ->
+            val meta = SeriesMetadata(
+                tvMazeId = cached.tvMazeId,
+                officialTitle = cached.title,
+                posterUrl = cached.posterUrl,
+                genres = cached.genre.ifBlank { "Drama • Mystery" }
+            )
+            seriesCache[trimmed] = meta
+            return@withContext meta
+        }
+
         var connection: HttpURLConnection? = null
 
         try {
@@ -319,6 +373,18 @@ object OnlineMetadataResolver {
                     genres = genreString
                 )
                 seriesCache[trimmed] = result
+                try {
+                    MetadataDiskCache.put(
+                        ClotubeApp.instance,
+                        CachedMetadataRecord(
+                            cacheKey = diskKey,
+                            title = result.officialTitle,
+                            posterUrl = result.posterUrl,
+                            genre = result.genres,
+                            tvMazeId = result.tvMazeId
+                        )
+                    )
+                } catch (_: Exception) {}
                 return@withContext result
             }
         } catch (e: Exception) {
@@ -339,6 +405,16 @@ object OnlineMetadataResolver {
         episodeNumber: Int,
         rawFileName: String
     ): EpisodeMetadata = withContext(Dispatchers.IO) {
+        val normSeries = WatchlistManager.normalizeTitle(seriesName)
+        val diskKey = "ep_${normSeries}_s${seasonNumber}e${episodeNumber}"
+        MetadataDiskCache.get(diskKey)?.let { cached ->
+            return@withContext EpisodeMetadata(
+                officialTitle = cached.title,
+                thumbnailUrl = cached.stillUrl.ifBlank { cached.posterUrl },
+                durationMinutes = 0L
+            )
+        }
+
         val targetShowId = if (tvMazeSeriesId > 0L) tvMazeSeriesId else resolveSeries(seriesName).tvMazeId
 
         if (targetShowId > 0L) {
@@ -350,7 +426,20 @@ object OnlineMetadataResolver {
             }
 
             // 2. Instant O(1) in-memory lookup
-            episodesMap[Pair(seasonNumber, episodeNumber)]?.let { return@withContext it }
+            episodesMap[Pair(seasonNumber, episodeNumber)]?.let { ep ->
+                try {
+                    MetadataDiskCache.put(
+                        ClotubeApp.instance,
+                        CachedMetadataRecord(
+                            cacheKey = diskKey,
+                            title = ep.officialTitle,
+                            stillUrl = ep.thumbnailUrl,
+                            posterUrl = ep.thumbnailUrl
+                        )
+                    )
+                } catch (_: Exception) {}
+                return@withContext ep
+            }
         }
 
         val fallbackTitle = cleanEpisodeTitleFromFileName(rawFileName, seasonNumber, episodeNumber, seriesName)

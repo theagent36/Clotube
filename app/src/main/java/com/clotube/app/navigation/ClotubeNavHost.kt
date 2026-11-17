@@ -11,10 +11,14 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavHostController
@@ -23,16 +27,20 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import com.clotube.app.ui.components.OfflineStatusBanner
 import com.clotube.app.ui.screens.ConnectDriveScreen
 import com.clotube.app.ui.screens.HomeScreen
 import com.clotube.app.ui.screens.MediaLibraryScreen
 import com.clotube.app.ui.screens.NativeVideoPlayerScreen
 import com.clotube.app.ui.screens.RecentScreen
+import com.clotube.app.ui.screens.SearchScreen
 import com.clotube.app.ui.screens.SeriesDetailScreen
 import com.clotube.app.ui.screens.SettingsScreen
+import com.clotube.app.ui.screens.WatchlistScreen
 import com.clotube.app.data.WatchHistoryItem
 import com.clotube.app.ui.theme.AppleTvMotion
 import com.clotube.app.viewmodel.VideoViewModel
+import com.clotube.app.viewmodel.toMovie
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 
@@ -72,6 +80,8 @@ object MaterialSharedZAxisMotion {
 
 object NavRoutes {
     const val HOME = "home"
+    const val SEARCH = "search"
+    const val WATCHLIST = "watchlist"
     const val RECENT = "recent"
     const val MEDIA_LIBRARY = "media_library"
     const val PLAYER = "player/{fileId}/{title}?seriesId={seriesId}"
@@ -107,6 +117,8 @@ object NavRoutes {
 @Keep
 sealed class Screen(val route: String) {
     object Home : Screen(NavRoutes.HOME)
+    object Search : Screen(NavRoutes.SEARCH)
+    object Watchlist : Screen(NavRoutes.WATCHLIST)
     object Recent : Screen(NavRoutes.RECENT)
     object MediaLibrary : Screen(NavRoutes.MEDIA_LIBRARY)
     object SeriesDetail : Screen(NavRoutes.SERIES_DETAIL)
@@ -165,11 +177,12 @@ fun ClotubeNavHost(
             }
         )
     } else {
-        NavHost(
-            navController = navController,
-            startDestination = Screen.Home.route,
-            modifier = modifier,
-            // Global Material Shared Z-Axis Defaults
+        Box(modifier = modifier.fillMaxSize()) {
+            NavHost(
+                navController = navController,
+                startDestination = Screen.Home.route,
+                modifier = Modifier.fillMaxSize(),
+                // Global Material Shared Z-Axis Defaults
             enterTransition = { MaterialSharedZAxisMotion.enterTransition },
             exitTransition = { MaterialSharedZAxisMotion.exitTransition },
             popEnterTransition = { MaterialSharedZAxisMotion.popEnterTransition },
@@ -235,6 +248,51 @@ fun ClotubeNavHost(
                             android.util.Log.i("ClotubePlayer", "--> NavHost navigating to Movie Player: fileId=$fileId, title=$title")
                             navController.navigate(NavRoutes.playerRoute(fileId, title))
                         }
+                    }
+                )
+            }
+
+            // SEARCH SCREEN
+            composable(
+                route = NavRoutes.SEARCH,
+                enterTransition = { MaterialSharedZAxisMotion.enterTransition },
+                exitTransition = { MaterialSharedZAxisMotion.exitTransition },
+                popEnterTransition = { MaterialSharedZAxisMotion.popEnterTransition },
+                popExitTransition = { MaterialSharedZAxisMotion.popExitTransition }
+            ) {
+                SearchScreen(
+                    viewModel = videoViewModel,
+                    onMovieSelected = { movie ->
+                        val title = movie.title.ifBlank { "Movie" }
+                        navController.navigate(NavRoutes.playerRoute(movie.id, title))
+                    },
+                    onSeriesSelected = { series ->
+                        navController.navigate(NavRoutes.seriesDetailRoute(series.id, autoPlayEpisodeId = null))
+                    }
+                )
+            }
+
+            // WATCHLIST SCREEN
+            composable(
+                route = NavRoutes.WATCHLIST,
+                enterTransition = { MaterialSharedZAxisMotion.enterTransition },
+                exitTransition = { MaterialSharedZAxisMotion.exitTransition },
+                popEnterTransition = { MaterialSharedZAxisMotion.popEnterTransition },
+                popExitTransition = { MaterialSharedZAxisMotion.popExitTransition }
+            ) {
+                val movies by videoViewModel.moviesList.collectAsState()
+                val seriesList by videoViewModel.seriesList.collectAsState()
+                val uiState by videoViewModel.uiState.collectAsState()
+                val effectiveMovies = if (movies.isNotEmpty()) movies else uiState.moviesList.map { it.toMovie() }
+                val effectiveSeries = if (seriesList.isNotEmpty()) seriesList else uiState.tvSeriesList
+                WatchlistScreen(
+                    movies = effectiveMovies,
+                    seriesList = effectiveSeries,
+                    onMovieSelected = { entry ->
+                        navController.navigate(NavRoutes.playerRoute(entry.id, entry.title))
+                    },
+                    onSeriesSelected = { entry ->
+                        navController.navigate(NavRoutes.seriesDetailRoute(entry.id, autoPlayEpisodeId = null))
                     }
                 )
             }
@@ -462,5 +520,12 @@ fun ClotubeNavHost(
                 )
             }
         }
+
+        OfflineStatusBanner(
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .statusBarsPadding()
+        )
     }
+}
 }

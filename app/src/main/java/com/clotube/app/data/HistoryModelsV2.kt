@@ -36,11 +36,11 @@ data class HistoryItemEntityV2(
                 title = obj.optString("t", ""),
                 positionMs = obj.optLong("p", 0L),
                 durationMs = obj.optLong("d", 0L),
-                timestamp = obj.optLong("ts", 0L),
+                timestamp = WatchHistoryPayloadV2.normalizeTimestampMs(obj.optLong("ts", 0L)),
                 isWatched = obj.optBoolean("w", false),
                 seriesId = if (obj.has("sid")) obj.optString("sid").ifBlank { null } else null,
-                seasonNumber = if (obj.has("s")) obj.optInt("s") else null,
-                episodeNumber = if (obj.has("e")) obj.optInt("e") else null
+                seasonNumber = if (obj.has("s") && !obj.isNull("s")) obj.optInt("s") else null,
+                episodeNumber = if (obj.has("e") && !obj.isNull("e")) obj.optInt("e") else null
             )
         }
     }
@@ -71,7 +71,7 @@ data class SeriesResumeEntityV2(
                 episodeNumber = obj.optInt("e", 1),
                 positionMs = obj.optLong("p", 0L),
                 durationMs = obj.optLong("d", 0L),
-                timestamp = obj.optLong("ts", 0L)
+                timestamp = WatchHistoryPayloadV2.normalizeTimestampMs(obj.optLong("ts", 0L))
             )
         }
     }
@@ -169,16 +169,32 @@ data class WatchHistoryPayloadV2(
     }
 
     companion object {
+        /**
+         * Normalizes Unix timestamps to epoch milliseconds.
+         * If a remote client (e.g., Desktop/PC) wrote Unix seconds (10-digit epoch),
+         * converts it to milliseconds so it compares accurately against Android's System.currentTimeMillis().
+         */
+        fun normalizeTimestampMs(value: Long): Long {
+            return if (value in 1_000_000_000L..9_999_999_999L) {
+                value * 1000L
+            } else {
+                value
+            }
+        }
+
         fun fromJsonString(json: String): WatchHistoryPayloadV2 {
             val root = JSONObject(json)
             val v = root.optInt("v", 2)
-            val updatedAt = root.optLong("updatedAt", System.currentTimeMillis())
+            val updatedAt = normalizeTimestampMs(root.optLong("updatedAt", System.currentTimeMillis()))
 
             val activeList = mutableListOf<HistoryItemEntityV2>()
             val activeArr = root.optJSONArray("active")
             if (activeArr != null) {
                 for (i in 0 until activeArr.length()) {
-                    activeList.add(HistoryItemEntityV2.fromJsonObject(activeArr.getJSONObject(i)))
+                    val obj = activeArr.optJSONObject(i) ?: continue
+                    if (obj.optString("id", "").isNotBlank()) {
+                        activeList.add(HistoryItemEntityV2.fromJsonObject(obj))
+                    }
                 }
             }
 
@@ -188,7 +204,10 @@ data class WatchHistoryPayloadV2(
                 val keys = resumeObj.keys()
                 while (keys.hasNext()) {
                     val k = keys.next()
-                    resumeMap[k] = SeriesResumeEntityV2.fromJsonObject(resumeObj.getJSONObject(k))
+                    val obj = resumeObj.optJSONObject(k) ?: continue
+                    if (obj.optString("id", "").isNotBlank()) {
+                        resumeMap[k] = SeriesResumeEntityV2.fromJsonObject(obj)
+                    }
                 }
             }
 
@@ -196,7 +215,10 @@ data class WatchHistoryPayloadV2(
             val watchedArr = root.optJSONArray("watchedIds")
             if (watchedArr != null) {
                 for (i in 0 until watchedArr.length()) {
-                    watchedList.add(watchedArr.getString(i))
+                    val wid = watchedArr.optString(i, "")
+                    if (wid.isNotBlank()) {
+                        watchedList.add(wid)
+                    }
                 }
             }
 

@@ -48,6 +48,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.clotube.app.model.Episode
+import com.clotube.app.data.PlaybackTrackPreferences
 import com.clotube.app.ui.theme.*
 import com.clotube.app.util.triggerClickHaptic
 import com.clotube.app.util.triggerNavigationHaptic
@@ -805,6 +806,8 @@ fun PlayerQuickSettingsSheet(
     onDismiss: () -> Unit
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
     var selectedAudioTrackId by remember { mutableIntStateOf(mediaPlayer.safeAudioTrack) }
     var selectedSubtitleTrackId by remember { mutableIntStateOf(mediaPlayer.safeSpuTrack) }
     val audioTracks = remember { mediaPlayer.safeAudioTracks?.toList() ?: emptyList() }
@@ -878,6 +881,9 @@ fun PlayerQuickSettingsSheet(
                             onClick = {
                                 selectedAudioTrackId = track.id
                                 mediaPlayer.safeSetAudioTrack(track.id)
+                                coroutineScope.launch(kotlinx.coroutines.NonCancellable + kotlinx.coroutines.Dispatchers.IO) {
+                                    PlaybackTrackPreferences.saveAudioSelection(context, track.id, track.name)
+                                }
                             }
                         )
                     }
@@ -912,6 +918,9 @@ fun PlayerQuickSettingsSheet(
                         onClick = {
                             selectedSubtitleTrackId = -1
                             mediaPlayer.safeSetSpuTrack(-1)
+                            coroutineScope.launch(kotlinx.coroutines.NonCancellable + kotlinx.coroutines.Dispatchers.IO) {
+                                PlaybackTrackPreferences.saveSubtitleSelection(context, -1, "Off", -1)
+                            }
                         }
                     )
                 }
@@ -924,6 +933,10 @@ fun PlayerQuickSettingsSheet(
                             onClick = {
                                 selectedSubtitleTrackId = track.id
                                 mediaPlayer.safeSetSpuTrack(track.id)
+                                val activeIndex = spuTracks.filter { it.id != -1 }.indexOfFirst { it.id == track.id }
+                                coroutineScope.launch(kotlinx.coroutines.NonCancellable + kotlinx.coroutines.Dispatchers.IO) {
+                                    PlaybackTrackPreferences.saveSubtitleSelection(context, track.id, track.name, activeIndex)
+                                }
                             }
                         )
                     }

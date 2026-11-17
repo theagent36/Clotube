@@ -1,11 +1,14 @@
 package com.clotube.app
 
+import android.content.res.Configuration
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import com.clotube.app.data.DownloadRepository
+import com.clotube.app.media.PipPlaybackController
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -48,6 +51,7 @@ import androidx.lifecycle.lifecycleScope
 import com.clotube.app.data.DriveWatchHistorySync
 import com.clotube.app.data.playbackDataStore
 import com.clotube.app.navigation.ClotubeNavHost
+import com.clotube.app.network.ClotubeNetworkMonitor
 import com.clotube.app.ui.theme.ClotubeTheme
 import com.clotube.app.viewmodel.VideoViewModel
 import kotlinx.coroutines.Dispatchers
@@ -76,12 +80,19 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        PipPlaybackController.register(this, this)
+        ClotubeNetworkMonitor.startMonitoring(applicationContext)
 
-        // Start background sync guardian service
+        // Start background sync guardian services
         try {
             startService(android.content.Intent(this, com.clotube.app.data.ClotubeSyncService::class.java))
         } catch (e: Exception) {
             android.util.Log.e("MainActivity", "Failed to start ClotubeSyncService: ${e.message}", e)
+        }
+        try {
+            startService(android.content.Intent(this, com.clotube.app.sync.ClotubeTaskWatcherService::class.java))
+        } catch (e: Exception) {
+            android.util.Log.e("MainActivity", "Failed to start ClotubeTaskWatcherService: ${e.message}", e)
         }
 
         // Auto-resume interrupted downloads on startup
@@ -126,46 +137,78 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        ClotubeNetworkMonitor.onAppForegrounded(applicationContext)
+        driveWatchHistorySync.pullFromCloudIfNeeded(dataStore, force = false)
+        com.clotube.app.data.DriveWatchlistSync.getInstance(applicationContext).triggerForegroundPull(force = false)
         videoViewModel.vlcPlayerManager.onAppResume()
     }
 
     override fun onResume() {
         super.onResume()
+        ClotubeNetworkMonitor.onAppForegrounded(applicationContext)
         videoViewModel.vlcPlayerManager.onAppResume()
-        // Pull latest watch history whenever the app comes to foreground
-        lifecycleScope.launch(Dispatchers.IO) {
-            driveWatchHistorySync.syncFromCloud(dataStore)
-        }
+        // Pull latest watch history and watchlist whenever the app comes to foreground
+        driveWatchHistorySync.pullFromCloudIfNeeded(dataStore, force = false)
+        com.clotube.app.data.DriveWatchlistSync.getInstance(applicationContext).triggerForegroundPull(force = false)
     }
 
     override fun onPause() {
         super.onPause()
-        videoViewModel.vlcPlayerManager.onAppPause()
-        videoViewModel.pauseActivePlayer()
-        try {
-            videoViewModel.playbackHistoryManager.backupImmediately()
-        } catch (ignored: Exception) {}
-        videoViewModel.scheduleBackgroundDriveSync(applicationContext)
+        val inPip = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) isInPictureInPictureMode else false
+        if (!inPip) {
+            videoViewModel.vlcPlayerManager.onAppPause()
+            videoViewModel.pauseActivePlayer()
+            try {
+                videoViewModel.playbackHistoryManager.backupImmediately()
+            } catch (ignored: Exception) {}
+            videoViewModel.scheduleBackgroundDriveSync(applicationContext)
+        }
     }
 
     override fun onStop() {
         super.onStop()
-        // 1. Enforce global pause
-        videoViewModel.vlcPlayerManager.onAppPause()
-        videoViewModel.pauseActivePlayer()
+        ClotubeNetworkMonitor.onAppBackgrounded()
+        val inPip = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) isInPictureInPictureMode else false
+        if (!inPip) {
+            // 1. Enforce global pause
+            videoViewModel.vlcPlayerManager.onAppPause()
+            videoViewModel.pauseActivePlayer()
 
-        // 2. When user presses Home or enters Recents, start immediate sync
-        try {
-            videoViewModel.playbackHistoryManager.backupImmediately()
-        } catch (ignored: Exception) {}
+            // 2. When user presses Home or enters Recents, start immediate sync for history and watchlist
+            try {
+                videoViewModel.playbackHistoryManager.backupImmediately()
+                com.clotube.app.data.DriveWatchlistSync.getInstance(applicationContext).enqueuePush()
+            } catch (ignored: Exception) {}
 
-        // 3. Schedule WorkManager persistent sync to push watch history to Drive
-        videoViewModel.scheduleBackgroundDriveSync(applicationContext)
+            // 3. Schedule WorkManager persistent sync to push watch history and watchlist to Drive
+            com.clotube.app.sync.DriveSyncWorker.enqueueImmediateSync(applicationContext)
+        }
 
         // Reset window brightness back to system default
         val lp = window.attributes
         lp.screenBrightness = android.view.WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
         window.attributes = lp
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        PipPlaybackController.unregister(this)
+    }
+
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && PipPlaybackController.isVideoActivelyPlaying) {
+            try {
+                enterPictureInPictureMode(PipPlaybackController.buildPipParams(this))
+            } catch (e: Exception) {
+                android.util.Log.w("MainActivity", "Failed to enter PiP: ${e.message}")
+            }
+        }
+    }
+
+    override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        PipPlaybackController.setInPipMode(isInPictureInPictureMode)
     }
 
     fun handleGoogleSignInResult(data: android.content.Intent?) {

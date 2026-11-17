@@ -20,6 +20,7 @@ import androidx.compose.animation.*
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -41,8 +42,15 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
@@ -67,10 +75,13 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewModelScope
 import coil.compose.AsyncImage
 import com.clotube.app.auth.TokenRefreshProvider
+import com.clotube.app.data.PlaybackTrackPreferences
+import com.clotube.app.data.TrackPreferenceState
 import com.clotube.app.media.BluetoothAudioKeepAlive
 import com.clotube.app.media.ClotubeAudioFocusManager
 import com.clotube.app.media.ClotubeMediaSessionManager
 import com.clotube.app.media.NetworkMonitor
+import com.clotube.app.media.PipPlaybackController
 import com.clotube.app.media.applyClotubeMediaOptions
 import com.clotube.app.model.Episode
 import com.clotube.app.viewmodel.VideoViewModel
@@ -408,6 +419,8 @@ fun ClotubeVideoPlayer(
                         addOption(":clock-synchro=0")
                     }
                     applyClotubeMediaOptions(startSec)
+                    val subScale = PlaybackTrackPreferences.getTrackPreferences(context).subtitleScalePercent
+                    addOption(":sub-text-scale=$subScale")
                     if (startSec > 0L) {
                         addOption(":start-time=$startSec")
                     }
@@ -1092,42 +1105,122 @@ fun ClotubeVideoPlayer(
     var userSelectedPlaybackSpeed by remember(mediaPlayer) { mutableFloatStateOf(mediaPlayer.safeCall(1.0f) { rate }.takeIf { it > 0f } ?: 1.0f) }
     var currentSpeed by remember(mediaPlayer) { mutableFloatStateOf(mediaPlayer.safeCall(1.0f) { rate }.takeIf { it > 0f } ?: 1.0f) }
     var pendingTrackRestore by remember(mediaPlayer) { mutableStateOf(false) }
+    var hasAppliedStickySubtitles by remember(mediaId) { mutableStateOf(false) }
+    var userManuallySelectedSubtitles by remember(mediaId) { mutableStateOf(false) }
+    var hasAppliedStickyAudio by remember(mediaId) { mutableStateOf(false) }
+    var userManuallySelectedAudio by remember(mediaId) { mutableStateOf(false) }
+    var trackDiscoveryGeneration by remember(mediaId) { mutableIntStateOf(0) }
+
+    // Dedicated Reactive Restoration on Next Episode / ESAdded for Subtitles
+    LaunchedEffect(mediaId, trackDiscoveryGeneration) {
+        if (userManuallySelectedSubtitles) return@LaunchedEffect
+        val prefs = PlaybackTrackPreferences.getTrackPreferences(context)
+        if (!prefs.subtitlesEnabled) {
+            if (mediaPlayer.safeSpuTrack != -1) {
+                mediaPlayer.safeSetSpuTrack(-1)
+            }
+            currentSpuTrackId = -1
+            hasAppliedStickySubtitles = true
+            return@LaunchedEffect
+        }
+
+        val maxAttempts = if (trackDiscoveryGeneration == 0) 15 else 1
+        for (attempt in 0 until maxAttempts) {
+            if (userManuallySelectedSubtitles || mediaPlayer.isReleased) return@LaunchedEffect
+            val rawTracks = mediaPlayer.safeSpuTracks
+                ?.filter { it.id != -1 }
+                ?.map { it.id to (it.name ?: "Track ${it.id}") }
+                .orEmpty()
+
+            if (rawTracks.isNotEmpty()) {
+                val targetTrackId = PlaybackTrackPreferences.findMatchingSubtitleTrackId(rawTracks, prefs)
+                if (targetTrackId != null) {
+                    if (mediaPlayer.safeSpuTrack != targetTrackId) {
+                        mediaPlayer.safeSetSpuTrack(targetTrackId)
+                    }
+                    currentSpuTrackId = targetTrackId
+                    hasAppliedStickySubtitles = true
+                    Log.i("ClotubeTracks", "--> Restored sticky subtitle trackId=$targetTrackId for mediaId=$mediaId")
+                }
+                return@LaunchedEffect
+            }
+            if (attempt < maxAttempts - 1) {
+                delay(350L)
+            }
+        }
+    }
+
+    // Dedicated Reactive Restoration on Next Episode / ESAdded for Audio
+    LaunchedEffect(mediaId, trackDiscoveryGeneration) {
+        if (userManuallySelectedAudio) return@LaunchedEffect
+        val prefs = PlaybackTrackPreferences.getTrackPreferences(context)
+        if (prefs.preferredAudioLang.isBlank() && prefs.preferredAudioLabel.isBlank()) return@LaunchedEffect
+
+        val maxAttempts = if (trackDiscoveryGeneration == 0) 15 else 1
+        for (attempt in 0 until maxAttempts) {
+            if (userManuallySelectedAudio || mediaPlayer.isReleased) return@LaunchedEffect
+            val rawTracks = mediaPlayer.safeAudioTracks
+                ?.filter { it.id != -1 }
+                ?.map { it.id to (it.name ?: "Track ${it.id}") }
+                .orEmpty()
+
+            if (rawTracks.isNotEmpty()) {
+                val targetTrackId = PlaybackTrackPreferences.findMatchingAudioTrackId(rawTracks, prefs)
+                if (targetTrackId != null) {
+                    if (mediaPlayer.safeAudioTrack != targetTrackId) {
+                        mediaPlayer.safeSetAudioTrack(targetTrackId)
+                    }
+                    currentAudioTrackId = targetTrackId
+                    hasAppliedStickyAudio = true
+                    Log.i("ClotubeTracks", "--> Restored sticky audio trackId=$targetTrackId for mediaId=$mediaId")
+                }
+                return@LaunchedEffect
+            }
+            if (attempt < maxAttempts - 1) {
+                delay(350L)
+            }
+        }
+    }
 
     fun restoreTracksIfNeeded(player: MediaPlayer) {
-        if (!pendingTrackRestore) return
-
-        // Ensure LibVLC has parsed the elementary stream tables
-        val availableAudio = player.safeAudioTracks
-        if (availableAudio.isNullOrEmpty()) return
-
-        userSelectedAudioTrackId?.let { targetAudioId ->
-            if (availableAudio.any { it.id == targetAudioId } && player.safeAudioTrack != targetAudioId) {
-                player.safeSetAudioTrack(targetAudioId)
-                currentAudioTrackId = targetAudioId
-                Log.d("ClotubePlayer", "Restored user audio track: $targetAudioId")
-            }
-        }
-
-        userSelectedSpuTrackId?.let { targetSpuId ->
-            val availableSpu = player.safeSpuTracks
-            if (targetSpuId == -1 || availableSpu?.any { it.id == targetSpuId } == true) {
-                if (player.safeSpuTrack != targetSpuId) {
-                    player.safeSetSpuTrack(targetSpuId)
-                    currentSpuTrackId = targetSpuId
-                    Log.d("ClotubePlayer", "Restored user subtitle track: $targetSpuId")
+        if (pendingTrackRestore) {
+            // Ensure LibVLC has parsed the elementary stream tables
+            val availableAudio = player.safeAudioTracks
+            if (!availableAudio.isNullOrEmpty()) {
+                userSelectedAudioTrackId?.let { targetAudioId ->
+                    if (availableAudio.any { it.id == targetAudioId } && player.safeAudioTrack != targetAudioId) {
+                        player.safeSetAudioTrack(targetAudioId)
+                        currentAudioTrackId = targetAudioId
+                        Log.d("ClotubePlayer", "Restored user audio track: $targetAudioId")
+                    }
                 }
+
+                userSelectedSpuTrackId?.let { targetSpuId ->
+                    val availableSpu = player.safeSpuTracks
+                    if (targetSpuId == -1 || availableSpu?.any { it.id == targetSpuId } == true) {
+                        if (player.safeSpuTrack != targetSpuId) {
+                            player.safeSetSpuTrack(targetSpuId)
+                            currentSpuTrackId = targetSpuId
+                            Log.d("ClotubePlayer", "Restored user subtitle track: $targetSpuId")
+                        }
+                    }
+                }
+
+                if (player.safeRate != userSelectedPlaybackSpeed) {
+                    try {
+                        if (!player.isReleased) player.rate = userSelectedPlaybackSpeed
+                    } catch (_: Throwable) {}
+                    currentSpeed = userSelectedPlaybackSpeed
+                    Log.d("ClotubePlayer", "Restored user playback speed: ${userSelectedPlaybackSpeed}x")
+                }
+
+                pendingTrackRestore = false
             }
         }
 
-        if (player.safeRate != userSelectedPlaybackSpeed) {
-            try {
-                if (!player.isReleased) player.rate = userSelectedPlaybackSpeed
-            } catch (_: Throwable) {}
-            currentSpeed = userSelectedPlaybackSpeed
-            Log.d("ClotubePlayer", "Restored user playback speed: ${userSelectedPlaybackSpeed}x")
+        if (!hasAppliedStickySubtitles || !hasAppliedStickyAudio) {
+            trackDiscoveryGeneration++
         }
-
-        pendingTrackRestore = false
     }
 
     // Fast initial in-memory access token priming without blocking launch
@@ -1229,6 +1322,8 @@ fun ClotubeVideoPlayer(
                                 addOption(":start-time=${resumeMs / 1000L}")
                             }
                             applyClotubeMediaOptions(resumeSec)
+                            val subScale = PlaybackTrackPreferences.getTrackPreferences(context).subtitleScalePercent
+                            addOption(":sub-text-scale=$subScale")
                             setHWDecoderEnabled(true, true)
                         }
                         try {
@@ -1264,6 +1359,8 @@ fun ClotubeVideoPlayer(
                                     addOption(":start-time=${resumeMs / 1000L}")
                                 }
                                 applyClotubeMediaOptions(resumeSec)
+                                val subScale = PlaybackTrackPreferences.getTrackPreferences(context).subtitleScalePercent
+                                addOption(":sub-text-scale=$subScale")
                                 setHWDecoderEnabled(true, true)
                             }
                             try {
@@ -1523,6 +1620,7 @@ fun ClotubeVideoPlayer(
                     }
                 }
                 MediaPlayer.Event.Playing -> {
+                    trackDiscoveryGeneration++
                     stallWatchdogJob?.cancel()
                     stallWatchdogJob = null
                     if (accumulatedSeekTargetMs < 0L) {
@@ -1594,6 +1692,8 @@ fun ClotubeVideoPlayer(
                             restoreTracksIfNeeded(mediaPlayer)
                             currentSpuTrackId = mediaPlayer.safeSpuTrack
                             currentAudioTrackId = mediaPlayer.safeAudioTrack
+                        } else if (!hasAppliedStickySubtitles || !hasAppliedStickyAudio) {
+                            trackDiscoveryGeneration++
                         }
                     }
                     if (isSeeking && (accumulatedSeekTargetMs < 0L)) {
@@ -1613,6 +1713,10 @@ fun ClotubeVideoPlayer(
                     if (event.lengthChanged > 0L) {
                         durationMs = event.lengthChanged
                     }
+                }
+                MediaPlayer.Event.ESAdded,
+                MediaPlayer.Event.Vout -> {
+                    trackDiscoveryGeneration++
                 }
                 MediaPlayer.Event.EndReached,
                 MediaPlayer.Event.EncounteredError -> {
@@ -1684,6 +1788,11 @@ fun ClotubeVideoPlayer(
         currentSpuTrackId = -1
         currentAudioTrackId = -1
         pendingTrackRestore = false
+        hasAppliedStickySubtitles = false
+        userManuallySelectedSubtitles = false
+        hasAppliedStickyAudio = false
+        userManuallySelectedAudio = false
+        trackDiscoveryGeneration = 0
         currentActiveStreamUrl = activeStreamUrl
         mediaPlayer.safeCall(Unit) { setEventListener(playerEventListener) }
     }
@@ -1748,6 +1857,24 @@ fun ClotubeVideoPlayer(
     var showSubtitleDialog by remember { mutableStateOf(false) }
     var showAudioTrackDialog by remember { mutableStateOf(false) }
     var showStatsOverlay by remember { mutableStateOf(false) }
+
+    // Dynamic Subtitle Font Scaling & Animated OSD Badge
+    val trackPrefs by PlaybackTrackPreferences.getTrackPreferencesFlow(context)
+        .collectAsState(initial = TrackPreferenceState())
+    var currentSubScale by remember(trackPrefs.subtitleScalePercent) {
+        mutableIntStateOf(trackPrefs.subtitleScalePercent)
+    }
+    var osdBadgeText by remember { mutableStateOf<String?>(null) }
+    var osdDismissJob by remember { mutableStateOf<Job?>(null) }
+
+    fun triggerOsdBadge(text: String) {
+        osdBadgeText = text
+        osdDismissJob?.cancel()
+        osdDismissJob = coroutineScope.launch {
+            kotlinx.coroutines.delay(1500)
+            osdBadgeText = null
+        }
+    }
 
     // Synchronize LibVLC Events (session-scoped to mediaPlayer so episode switches never detach Surface)
     DisposableEffect(mediaPlayer) {
@@ -2036,8 +2163,93 @@ fun ClotubeVideoPlayer(
 
     handlePlayPauseToggleRef = ::handlePlayPauseToggle
 
+    // Picture-in-Picture (PiP) State & Focus Management
+    val isInPipMode by PipPlaybackController.isInPipMode.collectAsState()
+    val focusRequester = remember { FocusRequester() }
+
+    LaunchedEffect(Unit) {
+        try { focusRequester.requestFocus() } catch (_: Exception) {}
+    }
+
+    DisposableEffect(activity) {
+        if (activity != null) {
+            PipPlaybackController.bindPlayerCallbacks(
+                activity = activity,
+                onTogglePlayPause = { handlePlayPauseToggle() },
+                onSeekRewind = { queueDebouncedSeek(-10_000L) },
+                onSeekForward = { queueDebouncedSeek(10_000L) }
+            )
+        }
+        onDispose {
+            PipPlaybackController.unbindPlayerCallbacks()
+        }
+    }
+
+    LaunchedEffect(isPlaying) {
+        PipPlaybackController.isVideoActivelyPlaying = isPlaying
+        if (activity != null) {
+            PipPlaybackController.updatePipParams(activity)
+        }
+    }
+
+    LaunchedEffect(isInPipMode) {
+        if (isInPipMode) {
+            showSpeedDialog = false
+            showSubtitleDialog = false
+            showAudioTrackDialog = false
+            showStatsOverlay = false
+            areControlsVisible = false
+        }
+    }
+
     BoxWithConstraints(
         modifier = modifier
+            .focusRequester(focusRequester)
+            .focusable()
+            .onPreviewKeyEvent { keyEvent ->
+                if (keyEvent.type == KeyEventType.KeyDown) {
+                    when (keyEvent.key) {
+                        Key.Spacebar, Key.Enter, Key.DirectionCenter, Key.MediaPlayPause -> {
+                            handlePlayPauseToggle()
+                            areControlsVisible = true
+                            resetInactivityTimer()
+                            true
+                        }
+                        Key.DirectionLeft, Key.MediaRewind -> {
+                            resetInactivityTimer()
+                            queueDebouncedSeek(-10_000L)
+                            true
+                        }
+                        Key.DirectionRight, Key.MediaFastForward -> {
+                            resetInactivityTimer()
+                            queueDebouncedSeek(10_000L)
+                            true
+                        }
+                        Key.F -> {
+                            val newFs = !currentFullscreen
+                            internalFullscreen = newFs
+                            onFullscreenChanged?.invoke(newFs)
+                            true
+                        }
+                        Key.C -> {
+                            showSubtitleDialog = true
+                            true
+                        }
+                        Key.Escape -> {
+                            if (currentFullscreen) {
+                                internalFullscreen = false
+                                onFullscreenChanged?.invoke(false)
+                            } else {
+                                onNavigateBack()
+                            }
+                            true
+                        }
+                        else -> false
+                    }
+                } else {
+                    false
+                }
+            }
             .background(Color.Black)
             .pointerInput(maxVolume) {
                 var isLeftSide = false
@@ -2234,7 +2446,7 @@ fun ClotubeVideoPlayer(
 
         // 3. Centered Vertical Brightness / Volume Capsule HUD
         AnimatedVisibility(
-            visible = showGestureOverlay && activeGestureMode != null,
+            visible = !isInPipMode && showGestureOverlay && activeGestureMode != null,
             enter = fadeIn() + scaleIn(initialScale = 0.85f),
             exit = fadeOut() + scaleOut(targetScale = 0.85f),
             modifier = Modifier.align(Alignment.Center)
@@ -2249,7 +2461,7 @@ fun ClotubeVideoPlayer(
         // 4. Center Loading / Buffering Indicator
         val shouldShowSpinner = !isFirstFrameRendered || isBuffering || isSeeking
 
-        if (shouldShowSpinner && !isScrubbing && !areControlsVisible) {
+        if (!isInPipMode && shouldShowSpinner && !isScrubbing && !areControlsVisible) {
             Box(
                 modifier = Modifier.fillMaxSize(),
                 contentAlignment = Alignment.Center
@@ -2263,7 +2475,7 @@ fun ClotubeVideoPlayer(
         }
 
         // 5. Stats for Nerds Overlay
-        if (showStatsOverlay) {
+        if (!isInPipMode && showStatsOverlay) {
             StatsForNerdsOverlay(
                 mediaPlayer = mediaPlayer,
                 isBuffering = isBuffering,
@@ -2274,7 +2486,7 @@ fun ClotubeVideoPlayer(
         }
 
         // 7. HUD Controls Tap Revealer when hidden
-        if (!areControlsVisible) {
+        if (!isInPipMode && !areControlsVisible) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -2290,7 +2502,7 @@ fun ClotubeVideoPlayer(
 
         // 7. HUD Controls
         AnimatedVisibility(
-            visible = areControlsVisible || isScrubbing,
+            visible = !isInPipMode && (areControlsVisible || isScrubbing),
             enter = fadeIn(),
             exit = fadeOut(),
             modifier = Modifier.fillMaxSize()
@@ -2746,7 +2958,7 @@ fun ClotubeVideoPlayer(
         }
 
         // 6. Floating Next Episode Auto-Play Card (Absolute Highest Z-Index)
-        if (nextEpisode != null && !isTransitioningToNewMedia && !isPlaybackEnded && !isBuffering && safeDurationMs > 0L) {
+        if (!isInPipMode && nextEpisode != null && !isTransitioningToNewMedia && !isPlaybackEnded && !isBuffering && safeDurationMs > 0L) {
             NextEpisodeCountdownCard(
                 currentPositionMs = if (isScrubbing) displayPositionMs else safeCurrentPositionMs,
                 durationMs = safeDurationMs,
@@ -2768,6 +2980,35 @@ fun ClotubeVideoPlayer(
                     .padding(end = 16.dp, bottom = if (currentFullscreen) 80.dp else 16.dp),
                 isScrubbing = isScrubbing
             )
+        }
+
+        // 7. Transient Animated OSD Pill Badge (e.g. Subtitle Scaling)
+        AnimatedVisibility(
+            visible = !isInPipMode && osdBadgeText != null,
+            enter = fadeIn(animationSpec = androidx.compose.animation.core.tween(150)) + slideInVertically(initialOffsetY = { -it / 2 }),
+            exit = fadeOut(animationSpec = androidx.compose.animation.core.tween(250)) + slideOutVertically(targetOffsetY = { -it / 2 }),
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .statusBarsPadding()
+                .padding(top = 16.dp)
+                .zIndex(110f)
+        ) {
+            osdBadgeText?.let { text ->
+                Surface(
+                    shape = RoundedCornerShape(20.dp),
+                    color = Color(0xDD10131B),
+                    border = BorderStroke(1.dp, Color(0x33FFFFFF)),
+                    shadowElevation = 8.dp
+                ) {
+                    Text(
+                        text = text,
+                        color = Color.White,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                    )
+                }
+            }
         }
     }
 
@@ -2835,6 +3076,10 @@ fun ClotubeVideoPlayer(
                                 mediaPlayer.safeSetSpuTrack(-1)
                                 userSelectedSpuTrackId = -1
                                 currentSpuTrackId = -1
+                                userManuallySelectedSubtitles = true
+                                coroutineScope.launch(NonCancellable + Dispatchers.IO) {
+                                    PlaybackTrackPreferences.saveSubtitleSelection(context, -1, "Off", -1)
+                                }
                                 showSubtitleDialog = false
                             }
                             .padding(vertical = 10.dp),
@@ -2860,6 +3105,11 @@ fun ClotubeVideoPlayer(
                                     mediaPlayer.safeSetSpuTrack(track.id)
                                     userSelectedSpuTrackId = track.id
                                     currentSpuTrackId = track.id
+                                    userManuallySelectedSubtitles = true
+                                    val activeIndex = spuTracks.indexOfFirst { it.id == track.id }
+                                    coroutineScope.launch(NonCancellable + Dispatchers.IO) {
+                                        PlaybackTrackPreferences.saveSubtitleSelection(context, track.id, track.name, activeIndex)
+                                    }
                                     showSubtitleDialog = false
                                 }
                                 .padding(vertical = 10.dp),
@@ -2873,6 +3123,74 @@ fun ClotubeVideoPlayer(
                             )
                             if (track.isSelected) {
                                 Text("✓", color = Color(0xFF00E5FF), fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+
+                    HorizontalDivider(color = Color(0xFF262A36), thickness = 0.8.dp, modifier = Modifier.padding(vertical = 8.dp))
+
+                    // Font Size Stepper Row
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Subtitle Size",
+                            color = Color.White,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Medium
+                        )
+
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            IconButton(
+                                onClick = {
+                                    val newScale = (currentSubScale - 10).coerceAtLeast(60)
+                                    currentSubScale = newScale
+                                    coroutineScope.launch(NonCancellable + Dispatchers.IO) {
+                                        PlaybackTrackPreferences.saveSubtitleScale(context, newScale)
+                                    }
+                                    triggerOsdBadge("Subtitle Size: $newScale%")
+                                },
+                                enabled = currentSubScale > 60,
+                                modifier = Modifier.size(32.dp)
+                            ) {
+                                Text(
+                                    text = "-",
+                                    color = if (currentSubScale > 60) Color.White else Color(0xFF64748B),
+                                    fontSize = 18.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+
+                            Text(
+                                text = "$currentSubScale%",
+                                color = Color(0xFF00E5FF),
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 6.dp)
+                            )
+
+                            IconButton(
+                                onClick = {
+                                    val newScale = (currentSubScale + 10).coerceAtMost(200)
+                                    currentSubScale = newScale
+                                    coroutineScope.launch(NonCancellable + Dispatchers.IO) {
+                                        PlaybackTrackPreferences.saveSubtitleScale(context, newScale)
+                                    }
+                                    triggerOsdBadge("Subtitle Size: $newScale%")
+                                },
+                                enabled = currentSubScale < 200,
+                                modifier = Modifier.size(32.dp)
+                            ) {
+                                Text(
+                                    text = "+",
+                                    color = if (currentSubScale < 200) Color.White else Color(0xFF64748B),
+                                    fontSize = 18.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
                             }
                         }
                     }
@@ -2908,6 +3226,10 @@ fun ClotubeVideoPlayer(
                                         mediaPlayer.safeSetAudioTrack(track.id)
                                         userSelectedAudioTrackId = track.id
                                         currentAudioTrackId = track.id
+                                        userManuallySelectedAudio = true
+                                        coroutineScope.launch(NonCancellable + Dispatchers.IO) {
+                                            PlaybackTrackPreferences.saveAudioSelection(context, track.id, track.name)
+                                        }
                                         showAudioTrackDialog = false
                                     }
                                     .padding(vertical = 10.dp),
