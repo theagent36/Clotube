@@ -148,6 +148,7 @@ import com.clotube.app.data.metadata.GlobalCatalogSearchEngine
 import com.clotube.app.data.metadata.OnlineMetadataResolver
 import com.clotube.app.model.WatchlistMediaType
 import com.clotube.app.model.WatchlistStatus
+import com.clotube.app.model.toMovie
 import com.clotube.app.ui.components.WatchlistBookmarkButton
 import com.clotube.app.ui.components.WatchlistStatusBottomSheet
 import com.clotube.app.ui.components.WatchlistStatusPill
@@ -523,8 +524,18 @@ fun HomeScreen(
                     .padding(bottom = paddingValues.calculateBottomPadding())
             )
         } else if (uiState.currentTab == NavigationTab.SEARCH) {
+            val effectiveDriveMovies = remember(uiState.movies, uiState.videos, driveMovies) {
+                uiState.movies
+                    .ifEmpty { uiState.videos.map { it.toMovie() } }
+                    .ifEmpty { driveMovies }
+            }
+            val effectiveDriveSeries = remember(uiState.tvSeriesList, driveSeries) {
+                uiState.tvSeriesList.ifEmpty { driveSeries }
+            }
             SearchScreen(
                 viewModel = viewModel,
+                moviesList = effectiveDriveMovies,
+                seriesList = effectiveDriveSeries,
                 onMovieSelected = { movie ->
                     if (onPlayMovie != null) {
                         onPlayMovie(movie.id)
@@ -561,9 +572,17 @@ fun HomeScreen(
                     .padding(bottom = paddingValues.calculateBottomPadding())
             )
         } else if (uiState.currentTab == NavigationTab.WATCHLIST) {
+            val effectiveDriveMovies = remember(uiState.movies, uiState.videos, driveMovies) {
+                uiState.movies
+                    .ifEmpty { uiState.videos.map { it.toMovie() } }
+                    .ifEmpty { driveMovies }
+            }
+            val effectiveDriveSeries = remember(uiState.tvSeriesList, driveSeries) {
+                uiState.tvSeriesList.ifEmpty { driveSeries }
+            }
             WatchlistScreen(
-                movies = driveMovies,
-                seriesList = driveSeries,
+                moviesList = effectiveDriveMovies,
+                seriesList = effectiveDriveSeries,
                 onMovieSelected = { entry ->
                     val matchedMovie = uiState.moviesList.find { it.id == entry.id }
                         ?: uiState.videos.find { it.id == entry.id }
@@ -3461,6 +3480,8 @@ fun HomeScreen(
         if (currentNavTab == HomeNavigationTab.SEARCH) {
             SearchScreen(
                 viewModel = viewModel,
+                moviesList = movies,
+                seriesList = series,
                 onMovieSelected = onMovieClick,
                 onSeriesSelected = onSeriesClick,
                 modifier = Modifier
@@ -3469,7 +3490,7 @@ fun HomeScreen(
             )
         } else if (currentNavTab == HomeNavigationTab.WATCHLIST) {
             WatchlistScreen(
-                movies = movies,
+                moviesList = movies,
                 seriesList = series,
                 onMovieSelected = { entry ->
                     val matched = movies.find { it.id == entry.id }

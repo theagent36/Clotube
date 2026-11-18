@@ -107,7 +107,7 @@ import com.clotube.app.ui.theme.TextPrimary
 import com.clotube.app.ui.theme.TextSecondary
 import com.clotube.app.ui.theme.TextTertiary
 import com.clotube.app.viewmodel.VideoViewModel
-import com.clotube.app.viewmodel.toMovie
+import com.clotube.app.model.toMovie
 import kotlinx.coroutines.launch
 
 enum class SearchAvailabilityFilter(val label: String) {
@@ -143,6 +143,8 @@ enum class SearchSortOption(val label: String) {
 @Composable
 fun SearchScreen(
     viewModel: VideoViewModel,
+    moviesList: List<Movie>,
+    seriesList: List<Series>,
     onMovieSelected: (Movie) -> Unit,
     onSeriesSelected: (Series) -> Unit,
     modifier: Modifier = Modifier
@@ -162,14 +164,20 @@ fun SearchScreen(
     val rawQuery by viewModel.searchQuery.collectAsState()
     val isSearchingOnline by viewModel.isSearchingOnline.collectAsState()
     val searchResults by viewModel.globalSearchResults.collectAsState()
-    val movies by viewModel.moviesList.collectAsState()
-    val seriesList by viewModel.seriesList.collectAsState()
+    val vmMovies by viewModel.moviesList.collectAsState()
+    val vmSeries by viewModel.seriesList.collectAsState()
     val uiState by viewModel.uiState.collectAsState()
-    val effectiveMovies = remember(movies, uiState.moviesList) {
-        if (movies.isNotEmpty()) movies else uiState.moviesList.map { it.toMovie() }
+    val effectiveMovies = remember(moviesList, vmMovies, uiState.movies, uiState.videos, uiState.moviesList) {
+        moviesList
+            .ifEmpty { uiState.movies }
+            .ifEmpty { vmMovies }
+            .ifEmpty { uiState.videos.map { it.toMovie() } }
+            .ifEmpty { uiState.moviesList.map { it.toMovie() } }
     }
-    val effectiveSeries = remember(seriesList, uiState.tvSeriesList) {
-        if (seriesList.isNotEmpty()) seriesList else uiState.tvSeriesList
+    val effectiveSeries = remember(seriesList, vmSeries, uiState.tvSeriesList) {
+        seriesList
+            .ifEmpty { uiState.tvSeriesList }
+            .ifEmpty { vmSeries }
     }
 
     // Observe watchlist revision for immediate pill/badge updates

@@ -1,37 +1,18 @@
 # ==============================================================================
-# CLOTUBE v4.0 - PRODUCTION R8 / PROGUARD KEEP RULES
+# CLOTUBE v4.1 - PRODUCTION R8 / PROGUARD KEEP RULES
 # ==============================================================================
 
-# 1. Preserve All @Keep Targets, Domain Models, Sync Managers, Network & Updater
+# 1. Preserve All Clotube Classes, @Keep Targets, Compose Player Lambdas & Domain Models
 -keep @androidx.annotation.Keep class * { *; }
 -keepclassmembers class * {
     @androidx.annotation.Keep *;
 }
 
--keep class com.clotube.app.model.** { *; }
--keepclassmembers class com.clotube.app.model.** { *; }
+-keep class com.clotube.app.** { *; }
+-keep interface com.clotube.app.** { *; }
+-keepclassmembers class com.clotube.app.** { *; }
 
--keep class com.clotube.app.data.** { *; }
--keepclassmembers class com.clotube.app.data.** { *; }
-
--keep class com.clotube.app.sync.** { *; }
--keepclassmembers class com.clotube.app.sync.** { *; }
-
--keep class com.clotube.app.network.** { *; }
--keepclassmembers class com.clotube.app.network.** { *; }
-
--keep class com.clotube.app.update.** { *; }
--keepclassmembers class com.clotube.app.update.** { *; }
-
--keep class com.clotube.app.media.** { *; }
--keepclassmembers class com.clotube.app.media.** { *; }
-
--keep class com.clotube.app.auth.** { *; }
--keep class com.clotube.app.player.** { *; }
--keep class com.clotube.app.viewmodel.** { *; }
--keepclassmembers class com.clotube.app.viewmodel.** { *; }
-
-# 2. Gson & JSON Reflection Protection
+# 2. Kotlin Metadata, Gson & JSON Reflection Protection
 -keepattributes Signature, InnerClasses, EnclosingMethod, RuntimeVisibleAnnotations, *Annotation*
 -keep class kotlin.Metadata { *; }
 -keepclassmembers class * {
@@ -42,9 +23,9 @@
 -keep class * extends com.google.gson.reflect.TypeToken
 
 # 3. LibVLC Native JNI & Media Playback Engine
--keep class org.videolan.libvlc.** { *; }
--keep interface org.videolan.libvlc.** { *; }
--keep class org.videolan.medialibrary.** { *; }
+-keep class org.videolan.** { *; }
+-keep interface org.videolan.** { *; }
+-keepclassmembers class org.videolan.** { *; }
 -dontwarn org.videolan.**
 -keepclasseswithmembernames class * {
     native <methods>;
@@ -73,10 +54,12 @@
 -dontwarn org.apache.http.**
 -dontwarn java.awt.**
 
-# 5. WorkManager, Services, DataStore & MediaSession
+# 5. WorkManager, Foreground/Task Services, DataStore & MediaSession
 -keep public class * extends androidx.work.ListenableWorker {
     public <init>(android.content.Context, androidx.work.WorkerParameters);
 }
+-keep class com.clotube.app.data.ClotubeSyncService { *; }
+-keep class com.clotube.app.sync.ClotubeTaskWatcherService { *; }
 -keep class com.clotube.app.workers.** { *; }
 -keep class android.support.v4.media.** { *; }
 -keep class androidx.media.** { *; }

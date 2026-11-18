@@ -40,7 +40,7 @@ import com.clotube.app.ui.screens.WatchlistScreen
 import com.clotube.app.data.WatchHistoryItem
 import com.clotube.app.ui.theme.AppleTvMotion
 import com.clotube.app.viewmodel.VideoViewModel
-import com.clotube.app.viewmodel.toMovie
+import com.clotube.app.model.toMovie
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 
@@ -260,8 +260,17 @@ fun ClotubeNavHost(
                 popEnterTransition = { MaterialSharedZAxisMotion.popEnterTransition },
                 popExitTransition = { MaterialSharedZAxisMotion.popExitTransition }
             ) {
+                val movies by videoViewModel.moviesList.collectAsState()
+                val seriesList by videoViewModel.seriesList.collectAsState()
+                val uiState by videoViewModel.uiState.collectAsState()
+                val effectiveMovies = uiState.movies
+                    .ifEmpty { uiState.videos.map { it.toMovie() } }
+                    .ifEmpty { movies }
+                val effectiveSeries = uiState.tvSeriesList.ifEmpty { seriesList }
                 SearchScreen(
                     viewModel = videoViewModel,
+                    moviesList = effectiveMovies,
+                    seriesList = effectiveSeries,
                     onMovieSelected = { movie ->
                         val title = movie.title.ifBlank { "Movie" }
                         navController.navigate(NavRoutes.playerRoute(movie.id, title))
@@ -283,10 +292,12 @@ fun ClotubeNavHost(
                 val movies by videoViewModel.moviesList.collectAsState()
                 val seriesList by videoViewModel.seriesList.collectAsState()
                 val uiState by videoViewModel.uiState.collectAsState()
-                val effectiveMovies = if (movies.isNotEmpty()) movies else uiState.moviesList.map { it.toMovie() }
-                val effectiveSeries = if (seriesList.isNotEmpty()) seriesList else uiState.tvSeriesList
+                val effectiveMovies = uiState.movies
+                    .ifEmpty { uiState.videos.map { it.toMovie() } }
+                    .ifEmpty { movies }
+                val effectiveSeries = uiState.tvSeriesList.ifEmpty { seriesList }
                 WatchlistScreen(
-                    movies = effectiveMovies,
+                    moviesList = effectiveMovies,
                     seriesList = effectiveSeries,
                     onMovieSelected = { entry ->
                         navController.navigate(NavRoutes.playerRoute(entry.id, entry.title))

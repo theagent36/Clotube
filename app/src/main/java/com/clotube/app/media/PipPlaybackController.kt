@@ -8,6 +8,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.graphics.drawable.Icon
 import android.os.Build
 import android.util.Log
@@ -63,26 +64,42 @@ object PipPlaybackController {
     private var currentActivityRef: java.lang.ref.WeakReference<Activity>? = null
     private var isReceiverRegistered = false
 
+    /**
+     * Checks whether the current device and OS level support Picture-in-Picture mode.
+     */
+    fun isPipSupported(context: Context): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return false
+        return try {
+            context.packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
     private val pipBroadcastReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action != ACTION_PIP_MEDIA_CONTROL) return
 
-            when (intent.getIntExtra(EXTRA_CONTROL_TYPE, 0)) {
-                CONTROL_REWIND -> {
-                    Log.d(TAG, "PiP RemoteAction -> Rewind 10s")
-                    onRewind10?.invoke()
-                }
-                CONTROL_PLAY_PAUSE -> {
-                    Log.d(TAG, "PiP RemoteAction -> Play/Pause")
-                    onPlayPause?.invoke()
-                    currentActivityRef?.get()?.let { act ->
-                        updatePipParams(act)
+            try {
+                when (intent.getIntExtra(EXTRA_CONTROL_TYPE, 0)) {
+                    CONTROL_REWIND -> {
+                        Log.d(TAG, "PiP RemoteAction -> Rewind 10s")
+                        onRewind10?.invoke()
+                    }
+                    CONTROL_PLAY_PAUSE -> {
+                        Log.d(TAG, "PiP RemoteAction -> Play/Pause")
+                        onPlayPause?.invoke()
+                        currentActivityRef?.get()?.let { act ->
+                            updatePipParams(act)
+                        }
+                    }
+                    CONTROL_FORWARD -> {
+                        Log.d(TAG, "PiP RemoteAction -> Forward 10s")
+                        onForward10?.invoke()
                     }
                 }
-                CONTROL_FORWARD -> {
-                    Log.d(TAG, "PiP RemoteAction -> Forward 10s")
-                    onForward10?.invoke()
-                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "PiP RemoteAction handler failed: ${t.message}")
             }
         }
     }
@@ -112,8 +129,8 @@ object PipPlaybackController {
             }
             isReceiverRegistered = true
             Log.d(TAG, "PiP BroadcastReceiver registered")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to register PiP receiver: ${e.message}", e)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Failed to register PiP receiver: ${t.message}", t)
         }
     }
 
@@ -127,8 +144,8 @@ object PipPlaybackController {
             isReceiverRegistered = false
             currentActivityRef = null
             Log.d(TAG, "PiP BroadcastReceiver unregistered")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to unregister PiP receiver: ${e.message}", e)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Failed to unregister PiP receiver: ${t.message}", t)
         }
     }
 
@@ -145,7 +162,11 @@ object PipPlaybackController {
         onPlayPause = onTogglePlayPause
         onRewind10 = onSeekRewind
         onForward10 = onSeekForward
-        updatePipParams(activity)
+        try {
+            if (isPipSupported(activity)) {
+                updatePipParams(activity)
+            }
+        } catch (_: Throwable) {}
     }
 
     /**
@@ -241,11 +262,12 @@ object PipPlaybackController {
      * Updates host Activity PiP params dynamically (e.g. when play/pause state flips).
      */
     fun updatePipParams(activity: Activity) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && isPipSupported(activity)) {
+            if (activity.isFinishing || activity.isDestroyed) return
             try {
                 activity.setPictureInPictureParams(buildPipParams(activity, isVideoActivelyPlaying))
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to update PiP params: ${e.message}")
+            } catch (t: Throwable) {
+                Log.w(TAG, "Failed to update PiP params: ${t.message}")
             }
         }
     }

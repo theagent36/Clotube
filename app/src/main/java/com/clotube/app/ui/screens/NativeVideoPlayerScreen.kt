@@ -4,8 +4,6 @@ import android.app.Activity
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import androidx.activity.compose.BackHandler
-import androidx.core.view.WindowCompat
-import androidx.core.view.WindowInsetsCompat
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
@@ -15,16 +13,20 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.viewModelScope
+import com.clotube.app.model.VideoItem
 import com.clotube.app.ui.components.ClotubeVideoPlayer
+import com.clotube.app.ui.components.safeCall
 import com.clotube.app.viewmodel.VideoViewModel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 @Composable
@@ -37,17 +39,17 @@ fun NativeVideoPlayerScreen(
     val activity = context as? Activity
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
-    val coroutineScope = rememberCoroutineScope()
+
     val movie = remember(fileId) {
         viewModel.getMovieById(fileId) ?: if (fileId.isNotBlank()) {
-            com.clotube.app.model.VideoItem(id = fileId, title = "Movie")
+            VideoItem(id = fileId, title = "Movie")
         } else null
     }
     val movieTitle = remember(movie) {
         movie?.title?.ifBlank { null } ?: movie?.displayTitle?.ifBlank { null } ?: "Movie"
     }
-    var resumePositionMs by remember { mutableLongStateOf(0L) }
-    var isReadyToPlay by remember { mutableStateOf(false) }
+    var resumePositionMs by remember(fileId) { mutableLongStateOf(0L) }
+    var isReadyToPlay by remember(fileId) { mutableStateOf(false) }
 
     val toggleFullscreen: () -> Unit = {
         activity?.let { act ->
@@ -61,79 +63,89 @@ fun NativeVideoPlayerScreen(
 
     // 1. Resolve resume position from DataStore before mounting player
     LaunchedEffect(fileId) {
-        viewModel.stopAndReleaseCurrentPlayer()
-        resumePositionMs = viewModel.playbackHistoryManager.getResumePosition(fileId)
+        if (fileId.isBlank()) {
+            onNavigateBack()
+            return@LaunchedEffect
+        }
+        try {
+            viewModel.stopAndReleaseCurrentPlayer()
+        } catch (_: Throwable) {}
 
-        // Immediately record playback start with current timestamp so it becomes the newest history item
-        viewModel.playbackHistoryManager.saveMoviePlaybackState(
-            fileId = fileId,
-            title = movieTitle,
-            positionMs = resumePositionMs.coerceAtLeast(1000L),
-            durationMs = movie?.durationMs?.coerceAtLeast(1000L) ?: 1000L
-        )
+        resumePositionMs = try {
+            viewModel.playbackHistoryManager.getResumePosition(fileId)
+        } catch (_: Throwable) {
+            0L
+        }
+
+        try {
+            viewModel.playbackHistoryManager.saveMoviePlaybackState(
+                fileId = fileId,
+                title = movieTitle,
+                positionMs = resumePositionMs.coerceAtLeast(1000L),
+                durationMs = movie?.durationMs?.coerceAtLeast(1000L) ?: 1000L
+            )
+        } catch (_: Throwable) {}
+
         viewModel.prepareAndPlayMovie(fileId, resumePositionMs)
         isReadyToPlay = true
     }
 
-    // 2. Periodic progress ticker while playing
-    LaunchedEffect(isReadyToPlay) {
+    // 2. Periodic progress ticker while playing (strictly guarded with safeCall)
+    LaunchedEffect(isReadyToPlay, fileId) {
         if (!isReadyToPlay) return@LaunchedEffect
-        while (true) {
+        while (isActive) {
             delay(4000L)
-            viewModel.mediaPlayer.let { player ->
-                if (player.isPlaying) {
-                    val pos = player.time
-                    val dur = if (player.length > 0L) player.length else (movie?.durationMs ?: 0L)
-                    if (pos > 1000L && dur > 0L) {
+            val player = viewModel.playerOrNull
+            val playing = player.safeCall(false) { isPlaying }
+            if (playing) {
+                val pos = player.safeCall(0L) { time }
+                val nativeLen = player.safeCall(0L) { length }
+                val dur = if (nativeLen > 0L) nativeLen else (movie?.durationMs ?: 0L)
+                if (pos > 1000L && dur > 0L) {
+                    try {
                         viewModel.playbackHistoryManager.saveMoviePlaybackState(
                             fileId = fileId,
                             title = movieTitle,
                             positionMs = pos,
                             durationMs = dur
                         )
-                    }
+                    } catch (_: Throwable) {}
                 }
             }
         }
     }
 
-    val handleExit = {
-        viewModel.mediaPlayer.let { player ->
-            val pos = player.time
-            val dur = if (player.length > 0L) player.length else (movie?.durationMs ?: 0L)
-            if (pos > 1000L && dur > 0L) {
-                viewModel.viewModelScope.launch {
+    fun persistProgressAndStop() {
+        val player = viewModel.playerOrNull
+        val pos = player.safeCall(0L) { time }
+        val nativeLen = player.safeCall(0L) { length }
+        val dur = if (nativeLen > 0L) nativeLen else (movie?.durationMs ?: 0L)
+        if (pos > 1000L && dur > 0L) {
+            viewModel.viewModelScope.launch {
+                try {
                     viewModel.playbackHistoryManager.saveMoviePlaybackState(
                         fileId = fileId,
                         title = movieTitle,
                         positionMs = pos,
                         durationMs = dur
                     )
-                }
+                } catch (_: Throwable) {}
             }
         }
-        viewModel.stopAndReleaseCurrentPlayer()
+        try {
+            viewModel.stopAndReleaseCurrentPlayer()
+        } catch (_: Throwable) {}
+    }
+
+    val handleExit = {
+        persistProgressAndStop()
         onNavigateBack()
     }
 
-    // 3. Save progress on back navigation / disposal and release native player
+    // 3. Save progress on back navigation / disposal safely
     DisposableEffect(fileId) {
         onDispose {
-            viewModel.mediaPlayer.let { player ->
-                val pos = player.time
-                val dur = if (player.length > 0L) player.length else (movie?.durationMs ?: 0L)
-                if (pos > 1000L && dur > 0L) {
-                    viewModel.viewModelScope.launch {
-                        viewModel.playbackHistoryManager.saveMoviePlaybackState(
-                            fileId = fileId,
-                            title = movieTitle,
-                            positionMs = pos,
-                            durationMs = dur
-                        )
-                    }
-                }
-            }
-            viewModel.stopAndReleaseCurrentPlayer()
+            persistProgressAndStop()
         }
     }
 
@@ -155,7 +167,7 @@ fun NativeVideoPlayerScreen(
         }
     }
 
-    if (isReadyToPlay) {
+    if (isReadyToPlay && movie != null) {
         ClotubeVideoPlayer(
             episode = null,
             movie = movie,

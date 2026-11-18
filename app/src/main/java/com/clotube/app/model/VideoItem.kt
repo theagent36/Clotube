@@ -97,3 +97,22 @@ data class VideoItem(
         watchProgressFraction = watchProgressFraction
     )
 }
+
+/**
+ * Maps a [VideoItem] from the Drive catalog stream into a canonical [Movie] domain model
+ * for Watchlist matching, Global Search, and DriveCatalogMatcher resolution.
+ */
+fun VideoItem.toMovie(): Movie = Movie(
+    id = id,
+    title = title.ifBlank { displayTitle },
+    fileName = displayTitle.ifBlank { title },
+    fileSize = sizeFormatted,
+    mimeType = mimeType,
+    thumbnailUrl = thumbnailUrl.ifBlank { null },
+    parentFolder = "",
+    durationFormatted = durationFormatted,
+    resolutionBadge = resolutionBadge,
+    genre = genre,
+    streamUri = streamUri,
+    sizeBytes = sizeBytes
+)

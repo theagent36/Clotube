@@ -126,8 +126,8 @@ private data class ResolvedWatchlistCardItem(
  */
 @Composable
 fun WatchlistScreen(
-    movies: List<Movie> = emptyList(),
-    seriesList: List<TvSeries> = emptyList(),
+    moviesList: List<Movie>,
+    seriesList: List<TvSeries>,
     onMovieSelected: (WatchlistEntry) -> Unit,
     onSeriesSelected: (WatchlistEntry) -> Unit,
     modifier: Modifier = Modifier
@@ -146,12 +146,12 @@ fun WatchlistScreen(
     var itemForBottomSheet by remember { mutableStateOf<WatchlistEntry?>(null) }
     var itemForExternalSheet by remember { mutableStateOf<WatchlistEntry?>(null) }
 
-    val resolvedItems = remember(revision, selectedFilter, movies, seriesList) {
+    val resolvedItems = remember(revision, selectedFilter, moviesList, seriesList) {
         val rawActive = WatchlistManager.getActiveItems(selectedFilter.status)
         val map = LinkedHashMap<String, ResolvedWatchlistCardItem>()
 
         for (entry in rawActive) {
-            val matchedDriveMovie = DriveCatalogMatcher.findMatchingDriveMovie(movies, entry.id, entry.title)
+            val matchedDriveMovie = DriveCatalogMatcher.findMatchingDriveMovie(moviesList, entry.id, entry.title)
             val matchedDriveSeries = if (matchedDriveMovie == null) {
                 DriveCatalogMatcher.findMatchingDriveSeries(seriesList, entry.id, entry.title)
             } else null
@@ -160,11 +160,9 @@ fun WatchlistScreen(
                 ?: matchedDriveSeries?.thumbnailUrl?.ifBlank { null }
                 ?: matchedDriveSeries?.posterUrl?.ifBlank { null }
 
-            val dedupKey = when {
-                matchedDriveMovie != null -> "drive_movie_${matchedDriveMovie.id}"
-                matchedDriveSeries != null -> "drive_series_${matchedDriveSeries.id}"
-                else -> "norm_${WatchlistManager.normalizeTitle(entry.title).ifBlank { entry.id }}"
-            }
+            val dedupKey = matchedDriveMovie?.id
+                ?: matchedDriveSeries?.id
+                ?: WatchlistManager.normalizeTitle(entry.title).ifBlank { entry.id }
 
             val existing = map[dedupKey]
             if (existing == null) {
@@ -195,17 +193,15 @@ fun WatchlistScreen(
         map.values.toList()
     }
 
-    val totalSavedCount = remember(revision, movies, seriesList) {
+    val totalSavedCount = remember(revision, moviesList, seriesList) {
         val rawAll = WatchlistManager.getActiveItems(null)
         val seen = HashSet<String>()
         for (entry in rawAll) {
-            val m = DriveCatalogMatcher.findMatchingDriveMovie(movies, entry.id, entry.title)
+            val m = DriveCatalogMatcher.findMatchingDriveMovie(moviesList, entry.id, entry.title)
             val s = if (m == null) DriveCatalogMatcher.findMatchingDriveSeries(seriesList, entry.id, entry.title) else null
-            val key = when {
-                m != null -> "drive_movie_${m.id}"
-                s != null -> "drive_series_${s.id}"
-                else -> "norm_${WatchlistManager.normalizeTitle(entry.title).ifBlank { entry.id }}"
-            }
+            val key = m?.id
+                ?: s?.id
+                ?: WatchlistManager.normalizeTitle(entry.title).ifBlank { entry.id }
             seen.add(key)
         }
         seen.size
@@ -432,7 +428,7 @@ fun WatchlistScreen(
                 currentStatus = targetEntry.status,
                 onSelectStatus = { newStatus ->
                     val matchedMovie = if (targetEntry.mediaType == WatchlistMediaType.MOVIE) {
-                        DriveCatalogMatcher.findMatchingDriveMovie(movies, targetEntry.id, targetEntry.title)
+                        DriveCatalogMatcher.findMatchingDriveMovie(moviesList, targetEntry.id, targetEntry.title)
                     } else null
                     val matchedSeries = if (targetEntry.mediaType == WatchlistMediaType.SERIES) {
                         DriveCatalogMatcher.findMatchingDriveSeries(seriesList, targetEntry.id, targetEntry.title)
@@ -461,7 +457,7 @@ fun WatchlistScreen(
                 entry = targetEntry,
                 onSelectStatus = { newStatus ->
                     val matchedMovie = if (targetEntry.mediaType == WatchlistMediaType.MOVIE) {
-                        DriveCatalogMatcher.findMatchingDriveMovie(movies, targetEntry.id, targetEntry.title)
+                        DriveCatalogMatcher.findMatchingDriveMovie(moviesList, targetEntry.id, targetEntry.title)
                     } else null
                     val matchedSeries = if (targetEntry.mediaType == WatchlistMediaType.SERIES) {
                         DriveCatalogMatcher.findMatchingDriveSeries(seriesList, targetEntry.id, targetEntry.title)
@@ -484,24 +480,6 @@ fun WatchlistScreen(
             )
         }
     }
-}
-
-/**
- * Backward-compatible overload for callers that do not directly provide Drive catalog lists.
- */
-@Composable
-fun WatchlistScreen(
-    onMovieSelected: (WatchlistEntry) -> Unit,
-    onSeriesSelected: (WatchlistEntry) -> Unit,
-    modifier: Modifier = Modifier
-) {
-    WatchlistScreen(
-        movies = emptyList(),
-        seriesList = emptyList(),
-        onMovieSelected = onMovieSelected,
-        onSeriesSelected = onSeriesSelected,
-        modifier = modifier
-    )
 }
 
 /**

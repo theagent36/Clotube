@@ -82,9 +82,9 @@ object WatchlistManager {
             .replace('/', ' ')
             .replace('\\', ' ')
 
-        // 4. Strip noise tokens (resolutions, formats, sources, codecs, audio, languages, years, tags)
+        // 4. Strip noise tokens (resolutions, formats, sources, codecs, audio, languages, years 1920..2039, tags)
         val noiseRegex = Regex(
-            """(?i)\b(19\d{2}|20[0-3]\d|2160p|1080p|720p|480p|360p|4k|uhd|fhd|hd|sd|hdr|hdr10|hdr10\+|dv|dolby|vision|imax|web-?dl|web-?rip|blu-?ray|brrip|bdrip|hdrip|dvdrip|hdcam|camrip|predvd|remux|repack|proper|x264|x265|h264|h265|hevc|avc|av1|10bit|8bit|aac|ac3|eac3|ddp?5\s*1|dd5\s*1|dts|truehd|atmos|5\s*1|7\s*1|2\s*0|esub|esubs|hc|hardcoded|subbed|dubbed|hindi|english|tamil|telugu|malayalam|kannada|bengali|punjabi|dual\s*audio|multi\s*audio|full\s*movie|bollywood|hollywood|unrated|extended|remastered|directors?\s*cut)\b"""
+            """(?i)\b(19[2-9]\d|20[0-3]\d|2160p|1080p|720p|480p|360p|4k|uhd|fhd|hd|sd|hdr|hdr10|hdr10\+|dv|dolby|vision|imax|web-?dl|web-?rip|blu-?ray|brrip|bdrip|hdrip|dvdrip|hdcam|camrip|predvd|remux|repack|proper|x264|x265|h264|h265|hevc|avc|av1|10bit|8bit|aac|ac3|eac3|ddp?5\s*1|dd5\s*1|dts|truehd|atmos|5\s*1|7\s*1|2\s*0|esub|esubs|hc|hardcoded|subbed|dubbed|hindi|english|tamil|telugu|malayalam|kannada|bengali|punjabi|dual\s*audio|multi\s*audio|full\s*movie|movies?|bollywood|hollywood|unrated|extended|remastered|directors?\s*cut)\b"""
         )
         title = title.replace(noiseRegex, " ")
 
@@ -103,7 +103,7 @@ object WatchlistManager {
      * Noise tokens for determining cleaner display titles.
      */
     private val TITLE_NOISE_REGEX = Regex(
-        """(?i)\b(19\d{2}|20[0-3]\d|2160p|1080p|720p|480p|4k|uhd|fhd|hd|sd|hdr|hdr10|bluray|bdrip|brrip|web-?dl|web-?rip|dvdrip|remux|x264|x265|hevc|aac|esub|esubs|hc|hindi|english|tamil|telugu|dual\s*audio|multi\s*audio|full\s*movie|bollywood|hollywood|mkv|mp4|avi)\b"""
+        """(?i)\b(19[2-9]\d|20[0-3]\d|2160p|1080p|720p|480p|4k|uhd|fhd|hd|sd|hdr|hdr10|bluray|blu-?ray|bdrip|brrip|web-?dl|web-?rip|dvdrip|remux|x264|x265|hevc|aac|esub|esubs|hc|subbed|dubbed|hindi|english|tamil|telugu|dual\s*audio|multi\s*audio|full\s*movie|movies?|bollywood|hollywood|mkv|mp4|avi)\b"""
     )
 
     /**

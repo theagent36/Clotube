@@ -41,6 +41,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
 import com.clotube.app.model.ContinueWatchingItem
 import com.clotube.app.model.Series
+import com.clotube.app.model.toMovie
 import com.clotube.app.data.metadata.OnlineMetadataResolver
 import com.clotube.app.data.metadata.GlobalCatalogSearchEngine
 import com.clotube.app.data.metadata.GlobalSearchResult
@@ -97,21 +98,6 @@ fun loadCatalogFromDisk(context: Context): List<TvSeries> {
 fun saveShowToDisk(context: Context, updatedShow: TvSeries) {
     CatalogCacheManager(context).upsertSeriesSync(updatedShow)
 }
-
-fun VideoItem.toMovie(): Movie = Movie(
-    id = id,
-    title = displayTitle,
-    fileName = displayTitle,
-    fileSize = fileSizeFormatted,
-    mimeType = mimeType,
-    thumbnailUrl = thumbnailUrl,
-    parentFolder = "",
-    durationFormatted = durationFormatted,
-    resolutionBadge = resolutionBadge,
-    genre = genreFormatted,
-    streamUri = streamUri,
-    sizeBytes = sizeBytes
-)
 
 @Keep
 data class ContinueWatchingData(
@@ -228,6 +214,7 @@ data class ContinueWatchingDisplayData(
 @Keep
 data class VideoUiState(
     val videos: List<VideoItem> = emptyList(),
+    val movies: List<Movie> = emptyList(),
     val moviesList: List<VideoItem> = emptyList(),
     val filteredVideos: List<VideoItem> = emptyList(),
     val tvSeriesList: List<TvSeries> = emptyList(),
@@ -356,7 +343,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         context = application,
         tokenProvider = { getValidAccessToken() }
     )
-    val mediaPlayer: MediaPlayer get() = vlcPlayerManager.mediaPlayer
+    val mediaPlayer: MediaPlayer get() = vlcPlayerManager.getOrCreateMediaPlayer()
     val player: MediaPlayer get() = mediaPlayer
 
     suspend fun getValidAccessToken(forceRefresh: Boolean = false): String = withContext(Dispatchers.IO) {
@@ -411,7 +398,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             withContext(Dispatchers.Main) {
-                registerActivePlayer(vlcPlayerManager.mediaPlayer)
+                registerActivePlayer(vlcPlayerManager.getOrCreateMediaPlayer())
                 vlcPlayerManager.play(
                     fileId = fileId,
                     localFile = localFile,
@@ -433,7 +420,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                 playbackHistoryManager.getResumePosition(episode.id)
             }
             withContext(Dispatchers.Main) {
-                registerActivePlayer(vlcPlayerManager.mediaPlayer)
+                registerActivePlayer(vlcPlayerManager.getOrCreateMediaPlayer())
                 vlcPlayerManager.play(
                     fileId = episode.id,
                     localFile = localFile,
@@ -444,11 +431,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun clearActiveEpisode() {
-        try {
-            mediaPlayer.setEventListener(null)
-            mediaPlayer.detachViews()
-            mediaPlayer.stop()
-        } catch (_: Exception) {}
+        vlcPlayerManager.stopAndDetachSafely()
     }
 
     fun getStreamUrlForEpisode(episodeId: String): String {
@@ -506,38 +489,29 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun stopAndReleaseCurrentPlayer() {
-        val playerToRelease = activeMediaPlayer
+        val playerToStop = activeMediaPlayer
         activeMediaPlayer = null
-        if (playerToRelease != null && !playerToRelease.isReleased) {
+        val sharedPlayer = vlcPlayerManager.activeMediaPlayerOrNull()
+        if (playerToStop != null && playerToStop != sharedPlayer) {
             try {
-                playerToRelease.setEventListener(null)
-                try {
-                    playerToRelease.stop()
-                } catch (_: Throwable) {}
-                try {
-                    playerToRelease.detachViews()
-                } catch (_: Throwable) {}
-                if (playerToRelease != vlcPlayerManager.mediaPlayer) {
+                if (!playerToStop.isReleased) {
+                    try { playerToStop.setEventListener(null) } catch (_: Throwable) {}
+                    try { playerToStop.stop() } catch (_: Throwable) {}
+                    try { playerToStop.detachViews() } catch (_: Throwable) {}
                     CoroutineScope(Dispatchers.IO).launch {
                         try {
-                            if (!playerToRelease.isReleased) {
-                                playerToRelease.release()
+                            if (!playerToStop.isReleased) {
+                                playerToStop.release()
                             }
                         } catch (_: Throwable) {}
                     }
                 }
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 android.util.Log.e("VideoViewModel", "Error releasing active player: ${e.message}")
             }
         }
-        try {
-            if (!vlcPlayerManager.mediaPlayer.isReleased) {
-                if (vlcPlayerManager.mediaPlayer.isPlaying) {
-                    vlcPlayerManager.mediaPlayer.stop()
-                }
-                vlcPlayerManager.mediaPlayer.detachViews()
-            }
-        } catch (_: Exception) {}
+        // Stop and detach views on shared vlcPlayerManager player WITHOUT destroying/poisoning it
+        vlcPlayerManager.stopAndDetachSafely()
     }
 
     fun selectEpisode(episode: Episode) {
@@ -658,7 +632,12 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
     }
 
 
-    val playerOrNull: MediaPlayer? get() = mediaPlayer
+    val playerOrNull: MediaPlayer?
+        get() = try {
+            activeMediaPlayer?.takeIf { !it.isReleased } ?: vlcPlayerManager.activeMediaPlayerOrNull()
+        } catch (_: Throwable) {
+            null
+        }
 
     fun pauseActivePlayer() {
         vlcPlayerManager.onAppPause()
@@ -668,8 +647,10 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                     player.pause()
                 }
             }
-            if (!mediaPlayer.isReleased && mediaPlayer.isPlaying) {
-                mediaPlayer.pause()
+            vlcPlayerManager.activeMediaPlayerOrNull()?.let { shared ->
+                if (!shared.isReleased && shared.isPlaying) {
+                    shared.pause()
+                }
             }
         } catch (_: Throwable) {}
     }
@@ -1398,8 +1379,11 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         } else {
             GlobalCatalogSearchEngine.getCachedOnlineResults(trimmedQuery)
         }
-        val effectiveMovies = if (movies.isNotEmpty()) movies else ui.moviesList.map { it.toMovie() }
-        val effectiveSeries = if (series.isNotEmpty()) series else ui.tvSeriesList
+        val effectiveMovies = ui.movies
+            .ifEmpty { ui.videos.map { it.toMovie() } }
+            .ifEmpty { movies }
+            .ifEmpty { ui.moviesList.map { it.toMovie() } }
+        val effectiveSeries = ui.tvSeriesList.ifEmpty { series }
         GlobalCatalogSearchEngine.mergeDriveAndOnlineResults(
             query = trimmedQuery,
             driveMovies = effectiveMovies,
@@ -1636,8 +1620,9 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                     series.copy(watchProgressFraction = seriesFraction, seasons = updatedSeasons)
                 }
 
+                val mappedDomainMovies = mappedMovies.map { it.toMovie() }
                 _moviesState.value = mappedMovies
-                _moviesList.value = mappedMovies.map { it.toMovie() }
+                _moviesList.value = mappedDomainMovies
                 _seriesState.value = mappedSeries
                 _isInitialLoading.value = false
 
@@ -1647,6 +1632,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                 _uiState.update { current ->
                     current.copy(
                         videos = mappedMovies,
+                        movies = mappedDomainMovies,
                         moviesList = mappedMovies,
                         filteredVideos = applyFilterAndSearch(mappedMovies, current.selectedFilter, current.searchQuery),
                         tvSeriesList = mappedSeries,
@@ -1665,11 +1651,13 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             if (lastAccount == null || !com.clotube.app.auth.GoogleAuthManager.hasAllDrivePermissions(getApplication(), lastAccount)) {
                 if (!hasCachedData) {
                     _moviesState.value = emptyList()
+                    _moviesList.value = emptyList()
                     _seriesState.value = emptyList()
                     _isInitialLoading.value = false
                     _uiState.update {
                         it.copy(
                             isSignedIn = false,
+                            movies = emptyList(),
                             isInitialLoading = false,
                             isLoading = false
                         )
@@ -1715,7 +1703,9 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                         series.copy(watchProgressFraction = seriesFraction, seasons = updatedSeasons)
                     }
 
+                    val updatedDomainMovies = updatedVideos.ifEmpty { updatedMovies }.map { it.toMovie() }
                     _moviesState.value = updatedMovies
+                    _moviesList.value = updatedDomainMovies
                     _seriesState.value = updatedSeries
 
                     current.copy(
@@ -1723,6 +1713,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                         lastWatchedMedia = lastWatched,
                         moviesList = updatedMovies,
                         videos = updatedVideos,
+                        movies = updatedDomainMovies,
                         filteredVideos = applyFilterAndSearch(updatedMovies, current.selectedFilter, current.searchQuery),
                         tvSeriesList = updatedSeries
                     )
@@ -1753,12 +1744,14 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             checkFolderOnboarding()
         } else {
             _moviesState.value = emptyList()
+            _moviesList.value = emptyList()
             _seriesState.value = emptyList()
             _isInitialLoading.value = false
             _uiState.update {
                 it.copy(
                     isSignedIn = false,
                     videos = emptyList(),
+                    movies = emptyList(),
                     moviesList = emptyList(),
                     filteredVideos = emptyList(),
                     tvSeriesList = emptyList(),
@@ -1905,6 +1898,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                 catalogCacheManager.clearCache()
             }
             _moviesState.value = emptyList()
+            _moviesList.value = emptyList()
             _seriesState.value = emptyList()
             _isInitialLoading.value = false
             _uiState.update {
@@ -1915,6 +1909,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                     userAvatarUrl = null,
                     accessToken = null,
                     videos = emptyList(),
+                    movies = emptyList(),
                     moviesList = emptyList(),
                     filteredVideos = emptyList(),
                     tvSeriesList = emptyList(),
@@ -1967,12 +1962,15 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                 } else if (!hasContent) {
                     // Fail-Closed Policy: Only clear if there's no pre-existing cached content
                     _moviesState.value = emptyList()
+                    _moviesList.value = emptyList()
                     _seriesState.value = emptyList()
                     _isInitialLoading.value = false
                     _uiState.update {
                         it.copy(
                             isLoading = false,
                             isInitialLoading = false,
+                            videos = emptyList(),
+                            movies = emptyList(),
                             moviesList = emptyList(),
                             filteredVideos = emptyList(),
                             tvSeriesList = emptyList(),
@@ -2071,7 +2069,9 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                         if (prog != null) movie.copy(watchProgressFraction = prog.progressFraction) else movie
                     }
 
+                    val mappedDomainMovies = mappedMovies.map { it.toMovie() }
                     _moviesState.value = mappedMovies
+                    _moviesList.value = mappedDomainMovies
 
                     // Dismiss skeleton as soon as the first chunk of items arrives
                     if (mappedMovies.isNotEmpty()) {
@@ -2082,6 +2082,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                         val hero = current.heroItem ?: mappedMovies.firstOrNull()
                         current.copy(
                             videos = mappedMovies,
+                            movies = mappedDomainMovies,
                             moviesList = mappedMovies,
                             filteredVideos = applyFilterAndSearch(mappedMovies, current.selectedFilter, current.searchQuery),
                             heroItem = hero,
@@ -2137,10 +2138,13 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                     val prog = progressMap[movie.id]
                     if (prog != null) movie.copy(watchProgressFraction = prog.progressFraction) else movie
                 }
+                val finalDomainMovies = finalMapped.map { it.toMovie() }
                 _moviesState.value = finalMapped
+                _moviesList.value = finalDomainMovies
                 _uiState.update { current ->
                     current.copy(
                         videos = finalMapped,
+                        movies = finalDomainMovies,
                         moviesList = finalMapped,
                         filteredVideos = applyFilterAndSearch(finalMapped, current.selectedFilter, current.searchQuery),
                         heroItem = current.heroItem ?: finalMapped.firstOrNull()
@@ -2257,6 +2261,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                         val heroSeries = current.heroSeries ?: result.series.firstOrNull()
                         current.copy(
                             videos = videoItems,
+                            movies = result.movies,
                             moviesList = videoItems,
                             tvSeriesList = result.series,
                             filteredVideos = applyFilterAndSearch(videoItems, current.selectedFilter, current.searchQuery),
@@ -2347,6 +2352,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                             val hero = current.heroItem ?: videoItems.firstOrNull()
                             current.copy(
                                 videos = videoItems,
+                                movies = movies,
                                 moviesList = videoItems,
                                 filteredVideos = applyFilterAndSearch(videoItems, current.selectedFilter, current.searchQuery),
                                 heroItem = hero,
@@ -2357,6 +2363,14 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                     } else {
                         _moviesList.value = emptyList()
                         _moviesState.value = emptyList()
+                        _uiState.update { current ->
+                            current.copy(
+                                videos = emptyList(),
+                                movies = emptyList(),
+                                moviesList = emptyList(),
+                                filteredVideos = emptyList()
+                            )
+                        }
                     }
 
                     // 2. Recursive Scan for TV Series
@@ -2520,8 +2534,11 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         result: GlobalSearchResult,
         status: WatchlistStatus
     ) {
-        val effectiveMovies = if (moviesList.value.isNotEmpty()) moviesList.value else _uiState.value.moviesList.map { it.toMovie() }
-        val effectiveSeries = if (seriesList.value.isNotEmpty()) seriesList.value else _uiState.value.tvSeriesList
+        val effectiveMovies = _uiState.value.movies
+            .ifEmpty { _uiState.value.videos.map { it.toMovie() } }
+            .ifEmpty { moviesList.value }
+            .ifEmpty { _uiState.value.moviesList.map { it.toMovie() } }
+        val effectiveSeries = _uiState.value.tvSeriesList.ifEmpty { seriesList.value }
 
         val matchedDriveMovie = result.driveMovie
             ?: DriveCatalogMatcher.findMatchingDriveMovie(
@@ -2566,8 +2583,11 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         year: String = "",
         genre: String = ""
     ) {
-        val effectiveMovies = if (moviesList.value.isNotEmpty()) moviesList.value else _uiState.value.moviesList.map { it.toMovie() }
-        val effectiveSeries = if (seriesList.value.isNotEmpty()) seriesList.value else _uiState.value.tvSeriesList
+        val effectiveMovies = _uiState.value.movies
+            .ifEmpty { _uiState.value.videos.map { it.toMovie() } }
+            .ifEmpty { moviesList.value }
+            .ifEmpty { _uiState.value.moviesList.map { it.toMovie() } }
+        val effectiveSeries = _uiState.value.tvSeriesList.ifEmpty { seriesList.value }
         val matchedMovie = if (mediaType == WatchlistMediaType.MOVIE) {
             DriveCatalogMatcher.findMatchingDriveMovie(effectiveMovies, id, title)
         } else null

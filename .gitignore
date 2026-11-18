@@ -33,6 +33,7 @@ build/
 app/build/
 **/build/
 *.apk
+Clotube-*.apk
 *.aab
 *.ap_
 *.dex
@@ -41,6 +42,8 @@ app/build/
 clotube_source_bundle.md
 clotube_desktop_source_bundle.md
 Bundle the codes (Android).txt
+export_bundle.ps1
+RELEASE_NOTES_TMP.md
 
 # IDE & Editor files
 .gradle/

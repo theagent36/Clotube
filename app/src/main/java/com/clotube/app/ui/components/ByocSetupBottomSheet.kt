@@ -17,7 +17,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
-import androidx.compose.material.icons.automirrored.filled.HelpOutline
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -682,7 +681,7 @@ private fun StepFourContent(onOpenClients: () -> Unit) {
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(
-                            imageVector = Icons.AutoMirrored.Filled.HelpOutline,
+                            imageVector = Icons.Default.HelpOutline,
                             contentDescription = null,
                             tint = AccentBlue,
                             modifier = Modifier.size(16.dp)

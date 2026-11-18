@@ -154,13 +154,17 @@ class MainActivity : ComponentActivity() {
 
     override fun onPause() {
         super.onPause()
-        val inPip = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) isInPictureInPictureMode else false
+        val inPip = try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) isInPictureInPictureMode else false
+        } catch (_: Throwable) {
+            false
+        }
         if (!inPip) {
             videoViewModel.vlcPlayerManager.onAppPause()
             videoViewModel.pauseActivePlayer()
             try {
                 videoViewModel.playbackHistoryManager.backupImmediately()
-            } catch (ignored: Exception) {}
+            } catch (_: Throwable) {}
             videoViewModel.scheduleBackgroundDriveSync(applicationContext)
         }
     }
@@ -168,7 +172,11 @@ class MainActivity : ComponentActivity() {
     override fun onStop() {
         super.onStop()
         ClotubeNetworkMonitor.onAppBackgrounded()
-        val inPip = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) isInPictureInPictureMode else false
+        val inPip = try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) isInPictureInPictureMode else false
+        } catch (_: Throwable) {
+            false
+        }
         if (!inPip) {
             // 1. Enforce global pause
             videoViewModel.vlcPlayerManager.onAppPause()
@@ -178,37 +186,47 @@ class MainActivity : ComponentActivity() {
             try {
                 videoViewModel.playbackHistoryManager.backupImmediately()
                 com.clotube.app.data.DriveWatchlistSync.getInstance(applicationContext).enqueuePush()
-            } catch (ignored: Exception) {}
+            } catch (_: Throwable) {}
 
             // 3. Schedule WorkManager persistent sync to push watch history and watchlist to Drive
             com.clotube.app.sync.DriveSyncWorker.enqueueImmediateSync(applicationContext)
         }
 
         // Reset window brightness back to system default
-        val lp = window.attributes
-        lp.screenBrightness = android.view.WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
-        window.attributes = lp
+        try {
+            val lp = window.attributes
+            lp.screenBrightness = android.view.WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+            window.attributes = lp
+        } catch (_: Throwable) {}
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        PipPlaybackController.unregister(this)
+        try {
+            PipPlaybackController.unregister(this)
+        } catch (_: Throwable) {}
     }
 
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && PipPlaybackController.isVideoActivelyPlaying) {
+        if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            PipPlaybackController.isPipSupported(this) &&
+            PipPlaybackController.isVideoActivelyPlaying
+        ) {
             try {
                 enterPictureInPictureMode(PipPlaybackController.buildPipParams(this))
-            } catch (e: Exception) {
-                android.util.Log.w("MainActivity", "Failed to enter PiP: ${e.message}")
+            } catch (t: Throwable) {
+                android.util.Log.w("MainActivity", "Failed to enter PiP: ${t.message}")
             }
         }
     }
 
     override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
-        PipPlaybackController.setInPipMode(isInPictureInPictureMode)
+        try {
+            PipPlaybackController.setInPipMode(isInPictureInPictureMode)
+        } catch (_: Throwable) {}
     }
 
     fun handleGoogleSignInResult(data: android.content.Intent?) {

@@ -211,9 +211,14 @@ object DriveCatalogMatcher {
         // Tier 4: Bounded Levenshtein fuzzy match (pick best match with distance <= threshold)
         var bestMovie: Movie? = null
         var bestSimilarity = 0.0
+        val targetTrailingNum = Regex("""\b(\d+)$""").find(normTarget)?.groupValues?.getOrNull(1)
 
         for ((movie, candidates) in candidateMap) {
             for (cand in candidates) {
+                val candTrailingNum = Regex("""\b(\d+)$""").find(cand)?.groupValues?.getOrNull(1)
+                if (targetTrailingNum != null && candTrailingNum != null && targetTrailingNum != candTrailingNum) {
+                    continue
+                }
                 val minLen = minOf(normTarget.length, cand.length)
                 val maxLen = maxOf(normTarget.length, cand.length)
                 if (minLen >= 4) {
