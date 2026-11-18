@@ -620,7 +620,7 @@ private fun StepFourContent(onOpenClients: () -> Unit) {
         Spacer(modifier = Modifier.height(8.dp))
         SubInstructionRow(
             number = "2",
-            text = "Open the Application type dropdown and select Desktop app (or Web application)."
+            text = "Open the Application type dropdown and select Desktop app (Recommended: loopback http://127.0.0.1 authentication works automatically with PKCE without needing to manually add redirect URIs)."
         )
         Spacer(modifier = Modifier.height(8.dp))
         SubInstructionRow(
@@ -705,7 +705,7 @@ private fun StepFourContent(onOpenClients: () -> Unit) {
                 if (showAndroidDetails) {
                     Spacer(modifier = Modifier.height(10.dp))
                     Text(
-                        text = "Desktop app is recommended because it provides the direct Download JSON button. If you choose Android client instead, copy these details:",
+                        text = "Desktop app is the primary recommended client type because loopback authentication works automatically out-of-the-box and provides the direct Download JSON button. If you choose Android client instead, copy these details:",
                         color = TextSecondary,
                         fontSize = 11.sp,
                         lineHeight = 15.sp

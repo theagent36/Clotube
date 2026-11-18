@@ -718,8 +718,10 @@ object AndroidWatchHistoryManager {
     }
 
     suspend fun removeContinueWatchingItem(context: Context, mediaId: String, seriesId: String?) {
-        val account = com.google.android.gms.auth.api.signin.GoogleSignIn.getLastSignedInAccount(context)
-        val email = account?.email ?: "default"
+        val email = ProfileManager.activeProfileEmail.value?.takeIf { it.isNotBlank() }
+            ?: ByocConfigManager.sessionFlow.value?.userEmail?.takeIf { it.isNotBlank() }
+            ?: com.google.android.gms.auth.api.signin.GoogleSignIn.getLastSignedInAccount(context)?.email
+            ?: "default"
         removeEntriesForMedia(context, email, mediaId, seriesId)
         PlaybackHistoryManager(context).removeContinueWatchingItem(context, mediaId, seriesId)
     }

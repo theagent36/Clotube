@@ -70,6 +70,15 @@ class GoogleAuthRepository(private val context: Context) {
      * Resolves a valid OAuth 2.0 Bearer token (starting with ya29.) on Dispatchers.IO.
      */
     suspend fun getAccessToken(): Result<String> = withContext(Dispatchers.IO) {
+        if (com.clotube.app.data.ByocConfigManager.isByocConfigured(context)) {
+            val token = ByocOAuthManager.getValidByocAccessToken(context, forceRefresh = false)
+            if (token.isNotBlank()) {
+                _accessToken.value = token
+                return@withContext Result.success(token)
+            }
+            return@withContext Result.failure(IllegalStateException("No valid BYOC OAuth access token available."))
+        }
+
         val account = _currentAccount.value?.account ?: run {
             val last = GoogleSignIn.getLastSignedInAccount(context)
             if (last != null) {
@@ -126,6 +135,15 @@ class GoogleAuthRepository(private val context: Context) {
      * Clears an expired token from Google Play Services cache and retrieves a fresh token.
      */
     suspend fun refreshAccessToken(): Result<String> = withContext(Dispatchers.IO) {
+        if (com.clotube.app.data.ByocConfigManager.isByocConfigured(context)) {
+            val token = ByocOAuthManager.getValidByocAccessToken(context, forceRefresh = true)
+            if (token.isNotBlank()) {
+                _accessToken.value = token
+                return@withContext Result.success(token)
+            }
+            return@withContext Result.failure(IllegalStateException("Failed to refresh BYOC OAuth access token."))
+        }
+
         val oldToken = _accessToken.value
         val account = _currentAccount.value?.account ?: run {
             GoogleSignIn.getLastSignedInAccount(context)?.account

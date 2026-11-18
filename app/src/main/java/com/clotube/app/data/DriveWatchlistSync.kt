@@ -413,6 +413,11 @@ class DriveWatchlistSync(private val context: Context) {
             }.setApplicationName("Clotube").build()
         }
 
+        if (byocActive) {
+            Log.e(TAG, "Cannot sync watchlist: BYOC is active but no valid OAuth access token could be acquired")
+            return null
+        }
+
         // 2. Fallback to GoogleSignIn last signed-in account / GoogleAccountCredential
         val account = GoogleSignIn.getLastSignedInAccount(appContext)
         val activeEmail = ProfileManager.activeProfileEmail.value?.takeIf { it.isNotBlank() }

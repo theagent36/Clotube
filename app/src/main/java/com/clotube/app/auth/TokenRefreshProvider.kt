@@ -46,7 +46,19 @@ class TokenRefreshProvider(
                 // 1. Invalidate local stream proxy cached token
                 LocalStreamProxy.invalidateTokenCache()
 
-                // 2. Clear stale token in Google Play Services on-device cache if present
+                // 2. Delegate to BYOC if configured (bypassing Google Play Services completely)
+                if (com.clotube.app.data.ByocConfigManager.isByocConfigured(context.applicationContext)) {
+                    val byocToken = ByocOAuthManager.getValidByocAccessToken(context.applicationContext, forceRefresh = true)
+                    if (byocToken.isNotBlank()) {
+                        lastKnownToken = byocToken
+                        Log.i(TAG, "Successfully refreshed BYOC OAuth token")
+                        return@withLock byocToken
+                    }
+                    Log.w(TAG, "BYOC configured but failed to refresh token")
+                    return@withLock null
+                }
+
+                // 3. Clear stale token in Google Play Services on-device cache if present
                 val tokenToEvict = lastKnownToken
                 if (!tokenToEvict.isNullOrBlank()) {
                     try {
@@ -105,6 +117,14 @@ class TokenRefreshProvider(
      * or making a network call unless forceRefresh is true or token is missing.
      */
     suspend fun getValidAccessToken(forceRefresh: Boolean = false): String? = withContext(Dispatchers.IO) {
+        if (com.clotube.app.data.ByocConfigManager.isByocConfigured(context.applicationContext)) {
+            val byocToken = ByocOAuthManager.getValidByocAccessToken(context.applicationContext, forceRefresh)
+            if (byocToken.isNotBlank()) {
+                lastKnownToken = byocToken
+                return@withContext byocToken
+            }
+            return@withContext null
+        }
         if (!forceRefresh) {
             val cached = lastKnownToken
             if (!cached.isNullOrBlank()) {

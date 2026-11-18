@@ -167,12 +167,17 @@ fun ClotubeNavHost(
         ConnectDriveScreen(
             isLoading = authUiState.first,
             errorMessage = authUiState.second,
+            viewModel = videoViewModel,
             onConnectClick = {
-                val act = activity
-                if (act != null) {
-                    com.clotube.app.auth.GoogleAuthManager.launchGoogleSignIn(act, signInLauncher)
+                if (com.clotube.app.data.ByocConfigManager.isByocConfigured(context)) {
+                    videoViewModel.signInWithByoc(context)
                 } else {
-                    com.clotube.app.auth.GoogleAuthManager.launchGoogleSignIn(context, signInLauncher)
+                    val act = activity
+                    if (act != null) {
+                        com.clotube.app.auth.GoogleAuthManager.launchGoogleSignIn(act, signInLauncher)
+                    } else {
+                        com.clotube.app.auth.GoogleAuthManager.launchGoogleSignIn(context, signInLauncher)
+                    }
                 }
             }
         )

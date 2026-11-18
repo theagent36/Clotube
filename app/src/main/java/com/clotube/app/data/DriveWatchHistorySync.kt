@@ -997,6 +997,23 @@ class DriveWatchHistorySync(private val context: Context) {
     }
 
     private fun getDriveService(): Drive? {
+        // 0. When BYOC custom OAuth is active, always use Bearer token (never require Google Play Services account)
+        if (ByocConfigManager.isByocConfigured(appContext)) {
+            val token = runBlocking {
+                tokenProviderRef?.invoke()
+                    ?: TokenRepository(appContext).getValidAccessToken(forceRefresh = false).takeIf { it.isNotBlank() }
+                    ?: com.clotube.app.auth.GoogleAuthRepository(appContext).getAccessToken().getOrNull()
+            }
+            if (!token.isNullOrBlank()) {
+                Log.d(TAG, "Using BYOC Bearer token for DriveWatchHistorySync")
+                return Drive.Builder(NetHttpTransport(), GsonFactory.getDefaultInstance()) { request ->
+                    request.headers.authorization = "Bearer $token"
+                }.setApplicationName("Clotube").build()
+            }
+            Log.e(TAG, "Cannot sync: BYOC is configured but no valid OAuth access token could be acquired")
+            return null
+        }
+
         val account = GoogleSignIn.getLastSignedInAccount(appContext)
         if (account == null) {
             val token = runBlocking {

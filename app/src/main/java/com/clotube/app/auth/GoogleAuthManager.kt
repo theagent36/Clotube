@@ -4,12 +4,16 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import androidx.activity.result.ActivityResultLauncher
+import com.clotube.app.data.ByocConfigManager
 import com.google.android.gms.auth.api.signin.GoogleSignIn
 import com.google.android.gms.auth.api.signin.GoogleSignInAccount
 import com.google.android.gms.auth.api.signin.GoogleSignInClient
 import com.google.android.gms.auth.api.signin.GoogleSignInOptions
 import com.google.android.gms.common.api.Scope
 import com.google.api.services.drive.DriveScopes
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 object GoogleAuthManager {
     const val REQUEST_CODE_DRIVE_PERMISSIONS = 9002
@@ -30,6 +34,7 @@ object GoogleAuthManager {
     }
 
     fun hasRequiredScopes(context: Context): Boolean {
+        if (ByocConfigManager.hasActiveByocSession(context)) return true
         val account = GoogleSignIn.getLastSignedInAccount(context) ?: return false
         return GoogleSignIn.hasPermissions(account, Scope(DriveScopes.DRIVE))
     }
@@ -38,6 +43,7 @@ object GoogleAuthManager {
      * Checks if full Drive scope is active on the account.
      */
     fun hasAllDrivePermissions(context: Context, account: GoogleSignInAccount? = null): Boolean {
+        if (ByocConfigManager.hasActiveByocSession(context)) return true
         val acc = account ?: GoogleSignIn.getLastSignedInAccount(context) ?: return false
         return GoogleSignIn.hasPermissions(acc, Scope(DriveScopes.DRIVE))
     }
@@ -56,6 +62,9 @@ object GoogleAuthManager {
     }
 
     fun signOut(context: Context, onComplete: () -> Unit = {}) {
+        CoroutineScope(Dispatchers.IO).launch {
+            ByocConfigManager.clearSession(context)
+        }
         getGoogleSignInClient(context).signOut().addOnCompleteListener {
             onComplete()
         }

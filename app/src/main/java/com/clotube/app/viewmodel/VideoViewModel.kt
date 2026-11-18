@@ -276,6 +276,33 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             android.util.Log.w("VideoViewModel", "WatchlistManager.ensureLoaded on startup: ${e.message}")
         }
 
+        // Hydrate active BYOC session immediately if present
+        if (com.clotube.app.data.ByocConfigManager.hasActiveByocSession(getApplication())) {
+            viewModelScope.launch(Dispatchers.IO) {
+                val session = com.clotube.app.data.ByocConfigManager.getSession(getApplication())
+                if (session != null && (session.refreshToken.isNotBlank() || session.accessToken.isNotBlank())) {
+                    ProfileManager.registerOrActivateProfile(
+                        getApplication(),
+                        email = session.userEmail,
+                        displayName = session.userName,
+                        photoUrl = session.userAvatarUrl
+                    )
+                    withContext(Dispatchers.Main) {
+                        _uiState.update {
+                            it.copy(
+                                isSignedIn = true,
+                                userEmail = session.userEmail,
+                                userName = session.userName,
+                                userAvatarUrl = session.userAvatarUrl,
+                                accessToken = session.accessToken
+                            )
+                        }
+                        checkFolderOnboarding()
+                    }
+                }
+            }
+        }
+
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 ProfileManager.ensureLoaded(getApplication())
@@ -1554,15 +1581,31 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         DriveWatchHistorySync.setOnAuthFailureListener {
             tokenRepository.invalidateAndForceConsent()
         }
-        val lastAccount = GoogleSignIn.getLastSignedInAccount(getApplication())
-        if (lastAccount != null && com.clotube.app.auth.GoogleAuthManager.hasAllDrivePermissions(getApplication(), lastAccount)) {
-            _uiState.update {
-                it.copy(
-                    isSignedIn = true,
-                    userEmail = lastAccount.email,
-                    userName = lastAccount.displayName,
-                    userAvatarUrl = lastAccount.photoUrl?.toString()
-                )
+        val hasByocSession = com.clotube.app.data.ByocConfigManager.hasActiveByocSession(getApplication())
+        if (hasByocSession) {
+            val session = com.clotube.app.data.ByocConfigManager.sessionFlow.value
+            if (session != null) {
+                _uiState.update {
+                    it.copy(
+                        isSignedIn = true,
+                        userEmail = session.userEmail,
+                        userName = session.userName,
+                        userAvatarUrl = session.userAvatarUrl,
+                        accessToken = session.accessToken
+                    )
+                }
+            }
+        } else {
+            val lastAccount = GoogleSignIn.getLastSignedInAccount(getApplication())
+            if (lastAccount != null && com.clotube.app.auth.GoogleAuthManager.hasAllDrivePermissions(getApplication(), lastAccount)) {
+                _uiState.update {
+                    it.copy(
+                        isSignedIn = true,
+                        userEmail = lastAccount.email,
+                        userName = lastAccount.displayName,
+                        userAvatarUrl = lastAccount.photoUrl?.toString()
+                    )
+                }
             }
         }
         observePlaybackHistory()
@@ -1647,8 +1690,9 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             // Step 2: Check authentication & perform single coordinated background refresh
+            val hasByocSession = com.clotube.app.data.ByocConfigManager.hasActiveByocSession(getApplication())
             val lastAccount = GoogleSignIn.getLastSignedInAccount(getApplication())
-            if (lastAccount == null || !com.clotube.app.auth.GoogleAuthManager.hasAllDrivePermissions(getApplication(), lastAccount)) {
+            if (!hasByocSession && (lastAccount == null || !com.clotube.app.auth.GoogleAuthManager.hasAllDrivePermissions(getApplication(), lastAccount))) {
                 if (!hasCachedData) {
                     _moviesState.value = emptyList()
                     _moviesList.value = emptyList()
@@ -1723,6 +1767,34 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun checkInitialAuthState() {
+        if (com.clotube.app.data.ByocConfigManager.hasActiveByocSession(getApplication())) {
+            viewModelScope.launch(Dispatchers.IO) {
+                val session = com.clotube.app.data.ByocConfigManager.getSession(getApplication())
+                if (session != null && (session.refreshToken.isNotBlank() || session.accessToken.isNotBlank())) {
+                    ProfileManager.registerOrActivateProfile(
+                        getApplication(),
+                        email = session.userEmail,
+                        displayName = session.userName,
+                        photoUrl = session.userAvatarUrl
+                    )
+                    withContext(Dispatchers.Main) {
+                        _uiState.update {
+                            it.copy(
+                                isSignedIn = true,
+                                userEmail = session.userEmail,
+                                userName = session.userName,
+                                userAvatarUrl = session.userAvatarUrl,
+                                accessToken = session.accessToken
+                            )
+                        }
+                        checkFolderOnboarding()
+                    }
+                    return@launch
+                }
+            }
+            return
+        }
+
         val lastAccount = GoogleSignIn.getLastSignedInAccount(getApplication())
         if (lastAccount != null && com.clotube.app.auth.GoogleAuthManager.hasAllDrivePermissions(getApplication(), lastAccount)) {
             viewModelScope.launch(Dispatchers.IO) {
@@ -1888,7 +1960,52 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /**
+     * Initiates Bring Your Own Cloud (BYOC) OAuth 2.0 loopback + PKCE sign-in flow.
+     */
+    fun signInWithByoc(context: Context) {
+        viewModelScope.launch {
+            _uiState.update { it.copy(isLoading = true, errorMessage = null) }
+            val result = withContext(Dispatchers.IO) {
+                com.clotube.app.auth.ByocOAuthManager.signInWithByoc(context)
+            }
+            result.onSuccess { session ->
+                _uiState.update {
+                    it.copy(
+                        isLoading = false,
+                        isSignedIn = true,
+                        userEmail = session.userEmail,
+                        userName = session.userName,
+                        userAvatarUrl = session.userAvatarUrl,
+                        accessToken = session.accessToken,
+                        errorMessage = null
+                    )
+                }
+                withContext(Dispatchers.IO) {
+                    ProfileManager.registerOrActivateProfile(
+                        getApplication(),
+                        email = session.userEmail,
+                        displayName = session.userName,
+                        photoUrl = session.userAvatarUrl
+                    )
+                }
+                checkFolderOnboarding()
+            }.onFailure { error ->
+                Log.e(TAG, "BYOC Sign-in failed: ${error.message}", error)
+                _uiState.update {
+                    it.copy(
+                        isLoading = false,
+                        errorMessage = error.localizedMessage ?: "Custom OAuth sign-in failed"
+                    )
+                }
+            }
+        }
+    }
+
     fun signOut() {
+        viewModelScope.launch(Dispatchers.IO) {
+            com.clotube.app.data.ByocConfigManager.clearSession(getApplication())
+        }
         authRepository.signOut {
             folderManager.resetSessionCache()
             driveWatchHistorySync.invalidateCache()

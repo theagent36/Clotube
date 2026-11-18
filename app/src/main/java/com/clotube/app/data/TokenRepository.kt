@@ -29,6 +29,20 @@ class TokenRepository(private val context: Context) {
 
     suspend fun getValidAccessToken(forceRefresh: Boolean = false): String = withContext(Dispatchers.IO) {
         val now = System.currentTimeMillis()
+
+        // 0. BYOC Custom OAuth Delegation (Never invoke Google Play Services when BYOC is active)
+        if (ByocConfigManager.isByocConfigured(context)) {
+            val byocToken = com.clotube.app.auth.ByocOAuthManager.getValidByocAccessToken(context, forceRefresh)
+            if (byocToken.isNotBlank()) {
+                lastKnownToken = byocToken
+                lastTokenFetchTimeMs = now
+                Log.d(TAG, "getValidAccessToken: Returning BYOC OAuth token")
+                return@withContext byocToken
+            }
+            Log.w(TAG, "getValidAccessToken: BYOC is configured but token could not be acquired")
+            return@withContext ""
+        }
+
         if (!forceRefresh && lastKnownToken.isNotBlank() && (now - lastTokenFetchTimeMs < 50 * 60 * 1000L)) {
             Log.d(TAG, "getValidAccessToken: Returning in-memory cached token (age=${(now - lastTokenFetchTimeMs) / 1000}s)")
             return@withContext lastKnownToken

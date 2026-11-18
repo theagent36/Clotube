@@ -3,6 +3,7 @@ package com.clotube.app.ui.screens
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -17,6 +18,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Cloud
@@ -24,9 +26,11 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -35,14 +39,17 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.clotube.app.R
+import com.clotube.app.data.ByocConfigManager
 import com.clotube.app.ui.components.ByocSetupBottomSheet
 import com.clotube.app.ui.components.ClotubeGlyph
+import com.clotube.app.viewmodel.VideoViewModel
 
 /**
  * Minimalist, unified centered authentication landing screen matching the Dark Cinema theme (#07090E).
@@ -52,9 +59,20 @@ import com.clotube.app.ui.components.ClotubeGlyph
 fun ConnectDriveScreen(
     isLoading: Boolean = false,
     errorMessage: String? = null,
-    onConnectClick: () -> Unit
+    viewModel: VideoViewModel? = null,
+    onConnectClick: () -> Unit = {}
 ) {
+    val context = LocalContext.current
+    val byocConfig by ByocConfigManager.configFlow.collectAsState()
     var showByocSheet by remember { mutableStateOf(false) }
+
+    val handleConnect: () -> Unit = {
+        if (byocConfig.isEnabled && byocConfig.clientId.isNotBlank() && viewModel != null) {
+            viewModel.signInWithByoc(context)
+        } else {
+            onConnectClick()
+        }
+    }
 
     Box(
         modifier = Modifier
@@ -94,11 +112,39 @@ fun ConnectDriveScreen(
                 modifier = Modifier.padding(horizontal = 16.dp)
             )
 
-            Spacer(modifier = Modifier.height(32.dp))
+            Spacer(modifier = Modifier.height(28.dp))
+
+            // Subtle Pill Badge for Active Custom OAuth
+            if (byocConfig.isEnabled && byocConfig.clientId.isNotBlank()) {
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = Color(0xFF1E293B),
+                    border = BorderStroke(1.dp, Color(0xFF38BDF8).copy(alpha = 0.35f)),
+                    modifier = Modifier.padding(bottom = 14.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(6.dp)
+                                .background(Color(0xFF38BDF8), CircleShape)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "Custom OAuth Active • Project: ${byocConfig.projectId}",
+                            color = Color(0xFF38BDF8),
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                }
+            }
 
             // Connect Button: "Connect Google Drive"
             Button(
-                onClick = onConnectClick,
+                onClick = handleConnect,
                 enabled = !isLoading,
                 modifier = Modifier
                     .fillMaxWidth()
