@@ -53,6 +53,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -110,6 +111,7 @@ enum class WatchlistFilter(val displayName: String, val status: WatchlistStatus?
 /**
  * Resolved presentation model for a deduplicated Watchlist card.
  */
+@androidx.annotation.Keep
 private data class ResolvedWatchlistCardItem(
     val dedupKey: String,
     val entry: WatchlistEntry,
@@ -117,6 +119,16 @@ private data class ResolvedWatchlistCardItem(
     val matchedDriveSeries: TvSeries?,
     val isInDrive: Boolean,
     val liveDrivePoster: String?
+)
+
+/**
+ * Asynchronously computed UI state model for WatchlistScreen.
+ */
+@androidx.annotation.Keep
+private data class WatchlistComputedState(
+    val isLoading: Boolean = false,
+    val resolvedItems: List<ResolvedWatchlistCardItem> = emptyList(),
+    val totalSavedCount: Int = 0
 )
 
 /**
@@ -146,66 +158,140 @@ fun WatchlistScreen(
     var itemForBottomSheet by remember { mutableStateOf<WatchlistEntry?>(null) }
     var itemForExternalSheet by remember { mutableStateOf<WatchlistEntry?>(null) }
 
-    val resolvedItems = remember(revision, selectedFilter, moviesList, seriesList) {
-        val rawActive = WatchlistManager.getActiveItems(selectedFilter.status)
-        val map = LinkedHashMap<String, ResolvedWatchlistCardItem>()
-
-        for (entry in rawActive) {
-            val matchedDriveMovie = DriveCatalogMatcher.findMatchingDriveMovie(moviesList, entry.id, entry.title)
-            val matchedDriveSeries = if (matchedDriveMovie == null) {
-                DriveCatalogMatcher.findMatchingDriveSeries(seriesList, entry.id, entry.title)
-            } else null
-            val isInDrive = matchedDriveMovie != null || matchedDriveSeries != null
-            val liveDrivePoster = matchedDriveMovie?.thumbnailUrl?.ifBlank { null }
-                ?: matchedDriveSeries?.thumbnailUrl?.ifBlank { null }
-                ?: matchedDriveSeries?.posterUrl?.ifBlank { null }
-
-            val dedupKey = matchedDriveMovie?.id
-                ?: matchedDriveSeries?.id
-                ?: WatchlistManager.normalizeTitle(entry.title).ifBlank { entry.id }
-
-            val existing = map[dedupKey]
-            if (existing == null) {
-                map[dedupKey] = ResolvedWatchlistCardItem(
-                    dedupKey = dedupKey,
-                    entry = entry,
-                    matchedDriveMovie = matchedDriveMovie,
-                    matchedDriveSeries = matchedDriveSeries,
-                    isInDrive = isInDrive,
-                    liveDrivePoster = liveDrivePoster
-                )
-            } else {
-                val winnerEntry = WatchlistManager.mergeDuplicateEntries(existing.entry, entry)
-                val bestPoster = liveDrivePoster ?: existing.liveDrivePoster
-                val bestMovie = matchedDriveMovie ?: existing.matchedDriveMovie
-                val bestSeries = matchedDriveSeries ?: existing.matchedDriveSeries
-                map[dedupKey] = ResolvedWatchlistCardItem(
-                    dedupKey = dedupKey,
-                    entry = winnerEntry,
-                    matchedDriveMovie = bestMovie,
-                    matchedDriveSeries = bestSeries,
-                    isInDrive = isInDrive || existing.isInDrive,
-                    liveDrivePoster = bestPoster
+    // Single-pass asynchronous matching running on Dispatchers.Default with O(1) indexed lookups
+    val watchlistUiData by produceState(
+        initialValue = WatchlistComputedState(isLoading = true),
+        key1 = revision,
+        key2 = selectedFilter,
+        key3 = moviesList to seriesList
+    ) {
+        value = withContext(Dispatchers.Default) {
+            val rawAll = WatchlistManager.getActiveItems(null)
+            if (rawAll.isEmpty()) {
+                return@withContext WatchlistComputedState(
+                    isLoading = false,
+                    resolvedItems = emptyList(),
+                    totalSavedCount = 0
                 )
             }
-        }
 
-        map.values.toList()
+            // O(1) Lookups for exact matches
+            val moviesById = HashMap<String, Movie>(moviesList.size * 2)
+            for (m in moviesList) {
+                moviesById[m.id] = m
+                val trimmed = m.id.trim()
+                if (trimmed != m.id) moviesById[trimmed] = m
+                moviesById["drive_${m.id}"] = m
+            }
+
+            val moviesByNormTitle = HashMap<String, Movie>(moviesList.size)
+            for (m in moviesList) {
+                val norm = WatchlistManager.normalizeTitle(m.title)
+                if (norm.isNotBlank() && !moviesByNormTitle.containsKey(norm)) {
+                    moviesByNormTitle[norm] = m
+                }
+            }
+
+            val seriesById = HashMap<String, TvSeries>(seriesList.size * 2)
+            for (s in seriesList) {
+                seriesById[s.id] = s
+                val trimmed = s.id.trim()
+                if (trimmed != s.id) seriesById[trimmed] = s
+                seriesById["drive_${s.id}"] = s
+            }
+
+            val seriesByNormTitle = HashMap<String, TvSeries>(seriesList.size)
+            for (s in seriesList) {
+                val norm = WatchlistManager.normalizeTitle(s.title)
+                if (norm.isNotBlank() && !seriesByNormTitle.containsKey(norm)) {
+                    seriesByNormTitle[norm] = s
+                }
+            }
+
+            fun matchMovieFast(targetId: String, targetTitle: String, normTitle: String): Movie? {
+                val cleanId = targetId.trim()
+                if (cleanId.isNotBlank() && !cleanId.startsWith("tmdb_") && !cleanId.startsWith("imdb_") && !cleanId.startsWith("ext_")) {
+                    moviesById[cleanId]?.let { return it }
+                    moviesById[cleanId.removePrefix("drive_")]?.let { return it }
+                }
+                if (normTitle.isNotBlank()) {
+                    moviesByNormTitle[normTitle]?.let { return it }
+                }
+                return DriveCatalogMatcher.findMatchingDriveMovie(moviesList, targetId, targetTitle)
+            }
+
+            fun matchSeriesFast(targetId: String, targetTitle: String, normTitle: String): TvSeries? {
+                val cleanId = targetId.trim()
+                if (cleanId.isNotBlank() && !cleanId.startsWith("tmdb_") && !cleanId.startsWith("imdb_") && !cleanId.startsWith("ext_")) {
+                    seriesById[cleanId]?.let { return it }
+                    seriesById[cleanId.removePrefix("drive_")]?.let { return it }
+                }
+                if (normTitle.isNotBlank()) {
+                    seriesByNormTitle[normTitle]?.let { return it }
+                }
+                return DriveCatalogMatcher.findMatchingDriveSeries(seriesList, targetId, targetTitle)
+            }
+
+            val filterStatus = selectedFilter.status
+            val allSeenKeys = HashSet<String>(rawAll.size)
+            val filteredMap = LinkedHashMap<String, ResolvedWatchlistCardItem>()
+
+            for (entry in rawAll) {
+                val normTitle = WatchlistManager.normalizeTitle(entry.title)
+                val matchedDriveMovie = matchMovieFast(entry.id, entry.title, normTitle)
+                val matchedDriveSeries = if (matchedDriveMovie == null) {
+                    matchSeriesFast(entry.id, entry.title, normTitle)
+                } else null
+
+                val isInDrive = matchedDriveMovie != null || matchedDriveSeries != null
+                val liveDrivePoster = matchedDriveMovie?.thumbnailUrl?.ifBlank { null }
+                    ?: matchedDriveSeries?.thumbnailUrl?.ifBlank { null }
+                    ?: matchedDriveSeries?.posterUrl?.ifBlank { null }
+
+                val dedupKey = matchedDriveMovie?.id
+                    ?: matchedDriveSeries?.id
+                    ?: normTitle.ifBlank { entry.id }
+
+                allSeenKeys.add(dedupKey)
+
+                if (filterStatus == null || entry.status == filterStatus) {
+                    val existing = filteredMap[dedupKey]
+                    if (existing == null) {
+                        filteredMap[dedupKey] = ResolvedWatchlistCardItem(
+                            dedupKey = dedupKey,
+                            entry = entry,
+                            matchedDriveMovie = matchedDriveMovie,
+                            matchedDriveSeries = matchedDriveSeries,
+                            isInDrive = isInDrive,
+                            liveDrivePoster = liveDrivePoster
+                        )
+                    } else {
+                        val winnerEntry = WatchlistManager.mergeDuplicateEntries(existing.entry, entry)
+                        val bestPoster = liveDrivePoster ?: existing.liveDrivePoster
+                        val bestMovie = matchedDriveMovie ?: existing.matchedDriveMovie
+                        val bestSeries = matchedDriveSeries ?: existing.matchedDriveSeries
+                        filteredMap[dedupKey] = ResolvedWatchlistCardItem(
+                            dedupKey = dedupKey,
+                            entry = winnerEntry,
+                            matchedDriveMovie = bestMovie,
+                            matchedDriveSeries = bestSeries,
+                            isInDrive = isInDrive || existing.isInDrive,
+                            liveDrivePoster = bestPoster
+                        )
+                    }
+                }
+            }
+
+            WatchlistComputedState(
+                isLoading = false,
+                resolvedItems = filteredMap.values.toList(),
+                totalSavedCount = allSeenKeys.size
+            )
+        }
     }
 
-    val totalSavedCount = remember(revision, moviesList, seriesList) {
-        val rawAll = WatchlistManager.getActiveItems(null)
-        val seen = HashSet<String>()
-        for (entry in rawAll) {
-            val m = DriveCatalogMatcher.findMatchingDriveMovie(moviesList, entry.id, entry.title)
-            val s = if (m == null) DriveCatalogMatcher.findMatchingDriveSeries(seriesList, entry.id, entry.title) else null
-            val key = m?.id
-                ?: s?.id
-                ?: WatchlistManager.normalizeTitle(entry.title).ifBlank { entry.id }
-            seen.add(key)
-        }
-        seen.size
-    }
+    val resolvedItems = watchlistUiData.resolvedItems
+    val totalSavedCount = watchlistUiData.totalSavedCount
 
     val infiniteTransition = rememberInfiniteTransition(label = "sync_rotation")
     val syncRotation by infiniteTransition.animateFloat(
@@ -330,7 +416,18 @@ fun WatchlistScreen(
             // ========================================================
             // 3. CONTENT GRID OR EMPTY STATE
             // ========================================================
-            if (resolvedItems.isEmpty()) {
+            if (watchlistUiData.isLoading && resolvedItems.isEmpty()) {
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(36.dp),
+                        color = AccentBlue,
+                        strokeWidth = 2.5.dp
+                    )
+                }
+            } else if (resolvedItems.isEmpty()) {
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -577,10 +674,17 @@ private fun WatchlistGridCard(
                 .border(BorderStroke(0.5.dp, SurfaceBorder), RoundedCornerShape(10.dp))
         ) {
             if (effectivePosterUrl.isNotBlank()) {
+                val cacheKey = when {
+                    matchingDrivePoster != null && (entry.mediaType == WatchlistMediaType.SERIES) -> "series_poster_${entry.id}"
+                    matchingDrivePoster != null -> "movie_thumb_${entry.id}"
+                    else -> "watchlist_art_${entry.id}"
+                }
                 AsyncImage(
                     model = ImageRequest.Builder(LocalContext.current)
                         .data(effectivePosterUrl)
                         .crossfade(180)
+                        .memoryCacheKey(cacheKey)
+                        .diskCacheKey(cacheKey)
                         .build(),
                     contentDescription = entry.title,
                     contentScale = ContentScale.Crop,

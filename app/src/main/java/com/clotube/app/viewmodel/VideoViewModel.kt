@@ -72,6 +72,10 @@ import com.clotube.app.data.WatchlistManager
 import com.clotube.app.model.WatchlistMediaType
 import com.clotube.app.model.WatchlistStatus
 import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -297,7 +301,6 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                                 accessToken = session.accessToken
                             )
                         }
-                        checkFolderOnboarding()
                     }
                 }
             }
@@ -324,10 +327,10 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                 _isHistoryLoaded.value = true
             }
 
-            // Step 2: Background Drive sync with defensive timeout
+            // Step 2: Background Drive sync with cooldown deduplication
             try {
                 withTimeoutOrNull(6000L) {
-                    driveWatchHistorySync.syncFromCloud(playbackHistoryManager.dataStore)
+                    syncFromCloud(force = false)
                 }
             } catch (e: Exception) {
                 android.util.Log.w("VideoViewModel", "Background boot sync skipped/timed out: ${e.message}")
@@ -380,6 +383,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         val token = tokenRepository.getValidAccessToken(forceRefresh)
         if (token.isNotBlank()) {
             _uiState.update { it.copy(accessToken = token) }
+            com.clotube.app.ClotubeApp.cachedBearerToken = token
             return@withContext token
         }
         val repoToken = if (forceRefresh) {
@@ -390,6 +394,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         } ?: getAccessToken()
         if (!repoToken.isNullOrBlank()) {
             _uiState.update { it.copy(accessToken = repoToken) }
+            com.clotube.app.ClotubeApp.cachedBearerToken = repoToken
             return@withContext repoToken
         }
         ""
@@ -1549,9 +1554,30 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun syncFromCloud() {
+    private val isSyncingFromCloud = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val lastCloudSyncTimeMs = java.util.concurrent.atomic.AtomicLong(0L)
+    private val CLOUD_SYNC_COOLDOWN_MS = 10_000L
+
+    fun syncFromCloud(force: Boolean = false) {
+        val now = System.currentTimeMillis()
+        val lastSync = lastCloudSyncTimeMs.get()
+        if (!force && (now - lastSync < CLOUD_SYNC_COOLDOWN_MS)) {
+            android.util.Log.d(TAG, "Skipping duplicate syncFromCloud (cooldown active: ${now - lastSync}ms)")
+            return
+        }
+        if (!isSyncingFromCloud.compareAndSet(false, true)) {
+            android.util.Log.d(TAG, "Skipping concurrent syncFromCloud (already in flight)")
+            return
+        }
         viewModelScope.launch(Dispatchers.IO) {
-            playbackHistoryManager.syncFromCloud()
+            try {
+                lastCloudSyncTimeMs.set(System.currentTimeMillis())
+                playbackHistoryManager.syncFromCloud()
+            } catch (e: Exception) {
+                android.util.Log.w(TAG, "syncFromCloud error: ${e.message}")
+            } finally {
+                isSyncingFromCloud.set(false)
+            }
         }
     }
 
@@ -1563,8 +1589,118 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
 
     val filterChips = listOf("All", "Movies", "TV Series")
     private var catalogLoadingJob: Job? = null
+    private var diskHydrationJob: Job? = null
+    private var enrichmentJob: Job? = null
+
+    private fun hydrateFromDiskCacheImmediately(): Job {
+        return viewModelScope.launch(Dispatchers.IO) {
+            try {
+                // Ensure profile registry and metadata disk cache are fully initialized before disk reads
+                com.clotube.app.data.ProfileManager.ensureLoaded(getApplication())
+                com.clotube.app.data.MetadataDiskCache.ensureLoaded(getApplication())
+
+                if (com.clotube.app.data.ProfileManager.activeProfileEmail.value.isNullOrBlank()) {
+                    val byocEmail = com.clotube.app.data.ByocConfigManager.getSession(getApplication())?.userEmail
+                    val googleEmail = com.google.android.gms.auth.api.signin.GoogleSignIn.getLastSignedInAccount(getApplication())?.email
+                    val resolvedEmail = byocEmail?.ifBlank { null } ?: googleEmail?.ifBlank { null }
+                    if (!resolvedEmail.isNullOrBlank()) {
+                        com.clotube.app.data.ProfileManager.registerOrActivateProfile(
+                            context = getApplication(),
+                            email = resolvedEmail,
+                            displayName = "",
+                            photoUrl = null
+                        )
+                    }
+                }
+
+                val cached = catalogCacheManager.getCachedCatalog()
+                val diskSeries = loadCatalogFromDisk(getApplication())
+                val combinedSeries = if (diskSeries.isNotEmpty()) {
+                    val diskMap = diskSeries.associateBy { it.id }
+                    val mergedFromCache = cached.series.map { s ->
+                        val d = diskMap[s.id]
+                        if (d != null && d.seasons.isNotEmpty() && s.seasons.isEmpty()) d else s
+                    }
+                    val freshIds = cached.series.map { it.id }.toSet()
+                    mergedFromCache + diskSeries.filter { it.id !in freshIds }
+                } else {
+                    cached.series
+                }
+
+                val hasCachedData = cached.movies.isNotEmpty() || combinedSeries.isNotEmpty()
+                if (hasCachedData) {
+                    val progressMap = _uiState.value.watchProgressMap
+                    val mappedMovies = cached.movies.map { movie ->
+                        val cleanTitle = when {
+                            movie.displayTitle.equals("My People, My Homeland", ignoreCase = true) -> "The Vast of Night"
+                            movie.displayTitle.contains("uindex", ignoreCase = true) || movie.displayTitle.startsWith("www", ignoreCase = true) -> {
+                                val (q, _) = com.clotube.app.data.metadata.OnlineMetadataResolver.extractMovieQueryAndYear(movie.displayTitle)
+                                if (q.isNotBlank()) q else movie.displayTitle
+                            }
+                            else -> movie.displayTitle
+                        }
+                        val prog = progressMap[movie.id]
+                        val updated = movie.copy(displayTitle = cleanTitle)
+                        if (prog != null) updated.copy(watchProgressFraction = prog.progressFraction) else updated
+                    }
+                    val mappedSeries = combinedSeries.map { series ->
+                        val seriesEpProgress = progressMap.values
+                            .filter { it.seriesId == series.id || series.seasons.any { s -> s.episodes.any { ep -> ep.id == it.fileId } } }
+                            .maxByOrNull { it.lastWatchedTimestamp }
+                        val seriesFraction = seriesEpProgress?.progressFraction ?: 0f
+
+                        val updatedSeasons = series.seasons.map { season ->
+                            season.copy(
+                                episodes = season.episodes.map { ep ->
+                                    val epProg = progressMap[ep.id]
+                                    if (epProg != null) ep.copy(watchProgressFraction = epProg.progressFraction) else ep
+                                }
+                            )
+                        }
+                        series.copy(watchProgressFraction = seriesFraction, seasons = updatedSeasons)
+                    }
+
+                    val mappedDomainMovies = mappedMovies.map { it.toMovie() }
+                    _moviesState.value = mappedMovies
+                    _moviesList.value = mappedDomainMovies
+                    _seriesState.value = mappedSeries
+                    _isInitialLoading.value = false
+
+                    val hero = mappedMovies.firstOrNull()
+                    val heroShow = mappedSeries.firstOrNull()
+
+                    _uiState.update { current ->
+                        current.copy(
+                            videos = mappedMovies,
+                            movies = mappedDomainMovies,
+                            moviesList = mappedMovies,
+                            filteredVideos = applyFilterAndSearch(mappedMovies, current.selectedFilter, current.searchQuery),
+                            tvSeriesList = mappedSeries,
+                            heroItem = hero,
+                            heroSeries = heroShow,
+                            isInitialLoading = false,
+                            isLoading = false
+                        )
+                    }
+                    android.util.Log.d(TAG, "Frame-1 disk cache hydrated: ${mappedMovies.size} movies, ${mappedSeries.size} series")
+                } else {
+                    _isInitialLoading.value = true
+                    _uiState.update { it.copy(isInitialLoading = true) }
+                    android.util.Log.d(TAG, "Disk cache is empty; keeping isInitialLoading=true for first launch onboarding")
+                }
+            } catch (e: Exception) {
+                android.util.Log.e(TAG, "Failed hydrating disk cache: ${e.message}", e)
+                val hasContent = _moviesState.value.isNotEmpty() || _seriesState.value.isNotEmpty()
+                _isInitialLoading.value = !hasContent
+                _uiState.update { it.copy(isInitialLoading = !hasContent) }
+            }
+        }
+    }
 
     init {
+        // Instant Frame-1 Disk Cache Hydration
+        diskHydrationJob = hydrateFromDiskCacheImmediately()
+
         playbackHistoryManager.setTokenProvider { getValidAccessToken() }
         DriveWatchlistSync.setTokenProvider { getValidAccessToken() }
         playbackHistoryManager.nextEpisodeResolver = { sId, epId ->
@@ -1615,79 +1751,10 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun initStaleWhileRevalidateFlow() {
         viewModelScope.launch(Dispatchers.IO) {
-            // Step 1: Immediately emit cached catalog from disk (0ms delay)
-            val cached = catalogCacheManager.getCachedCatalog()
-            val diskSeries = loadCatalogFromDisk(getApplication())
-            val combinedSeries = if (diskSeries.isNotEmpty()) {
-                val diskMap = diskSeries.associateBy { it.id }
-                val mergedFromCache = cached.series.map { s ->
-                    val d = diskMap[s.id]
-                    if (d != null && d.seasons.isNotEmpty() && s.seasons.isEmpty()) d else s
-                }
-                val freshIds = cached.series.map { it.id }.toSet()
-                mergedFromCache + diskSeries.filter { it.id !in freshIds }
-            } else {
-                cached.series
-            }
+            // Await Frame-1 disk cache hydration
+            diskHydrationJob?.join()
 
-            val hasCachedData = cached.movies.isNotEmpty() || combinedSeries.isNotEmpty()
-            if (hasCachedData) {
-                val progressMap = _uiState.value.watchProgressMap
-                val mappedMovies = cached.movies.map { movie ->
-                    val cleanTitle = when {
-                        movie.displayTitle.equals("My People, My Homeland", ignoreCase = true) -> "The Vast of Night"
-                        movie.displayTitle.contains("uindex", ignoreCase = true) || movie.displayTitle.startsWith("www", ignoreCase = true) -> {
-                            val (q, _) = com.clotube.app.data.metadata.OnlineMetadataResolver.extractMovieQueryAndYear(movie.displayTitle)
-                            if (q.isNotBlank()) q else movie.displayTitle
-                        }
-                        else -> movie.displayTitle
-                    }
-                    val prog = progressMap[movie.id]
-                    val updated = movie.copy(displayTitle = cleanTitle)
-                    if (prog != null) updated.copy(watchProgressFraction = prog.progressFraction) else updated
-                }
-                val mappedSeries = combinedSeries.map { series ->
-                    val seriesEpProgress = progressMap.values
-                        .filter { it.seriesId == series.id || series.seasons.any { s -> s.episodes.any { ep -> ep.id == it.fileId } } }
-                        .maxByOrNull { it.lastWatchedTimestamp }
-                    val seriesFraction = seriesEpProgress?.progressFraction ?: 0f
-
-                    val updatedSeasons = series.seasons.map { season ->
-                        season.copy(
-                            episodes = season.episodes.map { ep ->
-                                val epProg = progressMap[ep.id]
-                                if (epProg != null) ep.copy(watchProgressFraction = epProg.progressFraction) else ep
-                            }
-                        )
-                    }
-                    series.copy(watchProgressFraction = seriesFraction, seasons = updatedSeasons)
-                }
-
-                val mappedDomainMovies = mappedMovies.map { it.toMovie() }
-                _moviesState.value = mappedMovies
-                _moviesList.value = mappedDomainMovies
-                _seriesState.value = mappedSeries
-                _isInitialLoading.value = false
-
-                val hero = mappedMovies.firstOrNull()
-                val heroShow = mappedSeries.firstOrNull()
-
-                _uiState.update { current ->
-                    current.copy(
-                        videos = mappedMovies,
-                        movies = mappedDomainMovies,
-                        moviesList = mappedMovies,
-                        filteredVideos = applyFilterAndSearch(mappedMovies, current.selectedFilter, current.searchQuery),
-                        tvSeriesList = mappedSeries,
-                        heroItem = hero,
-                        heroSeries = heroShow,
-                        isInitialLoading = false
-                    )
-                }
-            } else {
-                _isInitialLoading.value = true // Triggers shimmer only if cache is completely empty
-                _uiState.update { it.copy(isInitialLoading = true) }
-            }
+            val hasCachedData = _moviesState.value.isNotEmpty() || _seriesState.value.isNotEmpty()
 
             // Step 2: Check authentication & perform single coordinated background refresh
             val hasByocSession = com.clotube.app.data.ByocConfigManager.hasActiveByocSession(getApplication())
@@ -2048,6 +2115,9 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
      */
     fun checkFolderOnboarding() {
         viewModelScope.launch {
+            // Await disk cache hydration to prevent cold-start race
+            diskHydrationJob?.join()
+
             val hasContent = _moviesState.value.isNotEmpty() || _seriesState.value.isNotEmpty()
             if (!hasContent) {
                 _uiState.update { it.copy(isLoading = true, errorMessage = null) }
@@ -2293,6 +2363,109 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
 
             // Persist accumulated catalog once to unified local cache on Dispatchers.IO
             catalogCacheManager.saveCatalog(_moviesState.value, _seriesState.value)
+
+            // Phase 2: Non-Blocking Metadata Enrichment
+            enrichCatalogMetadataAsync()
+        }
+    }
+
+    fun enrichCatalogMetadataAsync() {
+        enrichmentJob?.cancel()
+        enrichmentJob = viewModelScope.launch(Dispatchers.IO) {
+            val semaphore = Semaphore(5)
+            val currentMovies = _moviesState.value
+            val currentSeries = _seriesState.value
+
+            if (currentMovies.isEmpty() && currentSeries.isEmpty()) return@launch
+
+            // 1. Enrich movies
+            val movieDeferreds = currentMovies.map { movie ->
+                async(Dispatchers.IO) {
+                    val needsEnrichment = movie.genreFormatted == "Movie" ||
+                            movie.genreFormatted.isBlank() ||
+                            movie.thumbnailUrl.contains("googleusercontent.com") ||
+                            movie.thumbnailUrl.contains("drive.google.com")
+                    if (!needsEnrichment) return@async movie
+
+                    semaphore.withPermit {
+                        try {
+                            val meta = OnlineMetadataResolver.resolveMovie(
+                                movie.displayTitle
+                            )
+                            if (meta.officialTitle.isNotBlank() || meta.posterUrl.isNotBlank()) {
+                                movie.copy(
+                                    displayTitle = meta.officialTitle.ifBlank { movie.displayTitle },
+                                    thumbnailUrl = meta.posterUrl.ifBlank { movie.thumbnailUrl },
+                                    genreFormatted = meta.genre.ifBlank { movie.genreFormatted }
+                                )
+                            } else movie
+                        } catch (e: Exception) {
+                            movie
+                        }
+                    }
+                }
+            }
+
+            // 2. Enrich series
+            val seriesDeferreds = currentSeries.map { show ->
+                async(Dispatchers.IO) {
+                    val needsEnrichment = show.posterUrl.isNullOrBlank() ||
+                            show.thumbnailUrl.isNullOrBlank() ||
+                            show.genreFormatted == "TV Series" ||
+                            show.genreFormatted.isBlank() ||
+                            show.posterUrl.orEmpty().contains("googleusercontent.com") ||
+                            show.posterUrl.orEmpty().contains("drive.google.com")
+                    if (!needsEnrichment) return@async show
+
+                    semaphore.withPermit {
+                        try {
+                            val meta = OnlineMetadataResolver.resolveSeries(show.title)
+                            if (meta.officialTitle.isNotBlank() || meta.posterUrl.isNotBlank()) {
+                                show.copy(
+                                    title = meta.officialTitle.ifBlank { show.title },
+                                    thumbnailUrl = meta.posterUrl.ifBlank { show.thumbnailUrl },
+                                    posterUrl = meta.posterUrl.ifBlank { show.posterUrl },
+                                    backdropUrl = meta.posterUrl.ifBlank { show.backdropUrl },
+                                    genreFormatted = meta.genres.ifBlank { show.genreFormatted }
+                                )
+                            } else show
+                        } catch (e: Exception) {
+                            show
+                        }
+                    }
+                }
+            }
+
+            val enrichedMovies = movieDeferreds.awaitAll()
+            val enrichedSeries = seriesDeferreds.awaitAll()
+
+            val progressMap = _uiState.value.watchProgressMap
+            val mappedMovies = enrichedMovies.map { movie ->
+                val prog = progressMap[movie.id]
+                if (prog != null) movie.copy(watchProgressFraction = prog.progressFraction) else movie
+            }
+            val mappedDomainMovies = mappedMovies.map { it.toMovie() }
+
+            _moviesState.value = mappedMovies
+            _moviesList.value = mappedDomainMovies
+            _seriesState.value = enrichedSeries
+
+            _uiState.update { current ->
+                val hero = current.heroItem ?: mappedMovies.firstOrNull()
+                val heroShow = current.heroSeries ?: enrichedSeries.firstOrNull()
+                current.copy(
+                    videos = mappedMovies,
+                    movies = mappedDomainMovies,
+                    moviesList = mappedMovies,
+                    filteredVideos = applyFilterAndSearch(mappedMovies, current.selectedFilter, current.searchQuery),
+                    tvSeriesList = enrichedSeries,
+                    heroItem = hero,
+                    heroSeries = heroShow
+                )
+            }
+
+            // Persist the enriched catalog back to CatalogCacheManager
+            catalogCacheManager.saveCatalog(mappedMovies, enrichedSeries)
         }
     }
 
@@ -2360,7 +2533,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             if (_isRefreshing.value) return@launch
             _isRefreshing.value = true
             try {
-                // 1. Perform direct remote scan bypassing memory cache
+                // 1. Perform direct remote scan bypassing memory cache (Phase 1: Fast Raw Emit)
                 val result = DriveCatalogScanner.performFreshBootScan()
 
                 if (result.movies.isNotEmpty() || result.series.isNotEmpty()) {
@@ -2372,7 +2545,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                     // 2. Overwrite unified disk cache with fresh results once on Dispatchers.IO
                     catalogCacheManager.saveCatalog(videoItems, result.series)
 
-                    // 3. Update UI state
+                    // 3. Update UI state immediately (Phase 1 fast raw emit)
                     _uiState.update { current ->
                         val heroMovie = current.heroItem ?: videoItems.firstOrNull()
                         val heroSeries = current.heroSeries ?: result.series.firstOrNull()
@@ -2388,10 +2561,35 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                             isInitialLoading = false
                         )
                     }
+
+                    // 4. Phase 2: Non-Blocking Metadata Enrichment
+                    val enrichedResult = DriveCatalogScanner.enrichCatalogMetadata(result, maxConcurrency = 5)
+                    if (enrichedResult.movies.isNotEmpty() || enrichedResult.series.isNotEmpty()) {
+                        val enrichedVideoItems = enrichedResult.movies.map { it.toVideoItem() }
+                        _moviesList.value = enrichedResult.movies
+                        _moviesState.value = enrichedVideoItems
+                        _seriesList.value = enrichedResult.series
+
+                        catalogCacheManager.saveCatalog(enrichedVideoItems, enrichedResult.series)
+
+                        _uiState.update { current ->
+                            val heroMovie = current.heroItem ?: enrichedVideoItems.firstOrNull()
+                            val heroSeries = current.heroSeries ?: enrichedResult.series.firstOrNull()
+                            current.copy(
+                                videos = enrichedVideoItems,
+                                movies = enrichedResult.movies,
+                                moviesList = enrichedVideoItems,
+                                tvSeriesList = enrichedResult.series,
+                                filteredVideos = applyFilterAndSearch(enrichedVideoItems, current.selectedFilter, current.searchQuery),
+                                heroItem = heroMovie,
+                                heroSeries = heroSeries
+                            )
+                        }
+                    }
                 }
 
-                // 4. Re-sync cloud watch history so Continue Watching & progress checkmarks are freshly hydrated
-                playbackHistoryManager.syncFromCloud()
+                // 5. Re-sync cloud watch history with cooldown
+                syncFromCloud()
             } catch (e: Exception) {
                 android.util.Log.e("VideoViewModel", "Fresh boot refresh failed: ${e.message}", e)
             } finally {
@@ -2509,6 +2707,9 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
 
                     // Persist accumulated catalog once to unified local cache
                     catalogCacheManager.saveCatalog(_moviesState.value, _seriesState.value)
+
+                    // Phase 2: Non-Blocking Metadata Enrichment
+                    enrichCatalogMetadataAsync()
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Catalog sync failed: ${e.message}", e)

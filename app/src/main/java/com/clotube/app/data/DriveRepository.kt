@@ -119,7 +119,7 @@ class DriveRepository(
                     val fileId = file.id ?: return@mapNotNull null
                     if (seenMovieIds.add(fileId)) {
                         val matchingSubs = findMatchingSubtitles(file.name, rootSubtitles)
-                        mapToFileVideoItem(file, externalSubtitles = matchingSubs)
+                        mapToFileVideoItem(file, externalSubtitles = matchingSubs, resolveOnlineMetadata = false)
                     } else null
                 }
 
@@ -280,15 +280,15 @@ class DriveRepository(
             // Resolve title: folder name is typically "Inception (2010)" or clean title
             val rawVideoName = primaryVideo.name.orEmpty()
             val targetName = if (folderName.isNotBlank() && !isGenericMovieStem(folderName)) folderName else rawVideoName
-            val movieMeta = com.clotube.app.data.metadata.OnlineMetadataResolver.resolveMovie(targetName)
-            val movieTitle = movieMeta.officialTitle
-            val finalThumbnail = movieMeta.posterUrl.ifBlank { localImageThumb ?: rawVideoThumb }
+            val movieTitle = cleanFolderMovieTitle(targetName)
+            val finalThumbnail = localImageThumb ?: rawVideoThumb
 
             val currentMovie = mapToFileVideoItem(
                 file = primaryVideo,
                 overrideTitle = movieTitle,
                 externalSubtitles = externalSubtitles,
-                overrideThumbnail = finalThumbnail
+                overrideThumbnail = finalThumbnail,
+                resolveOnlineMetadata = false
             )
 
             listOf(currentMovie) + nestedMovies
@@ -359,7 +359,7 @@ class DriveRepository(
                 batch.map { folder ->
                     async(Dispatchers.IO) {
                         try {
-                            mapToShowOverview(driveService, folder)
+                            mapToShowOverview(driveService, folder, resolveOnlineMetadata = false)
                         } catch (e: Exception) {
                             Log.e(TAG, "Error mapping series ${folder.name}", e)
                             null
@@ -391,19 +391,36 @@ class DriveRepository(
         lastList
     }
 
-    private suspend fun mapToShowOverview(driveService: Drive, folder: File): TvSeries = withContext(Dispatchers.IO) {
+    private suspend fun mapToShowOverview(
+        driveService: Drive,
+        folder: File,
+        resolveOnlineMetadata: Boolean = false
+    ): TvSeries = withContext(Dispatchers.IO) {
         val folderId = folder.id.orEmpty()
         val folderName = folder.name.orEmpty()
-        val seriesMeta = com.clotube.app.data.metadata.OnlineMetadataResolver.resolveSeries(folderName)
-        val cleanTitle = seriesMeta.officialTitle
-        val genre = seriesMeta.genres
         val rawThumb = folder.thumbnailLink?.replace("=s220", "=s800").orEmpty()
 
-        var finalThumb = seriesMeta.posterUrl.ifBlank { rawThumb }
+        val cleanTitle: String
+        val genre: String
+        val finalThumb: String
 
-        // If poster and folder thumbnail both returned empty, peek at first season or episode for artwork fallback
-        if (finalThumb.isBlank()) {
-            finalThumb = peekSeriesArtwork(driveService, folderId)
+        if (resolveOnlineMetadata) {
+            val seriesMeta = com.clotube.app.data.metadata.OnlineMetadataResolver.resolveSeries(folderName)
+            cleanTitle = seriesMeta.officialTitle.ifBlank { cleanSeriesTitle(folderName) }
+            genre = seriesMeta.genres.ifBlank { "TV Series" }
+            var thumb = seriesMeta.posterUrl.ifBlank { rawThumb }
+            if (thumb.isBlank()) {
+                thumb = peekSeriesArtwork(driveService, folderId)
+            }
+            finalThumb = thumb
+        } else {
+            cleanTitle = cleanSeriesTitle(folderName)
+            genre = "TV Series"
+            val norm = com.clotube.app.data.WatchlistManager.normalizeTitle(cleanTitle)
+            val cachedMeta = com.clotube.app.data.MetadataDiskCache.get("series:$cleanTitle")
+                ?: com.clotube.app.data.MetadataDiskCache.get("series_$norm")
+                ?: com.clotube.app.data.MetadataDiskCache.get("series:$norm")
+            finalThumb = cachedMeta?.posterUrl?.takeIf { it.isNotBlank() } ?: ""
         }
 
         TvSeries(
@@ -413,8 +430,8 @@ class DriveRepository(
             totalSeasonsFormatted = "TV Series",
             seasons = emptyList(), // Shallow!
             thumbnailUrl = finalThumb,
-            backdropUrl = seriesMeta.posterUrl.ifBlank { finalThumb },
-            posterUrl = seriesMeta.posterUrl.ifBlank { finalThumb }
+            backdropUrl = finalThumb,
+            posterUrl = finalThumb
         )
     }
 
@@ -429,15 +446,10 @@ class DriveRepository(
                 .execute()
 
             val files = result.files.orEmpty()
-            // Look for an image file first
+            // Look for an image file only (never a video file frame)
             val img = files.find { it.mimeType?.startsWith("image/") == true }
             if (img?.thumbnailLink != null) {
                 return@withContext img.thumbnailLink.replace("=s220", "=s1200")
-            }
-            // Look for a video file or season subfolder
-            val vid = files.find { it.mimeType?.startsWith("video/") == true }
-            if (vid?.thumbnailLink != null) {
-                return@withContext vid.thumbnailLink.replace("=s220", "=s800")
             }
             ""
         } catch (e: Exception) {
@@ -488,7 +500,8 @@ class DriveRepository(
         file: File,
         overrideTitle: String? = null,
         externalSubtitles: List<ExternalSubtitleTrack> = emptyList(),
-        overrideThumbnail: String? = null
+        overrideThumbnail: String? = null,
+        resolveOnlineMetadata: Boolean = false
     ): VideoItem {
         val id = file.id ?: ""
         val name = file.name ?: "Untitled Video"
@@ -511,19 +524,29 @@ class DriveRepository(
         }
 
         val targetMovieName = overrideTitle?.ifBlank { null } ?: name
-        val movieMeta = com.clotube.app.data.metadata.OnlineMetadataResolver.resolveMovie(targetMovieName)
-        val cleanTitle = movieMeta.officialTitle
+        val cleanTitle: String
+        val genreFormatted: String
+        val finalThumb: String
+
+        if (resolveOnlineMetadata) {
+            val movieMeta = com.clotube.app.data.metadata.OnlineMetadataResolver.resolveMovie(targetMovieName)
+            cleanTitle = movieMeta.officialTitle.ifBlank { cleanVideoTitle(targetMovieName) }
+            genreFormatted = movieMeta.genre.ifBlank { "Movie" }
+            finalThumb = if (!overrideThumbnail.isNullOrBlank()) {
+                overrideThumbnail
+            } else {
+                movieMeta.posterUrl.ifBlank { rawThumb }
+            }
+        } else {
+            cleanTitle = overrideTitle?.ifBlank { null } ?: cleanVideoTitle(targetMovieName)
+            genreFormatted = "Movie"
+            finalThumb = if (!overrideThumbnail.isNullOrBlank()) overrideThumbnail else rawThumb
+        }
+
         val durationFormatted = if (durationMillis > 0) formatTimestamp(durationMillis) else "00:00"
         val sizeFormatted = formatFileSize(sizeBytes)
-        val genreFormatted = movieMeta.genre
         val streamUri = DriveMediaSourceFactory.buildDriveStreamUri(id).toString()
         val hdrBadge = if (width >= 3840 || height >= 2160) "HDR10" else null
-
-        val finalThumb = if (!overrideThumbnail.isNullOrBlank()) {
-            overrideThumbnail
-        } else {
-            movieMeta.posterUrl.ifBlank { rawThumb }
-        }
 
         val bitrateFormatted = if (durationMillis > 0 && sizeBytes > 0) {
             val durationSec = durationMillis / 1000.0

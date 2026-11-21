@@ -37,6 +37,7 @@ Clotube-*.apk
 *.aab
 *.ap_
 *.dex
+*_source_bundle.md
 
 # Local source dumps & notes
 clotube_source_bundle.md

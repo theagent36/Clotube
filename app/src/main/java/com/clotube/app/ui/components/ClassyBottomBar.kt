@@ -1,29 +1,20 @@
 package com.clotube.app.ui.components
 
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.animateContentSize
-import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
-import androidx.compose.animation.core.tween
-import androidx.compose.animation.expandHorizontally
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkHorizontally
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -35,21 +26,27 @@ import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.clotube.app.ui.theme.AppleTvMotion
-import com.clotube.app.ui.theme.appleTvPressable
 import com.clotube.app.util.triggerTabTickHaptic
 import com.clotube.app.viewmodel.NavigationTab
 
@@ -65,7 +62,7 @@ data class ClassyNavTabItem(
 
 /**
  * Default tab definitions matching Clotube's core destinations:
- * "Home", "Recent", and "Settings".
+ * "Home", "Search", "Watchlist", "Recent", and "Settings".
  */
 val DefaultClassyNavTabs = listOf(
     ClassyNavTabItem(
@@ -145,82 +142,14 @@ fun ClassyBottomBar(
             ) {
                 tabs.forEach { navItem ->
                     val isSelected = selectedTab == navItem.tab
-                    ClassyBottomBarItem(
-                        item = navItem,
+                    ClassyBottomBarTab(
+                        label = navItem.label,
+                        icon = navItem.icon,
                         isSelected = isSelected,
                         onClick = {
                             view.triggerTabTickHaptic()
                             onTabSelected(navItem.tab)
                         }
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun ClassyBottomBarItem(
-    item: ClassyNavTabItem,
-    isSelected: Boolean,
-    onClick: () -> Unit
-) {
-    val iconTint by animateColorAsState(
-        targetValue = if (isSelected) Color.White else Color(0xFF64748B),
-        animationSpec = tween(durationMillis = 200),
-        label = "classy_tab_icon_tint"
-    )
-    val containerColor by animateColorAsState(
-        targetValue = if (isSelected) Color(0x1AFFFFFF) else Color.Transparent,
-        animationSpec = tween(durationMillis = 200),
-        label = "classy_tab_container"
-    )
-
-    val interactionSource = remember { MutableInteractionSource() }
-
-    Box(
-        modifier = Modifier
-            .appleTvPressable(interactionSource, pressedScale = 0.92f)
-            .height(42.dp)
-            .clip(RoundedCornerShape(21.dp))
-            .background(containerColor)
-            .clickable(
-                interactionSource = interactionSource,
-                indication = ripple(bounded = true, color = Color.White.copy(alpha = 0.15f))
-            ) { onClick() }
-            .animateContentSize(
-                animationSpec = spring(
-                    dampingRatio = Spring.DampingRatioMediumBouncy,
-                    stiffness = Spring.StiffnessMedium
-                )
-            )
-            .padding(horizontal = if (isSelected) 16.dp else 14.dp, vertical = 8.dp),
-        contentAlignment = Alignment.Center
-    ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.Center
-        ) {
-            Icon(
-                imageVector = item.icon,
-                contentDescription = item.label,
-                tint = iconTint,
-                modifier = Modifier.size(20.dp)
-            )
-
-            AnimatedVisibility(
-                visible = isSelected,
-                enter = expandHorizontally(animationSpec = AppleTvMotion.fluidSpring()) + fadeIn(),
-                exit = shrinkHorizontally(animationSpec = AppleTvMotion.fluidSpring()) + fadeOut()
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = item.label,
-                        color = Color.White,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold,
-                        maxLines = 1
                     )
                 }
             }
@@ -266,71 +195,164 @@ fun ClassyBottomBar(
             ) {
                 tabs.forEach { tab ->
                     val isSelected = selectedTab == tab
-                    val iconTint by animateColorAsState(
-                        targetValue = if (isSelected) Color.White else Color(0xFF64748B),
-                        animationSpec = tween(durationMillis = 200),
-                        label = "classy_home_tab_icon_tint"
-                    )
-                    val containerColor by animateColorAsState(
-                        targetValue = if (isSelected) Color(0x1AFFFFFF) else Color.Transparent,
-                        animationSpec = tween(durationMillis = 200),
-                        label = "classy_home_tab_container"
-                    )
-
-                    val interactionSource = remember { MutableInteractionSource() }
-
-                    Box(
-                        modifier = Modifier
-                            .appleTvPressable(interactionSource, pressedScale = 0.92f)
-                            .height(42.dp)
-                            .clip(RoundedCornerShape(21.dp))
-                            .background(containerColor)
-                            .clickable(
-                                interactionSource = interactionSource,
-                                indication = ripple(bounded = true, color = Color.White.copy(alpha = 0.15f))
-                            ) {
-                                view.triggerTabTickHaptic()
-                                onTabSelected(tab)
-                            }
-                            .animateContentSize(
-                                animationSpec = spring(
-                                    dampingRatio = Spring.DampingRatioMediumBouncy,
-                                    stiffness = Spring.StiffnessMedium
-                                )
-                            )
-                            .padding(horizontal = if (isSelected) 16.dp else 14.dp, vertical = 8.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.Center
-                        ) {
-                            Icon(
-                                imageVector = tab.icon,
-                                contentDescription = tab.title,
-                                tint = iconTint,
-                                modifier = Modifier.size(20.dp)
-                            )
-
-                            AnimatedVisibility(
-                                visible = isSelected,
-                                enter = expandHorizontally(animationSpec = AppleTvMotion.fluidSpring()) + fadeIn(),
-                                exit = shrinkHorizontally(animationSpec = AppleTvMotion.fluidSpring()) + fadeOut()
-                            ) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Text(
-                                        text = tab.title,
-                                        color = Color.White,
-                                        fontSize = 12.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        maxLines = 1
-                                    )
-                                }
-                            }
+                    ClassyBottomBarTab(
+                        label = tab.title,
+                        icon = tab.icon,
+                        isSelected = isSelected,
+                        onClick = {
+                            view.triggerTabTickHaptic()
+                            onTabSelected(tab)
                         }
-                    }
+                    )
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ClassyBottomBarItem(
+    item: ClassyNavTabItem,
+    isSelected: Boolean,
+    onClick: () -> Unit
+) {
+    ClassyBottomBarTab(
+        label = item.label,
+        icon = item.icon,
+        isSelected = isSelected,
+        onClick = onClick
+    )
+}
+
+/**
+ * Individual tab item in the floating capsule with spring-based press scaling,
+ * ripple-free touch response, and linear spring width/alpha expansion.
+ */
+@Composable
+private fun ClassyBottomBarTab(
+    label: String,
+    icon: ImageVector,
+    isSelected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val isPressed by interactionSource.collectIsPressedAsState()
+    val pressScale by animateFloatAsState(
+        targetValue = if (isPressed) 0.94f else 1f,
+        animationSpec = spring(
+            dampingRatio = 0.75f,
+            stiffness = 600f
+        ),
+        label = "tab_press_scale"
+    )
+
+    val selectionProgress by animateFloatAsState(
+        targetValue = if (isSelected) 1f else 0f,
+        animationSpec = spring(
+            dampingRatio = 0.82f,
+            stiffness = 520f
+        ),
+        label = "tab_selection_progress"
+    )
+
+    val containerColor = lerp(
+        start = Color.Transparent,
+        stop = Color(0x1AFFFFFF),
+        fraction = selectionProgress.coerceIn(0f, 1f)
+    )
+    val iconTint = lerp(
+        start = Color(0xFF64748B),
+        stop = Color.White,
+        fraction = selectionProgress.coerceIn(0f, 1f)
+    )
+    val horizontalPadding = (14f + 2f * selectionProgress.coerceIn(0f, 1f)).dp
+
+    Box(
+        modifier = modifier
+            .graphicsLayer {
+                scaleX = pressScale
+                scaleY = pressScale
+            }
+            .height(42.dp)
+            .clip(RoundedCornerShape(21.dp))
+            .background(containerColor)
+            .clickable(
+                interactionSource = interactionSource,
+                indication = null,
+                role = Role.Tab
+            ) { onClick() }
+            .padding(horizontal = horizontalPadding, vertical = 8.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = label,
+                tint = iconTint,
+                modifier = Modifier.size(20.dp)
+            )
+
+            ExpandableTabLabel(
+                label = label,
+                selectionProgress = selectionProgress
+            )
+        }
+    }
+}
+
+/**
+ * Smoothly expanding tab label measured at its unconstrained intrinsic single-line width,
+ * avoiding zero-width clips and enter/exit race conditions during rapid tab switching.
+ */
+@Composable
+private fun ExpandableTabLabel(
+    label: String,
+    selectionProgress: Float,
+    modifier: Modifier = Modifier,
+    startSpacing: Dp = 8.dp
+) {
+    val density = LocalDensity.current
+    val startSpacingPx = with(density) { startSpacing.roundToPx() }
+
+    Layout(
+        content = {
+            Text(
+                text = label,
+                color = Color.White,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                softWrap = false,
+                overflow = TextOverflow.Visible,
+                modifier = Modifier.graphicsLayer {
+                    alpha = ((selectionProgress - 0.15f) / 0.85f).coerceIn(0f, 1f)
+                }
+            )
+        },
+        modifier = modifier.clipToBounds()
+    ) { measurables, constraints ->
+        if (measurables.isEmpty()) {
+            return@Layout layout(0, 0) {}
+        }
+        val textMeasurable = measurables.first()
+        val textPlaceable = textMeasurable.measure(
+            constraints.copy(minWidth = 0, maxWidth = Constraints.Infinity)
+        )
+
+        val fullWidth = startSpacingPx + textPlaceable.width
+        val animatedWidth = (fullWidth * selectionProgress.coerceIn(0f, 1f)).toInt()
+        val height = textPlaceable.height
+
+        layout(width = animatedWidth, height = height) {
+            if (animatedWidth > startSpacingPx) {
+                textPlaceable.placeRelative(
+                    x = startSpacingPx,
+                    y = (height - textPlaceable.height) / 2
+                )
             }
         }
     }

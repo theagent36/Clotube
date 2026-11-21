@@ -69,9 +69,7 @@ class MainActivity : ComponentActivity() {
         if (result.resultCode == android.app.Activity.RESULT_OK) {
             android.util.Log.i("MainActivity", "User granted permissions! Refreshing library and syncing history...")
             videoViewModel.refreshCatalog(forceSync = true)
-            lifecycleScope.launch(Dispatchers.IO) {
-                videoViewModel.playbackHistoryManager.syncFromCloud()
-            }
+            videoViewModel.syncFromCloud(force = true)
         } else {
             android.util.Log.w("MainActivity", "User declined or dismissed permissions dialog")
         }
@@ -138,8 +136,6 @@ class MainActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         ClotubeNetworkMonitor.onAppForegrounded(applicationContext)
-        driveWatchHistorySync.pullFromCloudIfNeeded(dataStore, force = false)
-        com.clotube.app.data.DriveWatchlistSync.getInstance(applicationContext).triggerForegroundPull(force = false)
         videoViewModel.vlcPlayerManager.onAppResume()
     }
 
@@ -147,8 +143,8 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         ClotubeNetworkMonitor.onAppForegrounded(applicationContext)
         videoViewModel.vlcPlayerManager.onAppResume()
-        // Pull latest watch history and watchlist whenever the app comes to foreground
-        driveWatchHistorySync.pullFromCloudIfNeeded(dataStore, force = false)
+        // Pull latest watch history and watchlist whenever the app comes to foreground with cooldown deduplication
+        videoViewModel.syncFromCloud(force = false)
         com.clotube.app.data.DriveWatchlistSync.getInstance(applicationContext).triggerForegroundPull(force = false)
     }
 

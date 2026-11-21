@@ -102,6 +102,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -479,160 +481,33 @@ fun HomeScreen(
             viewModel.selectTab(NavigationTab.LIBRARY)
         }
 
-        if (uiState.currentTab == NavigationTab.RECENT) {
-            RecentScreen(
-                playbackHistoryManager = viewModel.playbackHistoryManager,
-                viewModel = viewModel,
-                onResumeItem = { historyItem ->
-                    val sId = if (historyItem.isSeries) {
-                        if (!historyItem.seriesId.isNullOrBlank()) historyItem.seriesId
-                        else uiState.tvSeriesList.find { s -> s.seasons.any { season -> season.episodes.any { ep -> ep.id == historyItem.fileId } } }?.id
-                    } else null
+        val isHomeVisible = uiState.currentTab == NavigationTab.LIBRARY
 
-                    if (onResumePlayback != null) {
-                        onResumePlayback(historyItem.fileId, historyItem.title, sId, historyItem.positionMs)
-                    } else {
-                        if (!sId.isNullOrBlank()) {
-                            val matchedSeries = uiState.tvSeriesList.find { it.id == sId }
-                            if (matchedSeries != null) {
-                                onSeriesSelected(matchedSeries)
-                                return@RecentScreen
-                            }
-                        }
-                        val matchedMovie = uiState.moviesList.find { it.id == historyItem.fileId }
-                            ?: uiState.videos.find { it.id == historyItem.fileId }
-                        if (matchedMovie != null) {
-                            onVideoSelected(matchedMovie)
-                        } else {
-                            onVideoSelected(
-                                VideoItem(
-                                    id = historyItem.fileId,
-                                    displayTitle = historyItem.title,
-                                    durationFormatted = formatTimestamp(historyItem.durationMs),
-                                    fileSizeFormatted = "",
-                                    genreFormatted = if (historyItem.isSeries) "Series" else "Movie",
-                                    resolutionBadge = "HD",
-                                    streamUri = DriveMediaSourceFactory.buildDriveStreamUri(historyItem.fileId).toString(),
-                                    thumbnailUrl = historyItem.thumbnailUrl.orEmpty()
-                                )
-                            )
-                        }
-                    }
-                },
+        Box(modifier = Modifier.fillMaxSize()) {
+            // 1. Persistently Mounted Home Feed
+            Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(bottom = paddingValues.calculateBottomPadding())
-            )
-        } else if (uiState.currentTab == NavigationTab.SEARCH) {
-            val effectiveDriveMovies = remember(uiState.movies, uiState.videos, driveMovies) {
-                uiState.movies
-                    .ifEmpty { uiState.videos.map { it.toMovie() } }
-                    .ifEmpty { driveMovies }
-            }
-            val effectiveDriveSeries = remember(uiState.tvSeriesList, driveSeries) {
-                uiState.tvSeriesList.ifEmpty { driveSeries }
-            }
-            SearchScreen(
-                viewModel = viewModel,
-                moviesList = effectiveDriveMovies,
-                seriesList = effectiveDriveSeries,
-                onMovieSelected = { movie ->
-                    if (onPlayMovie != null) {
-                        onPlayMovie(movie.id)
-                    } else {
-                        val matchedMovie = uiState.moviesList.find { it.id == movie.id }
-                            ?: uiState.videos.find { it.id == movie.id }
-                        if (matchedMovie != null) {
-                            onVideoSelected(matchedMovie)
-                        } else {
-                            onVideoSelected(
-                                VideoItem(
-                                    id = movie.id,
-                                    displayTitle = movie.title,
-                                    durationFormatted = movie.formattedDuration,
-                                    fileSizeFormatted = movie.fileSize,
-                                    genreFormatted = movie.genre,
-                                    resolutionBadge = movie.resolution,
-                                    streamUri = movie.streamUri,
-                                    thumbnailUrl = movie.thumbnailUrl.orEmpty()
-                                )
-                            )
-                        }
+                    .graphicsLayer {
+                        alpha = if (isHomeVisible) 1f else 0f
                     }
-                },
-                onSeriesSelected = { series ->
-                    if (onNavigateToSeriesDetail != null) {
-                        onNavigateToSeriesDetail(series.id, null)
-                    } else {
-                        onSeriesSelected(series)
-                    }
-                },
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(bottom = paddingValues.calculateBottomPadding())
-            )
-        } else if (uiState.currentTab == NavigationTab.WATCHLIST) {
-            val effectiveDriveMovies = remember(uiState.movies, uiState.videos, driveMovies) {
-                uiState.movies
-                    .ifEmpty { uiState.videos.map { it.toMovie() } }
-                    .ifEmpty { driveMovies }
-            }
-            val effectiveDriveSeries = remember(uiState.tvSeriesList, driveSeries) {
-                uiState.tvSeriesList.ifEmpty { driveSeries }
-            }
-            WatchlistScreen(
-                moviesList = effectiveDriveMovies,
-                seriesList = effectiveDriveSeries,
-                onMovieSelected = { entry ->
-                    val matchedMovie = uiState.moviesList.find { it.id == entry.id }
-                        ?: uiState.videos.find { it.id == entry.id }
-                    if (matchedMovie != null) {
-                        onVideoSelected(matchedMovie)
-                    } else if (onPlayMovie != null) {
-                        onPlayMovie(entry.id)
-                    } else {
-                        onVideoSelected(
-                            VideoItem(
-                                id = entry.id,
-                                displayTitle = entry.title,
-                                durationFormatted = "",
-                                fileSizeFormatted = "",
-                                genreFormatted = entry.genre.ifBlank { "Movie" },
-                                resolutionBadge = "HD",
-                                streamUri = DriveMediaSourceFactory.buildDriveStreamUri(entry.id).toString(),
-                                thumbnailUrl = entry.posterUrl.ifBlank { entry.backdropUrl }
-                            )
-                        )
-                    }
-                },
-                onSeriesSelected = { entry ->
-                    val matchedSeries = uiState.tvSeriesList.find { it.id == entry.id }
-                    if (matchedSeries != null) {
-                        onSeriesSelected(matchedSeries)
-                    } else if (onNavigateToSeriesDetail != null) {
-                        onNavigateToSeriesDetail(entry.id, null)
-                    }
-                },
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(bottom = paddingValues.calculateBottomPadding())
-            )
-        } else {
-            val isInitialLoading = uiState.isInitialLoading
-            val isCatalogEmpty = uiState.moviesList.isEmpty() && uiState.tvSeriesList.isEmpty()
-
-        if (isCatalogEmpty && isInitialLoading) {
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(top = paddingValues.calculateTopPadding())
+                    .then(if (!isHomeVisible) Modifier.zIndex(-1f) else Modifier.zIndex(0f))
             ) {
-                ShimmerCategoryRow()
-                ShimmerHeroBillboard()
-                ShimmerMediaSection(sectionTitle = "Movies")
-                ShimmerMediaSection(sectionTitle = "TV Series & Shows")
-            }
-        } else {
+                val isInitialLoading = uiState.isInitialLoading
+                val isCatalogEmpty = uiState.moviesList.isEmpty() && uiState.tvSeriesList.isEmpty()
+
+                if (isCatalogEmpty && isInitialLoading) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(top = paddingValues.calculateTopPadding())
+                    ) {
+                        ShimmerCategoryRow()
+                        ShimmerHeroBillboard()
+                        ShimmerMediaSection(sectionTitle = "Movies")
+                        ShimmerMediaSection(sectionTitle = "TV Series & Shows")
+                    }
+                } else {
             val searchQuery = uiState.searchQuery.trim()
             val rawMovies = uiState.filteredVideos
             val displayMovies = remember(rawMovies) {
@@ -1040,8 +915,150 @@ fun HomeScreen(
             }
             }
         }
+        }
+
+        // 2. Overlaid Tab Destinations
+        if (uiState.currentTab == NavigationTab.RECENT) {
+            RecentScreen(
+                playbackHistoryManager = viewModel.playbackHistoryManager,
+                viewModel = viewModel,
+                onResumeItem = { historyItem ->
+                    val sId = if (historyItem.isSeries) {
+                        if (!historyItem.seriesId.isNullOrBlank()) historyItem.seriesId
+                        else uiState.tvSeriesList.find { s -> s.seasons.any { season -> season.episodes.any { ep -> ep.id == historyItem.fileId } } }?.id
+                    } else null
+
+                    if (onResumePlayback != null) {
+                        onResumePlayback(historyItem.fileId, historyItem.title, sId, historyItem.positionMs)
+                    } else {
+                        if (!sId.isNullOrBlank()) {
+                            val matchedSeries = uiState.tvSeriesList.find { it.id == sId }
+                            if (matchedSeries != null) {
+                                onSeriesSelected(matchedSeries)
+                                return@RecentScreen
+                            }
+                        }
+                        val matchedMovie = uiState.moviesList.find { it.id == historyItem.fileId }
+                            ?: uiState.videos.find { it.id == historyItem.fileId }
+                        if (matchedMovie != null) {
+                            onVideoSelected(matchedMovie)
+                        } else {
+                            onVideoSelected(
+                                VideoItem(
+                                    id = historyItem.fileId,
+                                    displayTitle = historyItem.title,
+                                    durationFormatted = formatTimestamp(historyItem.durationMs),
+                                    fileSizeFormatted = "",
+                                    genreFormatted = if (historyItem.isSeries) "Series" else "Movie",
+                                    resolutionBadge = "HD",
+                                    streamUri = DriveMediaSourceFactory.buildDriveStreamUri(historyItem.fileId).toString(),
+                                    thumbnailUrl = historyItem.thumbnailUrl.orEmpty()
+                                )
+                            )
+                        }
+                    }
+                },
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(bottom = paddingValues.calculateBottomPadding())
+            )
+        } else if (uiState.currentTab == NavigationTab.SEARCH) {
+            val effectiveDriveMovies = remember(uiState.movies, uiState.videos, driveMovies) {
+                uiState.movies
+                    .ifEmpty { uiState.videos.map { it.toMovie() } }
+                    .ifEmpty { driveMovies }
+            }
+            val effectiveDriveSeries = remember(uiState.tvSeriesList, driveSeries) {
+                uiState.tvSeriesList.ifEmpty { driveSeries }
+            }
+            SearchScreen(
+                viewModel = viewModel,
+                moviesList = effectiveDriveMovies,
+                seriesList = effectiveDriveSeries,
+                onMovieSelected = { movie ->
+                    if (onPlayMovie != null) {
+                        onPlayMovie(movie.id)
+                    } else {
+                        val matchedMovie = uiState.moviesList.find { it.id == movie.id }
+                            ?: uiState.videos.find { it.id == movie.id }
+                        if (matchedMovie != null) {
+                            onVideoSelected(matchedMovie)
+                        } else {
+                            onVideoSelected(
+                                VideoItem(
+                                    id = movie.id,
+                                    displayTitle = movie.title,
+                                    durationFormatted = movie.formattedDuration,
+                                    fileSizeFormatted = movie.fileSize,
+                                    genreFormatted = movie.genre,
+                                    resolutionBadge = movie.resolution,
+                                    streamUri = movie.streamUri,
+                                    thumbnailUrl = movie.thumbnailUrl.orEmpty()
+                                )
+                            )
+                        }
+                    }
+                },
+                onSeriesSelected = { series ->
+                    if (onNavigateToSeriesDetail != null) {
+                        onNavigateToSeriesDetail(series.id, null)
+                    } else {
+                        onSeriesSelected(series)
+                    }
+                },
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(bottom = paddingValues.calculateBottomPadding())
+            )
+        } else if (uiState.currentTab == NavigationTab.WATCHLIST) {
+            val effectiveDriveMovies = remember(uiState.movies, uiState.videos, driveMovies) {
+                uiState.movies
+                    .ifEmpty { uiState.videos.map { it.toMovie() } }
+                    .ifEmpty { driveMovies }
+            }
+            val effectiveDriveSeries = remember(uiState.tvSeriesList, driveSeries) {
+                uiState.tvSeriesList.ifEmpty { driveSeries }
+            }
+            WatchlistScreen(
+                moviesList = effectiveDriveMovies,
+                seriesList = effectiveDriveSeries,
+                onMovieSelected = { entry ->
+                    val matchedMovie = uiState.moviesList.find { it.id == entry.id }
+                        ?: uiState.videos.find { it.id == entry.id }
+                    if (matchedMovie != null) {
+                        onVideoSelected(matchedMovie)
+                    } else if (onPlayMovie != null) {
+                        onPlayMovie(entry.id)
+                    } else {
+                        onVideoSelected(
+                            VideoItem(
+                                id = entry.id,
+                                displayTitle = entry.title,
+                                durationFormatted = "",
+                                fileSizeFormatted = "",
+                                genreFormatted = entry.genre.ifBlank { "Movie" },
+                                resolutionBadge = "HD",
+                                streamUri = DriveMediaSourceFactory.buildDriveStreamUri(entry.id).toString(),
+                                thumbnailUrl = entry.posterUrl.ifBlank { entry.backdropUrl }
+                            )
+                        )
+                    }
+                },
+                onSeriesSelected = { entry ->
+                    val matchedSeries = uiState.tvSeriesList.find { it.id == entry.id }
+                    if (matchedSeries != null) {
+                        onSeriesSelected(matchedSeries)
+                    } else if (onNavigateToSeriesDetail != null) {
+                        onNavigateToSeriesDetail(entry.id, null)
+                    }
+                },
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(bottom = paddingValues.calculateBottomPadding())
+            )
+        }
     }
-}
+    }
 
 
 
@@ -1524,8 +1541,8 @@ fun MovieCard(
                         .crossfade(150)
                         .size(width = 440, height = 248) // Exact 2x pixel density for 220dp x 124dp card
                         .bitmapConfig(Bitmap.Config.HARDWARE) // Direct GPU texture
-                        .memoryCacheKey("thumb_${movie.id}_${effectiveThumb.hashCode()}")
-                        .diskCacheKey("thumb_${movie.id}_${effectiveThumb.hashCode()}")
+                        .memoryCacheKey("movie_thumb_${movie.id}")
+                        .diskCacheKey("movie_thumb_${movie.id}")
                         .build(),
                     contentDescription = movie.displayTitle,
                     contentScale = ContentScale.Crop,
@@ -1786,8 +1803,8 @@ fun MoviePosterCard(
                             .crossfade(150)
                             .size(width = 300, height = 450)
                             .bitmapConfig(Bitmap.Config.HARDWARE)
-                            .memoryCacheKey("poster_${movie.id}_${effectiveThumb.hashCode()}")
-                            .diskCacheKey("poster_${movie.id}_${effectiveThumb.hashCode()}")
+                            .memoryCacheKey("movie_thumb_${movie.id}")
+                            .diskCacheKey("movie_thumb_${movie.id}")
                             .build(),
                         contentDescription = movie.displayTitle,
                         contentScale = ContentScale.Crop,
@@ -2023,8 +2040,8 @@ fun SeriesCard(
                         .crossfade(150)
                         .size(width = 440, height = 248) // Exact 2x pixel density for 220dp x 124dp card
                         .bitmapConfig(Bitmap.Config.HARDWARE) // Direct GPU texture
-                        .memoryCacheKey("thumb_${series.id}_${effectiveThumb.hashCode()}")
-                        .diskCacheKey("thumb_${series.id}_${effectiveThumb.hashCode()}")
+                        .memoryCacheKey("series_poster_${series.id}")
+                        .diskCacheKey("series_poster_${series.id}")
                         .build(),
                     contentDescription = series.title,
                     modifier = Modifier.fillMaxSize(),
@@ -2455,6 +2472,8 @@ fun MoviePosterCard(
                             .crossfade(150)
                             .size(width = 300, height = 450)
                             .bitmapConfig(Bitmap.Config.HARDWARE)
+                            .memoryCacheKey("movie_thumb_${movie.id}")
+                            .diskCacheKey("movie_thumb_${movie.id}")
                             .build(),
                         contentDescription = movie.title,
                         contentScale = ContentScale.Crop,
@@ -2570,10 +2589,10 @@ fun SeriesRowCard(
                     model = ImageRequest.Builder(LocalContext.current)
                         .data(thumbUrl)
                         .crossfade(150)
-                        .size(width = 360, height = 240)
+                        .size(width = 440, height = 248)
                         .bitmapConfig(Bitmap.Config.HARDWARE)
-                        .memoryCacheKey("series_row_${series.id}_${thumbUrl.hashCode()}")
-                        .diskCacheKey("series_row_${series.id}_${thumbUrl.hashCode()}")
+                        .memoryCacheKey("series_poster_${series.id}")
+                        .diskCacheKey("series_poster_${series.id}")
                         .build(),
                     contentDescription = series.title,
                     contentScale = ContentScale.Crop,
@@ -3146,6 +3165,8 @@ fun HomeScreen(
     val resolvedCwItem by viewModel.resolvedContinueWatching.collectAsState()
     val continueWatchingDisplayItem by viewModel.continueWatchingDisplayState.collectAsState()
 
+    val isHomeVisible = currentNavTab == HomeNavigationTab.HOME
+
     Box(
         modifier = modifier
             .fillMaxSize()
@@ -3155,6 +3176,10 @@ fun HomeScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .statusBarsPadding()
+                .graphicsLayer {
+                    alpha = if (isHomeVisible) 1f else 0f
+                }
+                .then(if (!isHomeVisible) Modifier.zIndex(-1f) else Modifier.zIndex(0f))
         ) {
             // ========================================================
             // 1. TOP APP BAR (Branding, Search Pill, Account Avatar)

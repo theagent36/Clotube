@@ -14,6 +14,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.Serializable
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Serialized data envelope for cached media library.
@@ -52,26 +53,52 @@ class CatalogCacheManager(private val context: Context) {
         private val cacheMutex = Mutex()
         private val diskLock = Any()
 
-        @Volatile
-        private var cachedInMemory: CachedCatalog? = null
+        private val cachedInMemory = ConcurrentHashMap<String, CachedCatalog>()
 
         /**
          * Clears in-memory catalog cache when switching profiles.
          */
         fun clearInMemoryCache() {
-            synchronized(diskLock) {
-                cachedInMemory = null
-            }
+            cachedInMemory.clear()
         }
     }
 
-    private fun readCatalogFromDiskSync(): CachedCatalog {
-        cachedInMemory?.let { return it }
+    private fun findNonEmptyProfileCatalogFallback(excludeFile: File): CachedCatalog? {
+        return try {
+            val profilesDir = File(appContext.filesDir, "profiles")
+            if (!profilesDir.exists() || !profilesDir.isDirectory) return null
+            val subDirs = profilesDir.listFiles { f -> f.isDirectory } ?: return null
+            for (dir in subDirs) {
+                val candidate = File(dir, "cached_catalog.json")
+                if (candidate.absolutePath == excludeFile.absolutePath) continue
+                if (candidate.exists() && candidate.length() > 0) {
+                    val raw = candidate.readText(Charsets.UTF_8)
+                    if (raw.isNotBlank()) {
+                        val type = object : TypeToken<CachedCatalog>() {}.type
+                        val catalog = gson.fromJson<CachedCatalog>(raw, type)
+                        if (catalog != null && (catalog.movies.isNotEmpty() || catalog.series.isNotEmpty())) {
+                            return catalog
+                        }
+                    }
+                }
+            }
+            null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    fun getCachedCatalogSync(): CachedCatalog = readCatalogFromDiskSync()
+
+    fun readCatalogFromDiskSync(): CachedCatalog {
+        val targetFile = cacheFile
+        val cacheKey = targetFile.absolutePath
+        cachedInMemory[cacheKey]?.let { return it }
+
         synchronized(diskLock) {
-            cachedInMemory?.let { return it }
+            cachedInMemory[cacheKey]?.let { return it }
             val loaded = try {
-                val targetFile = cacheFile
-                if (targetFile.exists()) {
+                if (targetFile.exists() && targetFile.length() > 0) {
                     val jsonString = targetFile.readText(Charsets.UTF_8)
                     if (jsonString.isNotBlank()) {
                         val type = object : TypeToken<CachedCatalog>() {}.type
@@ -79,37 +106,45 @@ class CatalogCacheManager(private val context: Context) {
                     } else {
                         CachedCatalog()
                     }
-                } else if (legacyRootCacheFile.exists()) {
-                    // One-time migration from legacy root directory to profile directory
-                    val legacyJson = legacyRootCacheFile.readText(Charsets.UTF_8)
-                    if (legacyJson.isNotBlank()) {
-                        val type = object : TypeToken<CachedCatalog>() {}.type
-                        val migrated = gson.fromJson<CachedCatalog>(legacyJson, type) ?: CachedCatalog()
-                        try {
-                            val targetDir = targetFile.parentFile ?: appContext.filesDir
-                            if (!targetDir.exists()) targetDir.mkdirs()
-                            targetFile.writeText(legacyJson, Charsets.UTF_8)
-                        } catch (_: Exception) {}
-                        migrated
-                    } else {
-                        CachedCatalog()
-                    }
-                } else if (legacySeriesCacheFile.exists()) {
-                    val legacyJson = legacySeriesCacheFile.readText(Charsets.UTF_8)
-                    if (legacyJson.isNotBlank()) {
-                        val type = object : TypeToken<List<TvSeries>>() {}.type
-                        val legacySeries = gson.fromJson<List<TvSeries>>(legacyJson, type) ?: emptyList()
-                        CachedCatalog(series = legacySeries)
-                    } else {
-                        CachedCatalog()
-                    }
                 } else {
-                    CachedCatalog()
+                    // Check fallback: files/profiles/*/cached_catalog.json
+                    val fallbackCatalog = findNonEmptyProfileCatalogFallback(targetFile)
+                    if (fallbackCatalog != null && (fallbackCatalog.movies.isNotEmpty() || fallbackCatalog.series.isNotEmpty())) {
+                        fallbackCatalog
+                    } else if (legacyRootCacheFile.exists() && legacyRootCacheFile.length() > 0) {
+                        // One-time migration from legacy root directory to profile directory
+                        val legacyJson = legacyRootCacheFile.readText(Charsets.UTF_8)
+                        if (legacyJson.isNotBlank()) {
+                            val type = object : TypeToken<CachedCatalog>() {}.type
+                            val migrated = gson.fromJson<CachedCatalog>(legacyJson, type) ?: CachedCatalog()
+                            try {
+                                val targetDir = targetFile.parentFile ?: appContext.filesDir
+                                if (!targetDir.exists()) targetDir.mkdirs()
+                                targetFile.writeText(legacyJson, Charsets.UTF_8)
+                            } catch (_: Exception) {}
+                            migrated
+                        } else {
+                            CachedCatalog()
+                        }
+                    } else if (legacySeriesCacheFile.exists() && legacySeriesCacheFile.length() > 0) {
+                        val legacyJson = legacySeriesCacheFile.readText(Charsets.UTF_8)
+                        if (legacyJson.isNotBlank()) {
+                            val type = object : TypeToken<List<TvSeries>>() {}.type
+                            val legacySeries = gson.fromJson<List<TvSeries>>(legacyJson, type) ?: emptyList()
+                            CachedCatalog(series = legacySeries)
+                        } else {
+                            CachedCatalog()
+                        }
+                    } else {
+                        CachedCatalog()
+                    }
                 }
             } catch (_: Exception) {
                 CachedCatalog()
             }
-            cachedInMemory = loaded
+            if (loaded.movies.isNotEmpty() || loaded.series.isNotEmpty()) {
+                cachedInMemory[cacheKey] = loaded
+            }
             return loaded
         }
     }
@@ -117,8 +152,8 @@ class CatalogCacheManager(private val context: Context) {
     private fun writeCatalogToDiskSync(catalog: CachedCatalog) {
         synchronized(diskLock) {
             try {
-                cachedInMemory = catalog
                 val targetFile = cacheFile
+                cachedInMemory[targetFile.absolutePath] = catalog
                 val targetDir = targetFile.parentFile ?: appContext.filesDir
                 if (!targetDir.exists()) {
                     targetDir.mkdirs()
@@ -171,7 +206,8 @@ class CatalogCacheManager(private val context: Context) {
      * Reads the cached catalog from internal storage (or warm memory cache).
      */
     suspend fun getCachedCatalog(): CachedCatalog = withContext(Dispatchers.IO) {
-        cachedInMemory?.let { return@withContext it }
+        val targetFile = cacheFile
+        cachedInMemory[targetFile.absolutePath]?.let { return@withContext it }
         cacheMutex.withLock {
             readCatalogFromDiskSync()
         }
@@ -203,9 +239,9 @@ class CatalogCacheManager(private val context: Context) {
     suspend fun clearCache() = withContext(Dispatchers.IO) {
         cacheMutex.withLock {
             synchronized(diskLock) {
-                cachedInMemory = null
+                val targetFile = cacheFile
+                cachedInMemory.remove(targetFile.absolutePath)
                 try {
-                    val targetFile = cacheFile
                     if (targetFile.exists()) targetFile.delete()
                     if (legacySeriesCacheFile.exists()) legacySeriesCacheFile.delete()
                     if (legacyRootCacheFile.exists()) legacyRootCacheFile.delete()

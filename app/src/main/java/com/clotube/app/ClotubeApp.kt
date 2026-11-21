@@ -7,8 +7,12 @@ import coil.disk.DiskCache
 import coil.memory.MemoryCache
 import coil.request.CachePolicy
 import com.clotube.app.data.DriveWatchHistorySync
+import com.clotube.app.data.MetadataDiskCache
 import com.clotube.app.data.TokenRepository
 import com.clotube.app.network.ClotubeNetworkMonitor
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import okhttp3.OkHttpClient
 import java.util.concurrent.TimeUnit
@@ -18,6 +22,9 @@ class ClotubeApp : Application(), ImageLoaderFactory {
     companion object {
         lateinit var instance: ClotubeApp
             private set
+
+        @Volatile
+        var cachedBearerToken: String? = null
     }
 
     override fun onCreate() {
@@ -25,6 +32,9 @@ class ClotubeApp : Application(), ImageLoaderFactory {
         instance = this
         DriveWatchHistorySync.init(this)
         ClotubeNetworkMonitor.startMonitoring(this)
+        CoroutineScope(Dispatchers.IO).launch {
+            MetadataDiskCache.ensureLoaded(this@ClotubeApp)
+        }
     }
 
     override fun newImageLoader(): ImageLoader {
@@ -41,11 +51,16 @@ class ClotubeApp : Application(), ImageLoaderFactory {
                         url.contains("drive.google.com")
 
                 if (isDriveUrl && request.header("Authorization") == null) {
-                    val token = runCatching {
-                        runBlocking {
-                            TokenRepository(this@ClotubeApp).getValidAccessToken(forceRefresh = false)
-                        }
-                    }.getOrNull()
+                    val fastToken = cachedBearerToken
+                    val token = if (!fastToken.isNullOrBlank()) {
+                        fastToken
+                    } else {
+                        runCatching {
+                            runBlocking {
+                                TokenRepository(this@ClotubeApp).getValidAccessToken(forceRefresh = false)
+                            }
+                        }.getOrNull()?.also { cachedBearerToken = it }
+                    }
 
                     if (!token.isNullOrBlank()) {
                         val authRequest = request.newBuilder()
