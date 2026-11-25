@@ -59,6 +59,7 @@ class DownloadRepository(private val context: Context) {
 
     companion object {
         private const val MIN_VALID_MEDIA_BYTES = 1024L
+        private val titleCache = java.util.concurrent.ConcurrentHashMap<String, String>()
     }
 
     fun getDownloadRecord(fileId: String): Flow<OfflineMediaRecord?> {
@@ -68,6 +69,7 @@ class DownloadRepository(private val context: Context) {
             val total = prefs[longPreferencesKey("${fileId}_total")] ?: 0L
             val downloaded = prefs[longPreferencesKey("${fileId}_downloaded")] ?: 0L
             val title = prefs[stringPreferencesKey("${fileId}_title")] ?: ""
+            if (title.isNotBlank()) titleCache[fileId] = title
 
             OfflineMediaRecord(
                 fileId = fileId,
@@ -88,9 +90,11 @@ class DownloadRepository(private val context: Context) {
                     val fileId = key.name.removeSuffix("_status")
                     val statusStr = prefs[stringPreferencesKey("${fileId}_status")] ?: continue
                     val status = try { DownloadStatus.valueOf(statusStr) } catch (_: Exception) { DownloadStatus.FAILED }
+                    val recordTitle = prefs[stringPreferencesKey("${fileId}_title")] ?: ""
+                    if (recordTitle.isNotBlank()) titleCache[fileId] = recordTitle
                     result[fileId] = OfflineMediaRecord(
                         fileId = fileId,
-                        title = prefs[stringPreferencesKey("${fileId}_title")] ?: "",
+                        title = recordTitle,
                         localFilePath = prefs[stringPreferencesKey("${fileId}_path")] ?: "",
                         totalBytes = prefs[longPreferencesKey("${fileId}_total")] ?: 0L,
                         downloadedBytes = prefs[longPreferencesKey("${fileId}_downloaded")] ?: 0L,
@@ -251,6 +255,7 @@ class DownloadRepository(private val context: Context) {
     }
 
     suspend fun deleteDownload(fileId: String) = withContext(Dispatchers.IO) {
+        titleCache.remove(fileId)
         var pathToDelete: String? = null
         context.downloadsDataStore.edit { prefs ->
             pathToDelete = prefs[stringPreferencesKey("${fileId}_path")]
@@ -270,6 +275,22 @@ class DownloadRepository(private val context: Context) {
             if (mp4.exists()) mp4.delete()
             val tmp = File(moviesDir, "$fileId.tmp")
             if (tmp.exists()) tmp.delete()
+        }
+    }
+
+    fun getDownloadedTitleSync(fileId: String): String? {
+        if (fileId.isBlank()) return null
+        titleCache[fileId]?.let { return it }
+        return try {
+            kotlinx.coroutines.runBlocking(Dispatchers.IO) {
+                val title = context.downloadsDataStore.data.firstOrNull()?.get(stringPreferencesKey("${fileId}_title"))
+                if (!title.isNullOrBlank()) {
+                    titleCache[fileId] = title
+                }
+                title
+            }
+        } catch (_: Exception) {
+            null
         }
     }
 

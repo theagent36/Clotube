@@ -46,7 +46,12 @@ data class VideoItem(
     @SerializedName("durationMs") val durationMs: Long = 0L,
     @SerializedName("sizeBytes") val sizeBytes: Long = 0L,
     @SerializedName("externalSubtitles") val externalSubtitles: List<ExternalSubtitleTrack> = emptyList(),
-    @SerializedName("watchProgressFraction") val watchProgressFraction: Float = 0.0f
+    @SerializedName("watchProgressFraction") val watchProgressFraction: Float = 0.0f,
+    @SerializedName("fallbackThumbnailUrl") val fallbackThumbnailUrl: String = "",
+    @SerializedName("language") val language: String = "",
+    @SerializedName("industry") val industry: String = "",
+    @SerializedName("sourceFolder") val sourceFolder: String = "",
+    @SerializedName("isFolderClassified") val isFolderClassified: Boolean = false
 ) : Serializable {
     val title: String get() = displayTitle
     val fileId: String get() = id
@@ -73,7 +78,12 @@ data class VideoItem(
         externalSubtitles: List<ExternalSubtitleTrack> = emptyList(),
         genre: String = "Movie • Cinema",
         watchProgressFraction: Float = 0.0f,
-        streamUri: String = DriveMediaSourceFactory.buildDriveStreamUri(id).toString()
+        streamUri: String = DriveMediaSourceFactory.buildDriveStreamUri(id).toString(),
+        fallbackThumbnailUrl: String = "",
+        language: String = "",
+        industry: String = "",
+        sourceFolder: String = "",
+        isFolderClassified: Boolean = false
     ) : this(
         id = id,
         displayTitle = title,
@@ -94,7 +104,12 @@ data class VideoItem(
         durationMs = durationMs,
         sizeBytes = sizeBytes,
         externalSubtitles = externalSubtitles,
-        watchProgressFraction = watchProgressFraction
+        watchProgressFraction = watchProgressFraction,
+        fallbackThumbnailUrl = fallbackThumbnailUrl,
+        language = language,
+        industry = industry,
+        sourceFolder = sourceFolder,
+        isFolderClassified = isFolderClassified
     )
 }
 
@@ -109,10 +124,15 @@ fun VideoItem.toMovie(): Movie = Movie(
     fileSize = sizeFormatted,
     mimeType = mimeType,
     thumbnailUrl = thumbnailUrl.ifBlank { null },
-    parentFolder = "",
+    parentFolder = sourceFolder,
     durationFormatted = durationFormatted,
     resolutionBadge = resolutionBadge,
     genre = genre,
     streamUri = streamUri,
-    sizeBytes = sizeBytes
+    sizeBytes = sizeBytes,
+    fallbackThumbnailUrl = fallbackThumbnailUrl,
+    language = language,
+    industry = industry,
+    sourceFolder = sourceFolder,
+    isFolderClassified = isFolderClassified
 )

@@ -32,9 +32,6 @@ class ClotubeApp : Application(), ImageLoaderFactory {
         instance = this
         DriveWatchHistorySync.init(this)
         ClotubeNetworkMonitor.startMonitoring(this)
-        CoroutineScope(Dispatchers.IO).launch {
-            MetadataDiskCache.ensureLoaded(this@ClotubeApp)
-        }
     }
 
     override fun newImageLoader(): ImageLoader {

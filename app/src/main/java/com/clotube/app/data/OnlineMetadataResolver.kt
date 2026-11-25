@@ -60,5 +60,17 @@ object OnlineMetadataResolver {
         rawFileName = rawFileName
     )
 
+    fun isDriveVideoFrameUrl(url: String?): Boolean =
+        com.clotube.app.data.metadata.OnlineMetadataResolver.isDriveVideoFrameUrl(url)
+
+    fun needsRevalidation(title: String, thumbnailUrl: String?): Boolean =
+        com.clotube.app.data.metadata.OnlineMetadataResolver.needsRevalidation(title, thumbnailUrl)
+
+    fun getCachedMovieMetadata(context: android.content.Context? = null, idOrTitle: String): com.clotube.app.data.metadata.MovieMetadata? =
+        com.clotube.app.data.metadata.OnlineMetadataResolver.getCachedMovieMetadata(context, idOrTitle)
+
+    fun extractMovieQueryAndYear(raw: String): Pair<String, String?> =
+        com.clotube.app.data.metadata.OnlineMetadataResolver.extractMovieQueryAndYear(raw)
+
     fun clearCache() = com.clotube.app.data.metadata.OnlineMetadataResolver.clearCache()
 }

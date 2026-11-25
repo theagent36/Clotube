@@ -5,6 +5,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.Crossfade
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
@@ -40,13 +41,18 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.FileDownload
+import androidx.compose.material.icons.outlined.FileDownloadDone
+import com.clotube.app.util.triggerClickHaptic
+import androidx.compose.ui.unit.Dp
+import com.clotube.app.data.DownloadStatus
 import androidx.compose.material.icons.automirrored.filled.ExitToApp
 import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.Close
@@ -101,7 +107,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.zIndex
 import androidx.compose.ui.layout.ContentScale
@@ -129,6 +134,7 @@ import com.clotube.app.ui.components.ClassyBottomBar
 import com.clotube.app.ui.components.DriveFolderPickerDialog
 import com.clotube.app.ui.components.GoogleAccountDialog
 import kotlinx.coroutines.launch
+import com.clotube.app.ui.components.HomeSkeletonScreen
 import com.clotube.app.ui.components.ShimmerCategoryRow
 import com.clotube.app.ui.components.ShimmerHeroBillboard
 import com.clotube.app.ui.components.ShimmerMediaSection
@@ -145,6 +151,8 @@ import androidx.compose.material.icons.rounded.Bookmarks
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Movie
 import androidx.compose.material.icons.rounded.Tv
+import com.clotube.app.data.MetadataDiskCache
+import com.clotube.app.data.MovieIndustryResolver
 import com.clotube.app.data.WatchlistManager
 import com.clotube.app.data.metadata.GlobalCatalogSearchEngine
 import com.clotube.app.data.metadata.OnlineMetadataResolver
@@ -192,7 +200,7 @@ import com.clotube.app.viewmodel.formatTimestamp
 enum class HomeCatalogFilter(val title: String) {
     ALL("All"),
     MOVIES("Movies"),
-    TV_SERIES("TV Series")
+    TV_SERIES("Series")
 }
 
 @Keep
@@ -284,6 +292,80 @@ fun HomeScreen(
     var showAccountDialog by remember { mutableStateOf(false) }
     val currentUser by viewModel.currentUserAccount.collectAsState()
     val coroutineScope = androidx.compose.runtime.rememberCoroutineScope()
+    var selectedMovieLanguage by remember { mutableStateOf("All") }
+
+    val allDownloadRecords by viewModel.downloadRepository
+        .getAllDownloadRecords()
+        .collectAsState(initial = emptyMap())
+
+    var movieToDeleteOffline by remember { mutableStateOf<VideoItem?>(null) }
+
+    fun handleMovieDownloadAction(movie: VideoItem) {
+        val record = allDownloadRecords[movie.id]
+        when (record?.status) {
+            com.clotube.app.data.DownloadStatus.COMPLETED -> {
+                movieToDeleteOffline = movie
+            }
+            com.clotube.app.data.DownloadStatus.DOWNLOADING,
+            com.clotube.app.data.DownloadStatus.QUEUED -> {
+                coroutineScope.launch {
+                    viewModel.downloadRepository.cancelDownload(movie.id)
+                }
+            }
+            else -> {
+                coroutineScope.launch {
+                    val token = viewModel.getValidAccessToken()
+                    viewModel.downloadRepository.enqueueDownload(
+                        fileId = movie.id,
+                        title = movie.displayTitle,
+                        authToken = token
+                    )
+                    viewModel.downloadRepository.requestUnrestrictedBatteryIfNeeded()
+                }
+            }
+        }
+    }
+
+    movieToDeleteOffline?.let { targetMovie ->
+        AlertDialog(
+            onDismissRequest = { movieToDeleteOffline = null },
+            containerColor = Color(0xFF131722),
+            title = {
+                Text(
+                    text = "Remove Offline Movie?",
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 16.sp
+                )
+            },
+            text = {
+                Text(
+                    text = "Delete \"${targetMovie.displayTitle}\" from device storage? You can download it again anytime while online.",
+                    color = Color(0xFF94A3B8),
+                    fontSize = 13.sp
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val idToDelete = targetMovie.id
+                        movieToDeleteOffline = null
+                        coroutineScope.launch {
+                            viewModel.downloadRepository.deleteDownload(idToDelete)
+                        }
+                    }
+                ) {
+                    Text("Delete", color = Color(0xFFEF4444), fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { movieToDeleteOffline = null }) {
+                    Text("Cancel", color = Color(0xFF94A3B8))
+                }
+            },
+            shape = RoundedCornerShape(16.dp)
+        )
+    }
 
     var showFolderPickerType by remember { mutableStateOf<String?>(null) }
     var availableDriveFolders by remember { mutableStateOf<List<com.google.api.services.drive.model.File>>(emptyList()) }
@@ -350,75 +432,12 @@ fun HomeScreen(
                         titleContentColor = Color.White
                     ),
                     title = {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(end = 10.dp)
-                        ) {
-                            Text(
-                                text = "Clotube",
-                                fontSize = 22.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = Color.White
-                            )
-                            Spacer(modifier = Modifier.width(12.dp))
-                            // Modern Compact Pill Search Bar
-                            BasicTextField(
-                                value = uiState.searchQuery,
-                                onValueChange = { viewModel.onSearchQueryChanged(it) },
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .height(40.dp)
-                                    .background(SurfaceElevated, RoundedCornerShape(20.dp))
-                                    .border(1.dp, SurfaceBorder, RoundedCornerShape(20.dp))
-                                    .padding(horizontal = 12.dp),
-                                singleLine = true,
-                                textStyle = TextStyle(
-                                    color = Color.White,
-                                    fontSize = 13.sp,
-                                    fontWeight = FontWeight.Normal
-                                ),
-                                cursorBrush = SolidColor(AccentBlue),
-                                decorationBox = { innerTextField ->
-                                    Row(
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        modifier = Modifier.fillMaxSize()
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Default.Search,
-                                            contentDescription = "Search",
-                                            tint = Color(0xFF64748B),
-                                            modifier = Modifier.size(18.dp)
-                                        )
-                                        Spacer(modifier = Modifier.width(8.dp))
-                                        Box(modifier = Modifier.weight(1f)) {
-                                            if (uiState.searchQuery.isEmpty()) {
-                                                Text(
-                                                    text = "Search movies, series...",
-                                                    fontSize = 13.sp,
-                                                    color = Color(0xFF64748B)
-                                                )
-                                            }
-                                            innerTextField()
-                                        }
-                                        if (uiState.searchQuery.isNotEmpty()) {
-                                            IconButton(
-                                                onClick = { viewModel.onSearchQueryChanged("") },
-                                                modifier = Modifier.size(24.dp)
-                                            ) {
-                                                Icon(
-                                                    imageVector = Icons.Default.Close,
-                                                    contentDescription = "Clear search",
-                                                    tint = Color(0xFF94A3B8),
-                                                    modifier = Modifier.size(16.dp)
-                                                )
-                                            }
-                                        }
-                                    }
-                                }
-                            )
-                        }
+                        Text(
+                            text = "Clotube",
+                            fontSize = 22.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White
+                        )
                     },
                     actions = {
                         // Profile / Sign-in Avatar on far right
@@ -473,7 +492,8 @@ fun HomeScreen(
                     } else {
                         viewModel.selectTab(tab)
                     }
-                }
+                },
+                modifier = Modifier.zIndex(10f)
             )
         }
     ) { paddingValues ->
@@ -493,31 +513,35 @@ fun HomeScreen(
                     }
                     .then(if (!isHomeVisible) Modifier.zIndex(-1f) else Modifier.zIndex(0f))
             ) {
-                val isInitialLoading = uiState.isInitialLoading
-                val isCatalogEmpty = uiState.moviesList.isEmpty() && uiState.tvSeriesList.isEmpty()
-
-                if (isCatalogEmpty && isInitialLoading) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(top = paddingValues.calculateTopPadding())
-                    ) {
-                        ShimmerCategoryRow()
-                        ShimmerHeroBillboard()
-                        ShimmerMediaSection(sectionTitle = "Movies")
-                        ShimmerMediaSection(sectionTitle = "TV Series & Shows")
-                    }
-                } else {
+                Crossfade(
+                    targetState = uiState.isInitialLoading,
+                    animationSpec = tween(durationMillis = 280),
+                    label = "HomeSkeletonCrossfade"
+                ) { initialLoading ->
+                    if (initialLoading) {
+                        HomeSkeletonScreen(contentPadding = paddingValues)
+                    } else {
             val searchQuery = uiState.searchQuery.trim()
             val rawMovies = uiState.filteredVideos
             val displayMovies = remember(rawMovies) {
                 val seenIds = HashSet<String>()
-                val seenNorms = HashSet<String>()
                 rawMovies.filter { movie ->
-                    val norm = WatchlistManager.normalizeTitle(movie.displayTitle.ifBlank { movie.title })
-                    val idAdded = seenIds.add(movie.id)
-                    val normAdded = norm.isBlank() || seenNorms.add(norm)
-                    idAdded && normAdded
+                    movie.id.isNotBlank() && seenIds.add(movie.id)
+                }
+            }
+            val moviesByLanguage = remember(displayMovies) {
+                displayMovies.groupBy { movie ->
+                    val section = MovieIndustryResolver.resolveVideoSection(movie)
+                    section.ifBlank { movie.language.ifBlank { "English" } }
+                }
+            }
+            val orderedLanguages = remember(moviesByLanguage) {
+                MovieIndustryResolver.sortIndustrySections(moviesByLanguage.keys)
+            }
+
+            LaunchedEffect(orderedLanguages) {
+                if (selectedMovieLanguage != "All" && selectedMovieLanguage !in orderedLanguages) {
+                    selectedMovieLanguage = "All"
                 }
             }
             val rawSeries = uiState.tvSeriesList
@@ -549,7 +573,7 @@ fun HomeScreen(
                 HomeFilterChipsRow(
                     selectedFilter = when (uiState.selectedFilter) {
                         HomeCatalogFilter.MOVIES.title -> HomeCatalogFilter.MOVIES
-                        HomeCatalogFilter.TV_SERIES.title -> HomeCatalogFilter.TV_SERIES
+                        HomeCatalogFilter.TV_SERIES.title, "TV Series" -> HomeCatalogFilter.TV_SERIES
                         else -> HomeCatalogFilter.ALL
                     },
                     onFilterSelected = { filter ->
@@ -611,8 +635,8 @@ fun HomeScreen(
                     ) { currentFilter ->
                         when (currentFilter) {
                         HomeCatalogFilter.MOVIES.title -> {
-                            // Full-screen 2-column Grid of All Movies (Continue Watching hidden)
-                            if (displayMovies.isEmpty()) {
+                            // Full-screen 3-column Grid of All Movies (Continue Watching hidden)
+                            if (displayMovies.isEmpty() && !uiState.isInitialLoading && !uiState.isLoading) {
                                 CatalogEmptyView(
                                     title = if (searchQuery.isNotBlank()) "No Matching Movies Found" else "No Movies Found",
                                     subtitle = if (searchQuery.isNotBlank()) {
@@ -641,37 +665,144 @@ fun HomeScreen(
                                     }
                                 )
                             } else {
-                                LazyVerticalGrid(
-                                    columns = GridCells.Fixed(3),
-                                    modifier = Modifier.fillMaxSize(),
-                                    contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 8.dp, bottom = 110.dp),
-                                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                                    verticalArrangement = Arrangement.spacedBy(14.dp)
-                                ) {
-                                    items(
-                                        items = displayMovies,
-                                        key = { it.id },
-                                        contentType = { "movie_poster_card" }
-                                    ) { movie ->
-                                        MoviePosterCard(
-                                            movie = movie,
-                                            onClick = {
-                                                if (onPlayMovie != null) {
-                                                    onPlayMovie(movie.id)
-                                                } else {
-                                                    onVideoSelected(movie)
+                                Column(modifier = Modifier.fillMaxSize()) {
+                                    if (orderedLanguages.size > 1) {
+                                        LazyRow(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(horizontal = 16.dp, vertical = 6.dp),
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                        ) {
+                                            val pillOptions = listOf("All") + orderedLanguages
+                                            items(pillOptions, key = { it }) { languageOption ->
+                                                val isSelected = selectedMovieLanguage == languageOption
+                                                val backgroundColor by animateColorAsState(
+                                                    targetValue = if (isSelected) Color.White else SurfaceDefault,
+                                                    animationSpec = AppleTvMotion.fluidSpring(),
+                                                    label = "movieLangFilterChipBg_$languageOption"
+                                                )
+                                                val textColor by animateColorAsState(
+                                                    targetValue = if (isSelected) Color(0xFF08090D) else TextSecondary,
+                                                    animationSpec = AppleTvMotion.fluidSpring(),
+                                                    label = "movieLangFilterChipText_$languageOption"
+                                                )
+                                                val interactionSource = remember { MutableInteractionSource() }
+                                                Surface(
+                                                    modifier = Modifier
+                                                        .appleTvPressable(interactionSource, pressedScale = 0.94f)
+                                                        .clip(RoundedCornerShape(20.dp))
+                                                        .clickable(
+                                                            interactionSource = interactionSource,
+                                                            indication = ripple(bounded = true)
+                                                        ) { selectedMovieLanguage = languageOption },
+                                                    shape = RoundedCornerShape(20.dp),
+                                                    color = backgroundColor,
+                                                    border = if (isSelected) null else BorderStroke(1.dp, SurfaceBorder)
+                                                ) {
+                                                    Text(
+                                                        text = languageOption,
+                                                        fontSize = 12.sp,
+                                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                                                        color = textColor,
+                                                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                                                    )
                                                 }
-                                            },
-                                            modifier = Modifier.fillMaxWidth()
-                                        )
+                                            }
+                                        }
+                                    }
+
+                                    LazyVerticalGrid(
+                                        columns = GridCells.Fixed(3),
+                                        modifier = Modifier.fillMaxSize(),
+                                        contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 8.dp, bottom = 110.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                        verticalArrangement = Arrangement.spacedBy(14.dp)
+                                    ) {
+                                        if (selectedMovieLanguage == "All" && orderedLanguages.size > 1) {
+                                            orderedLanguages.forEach { languageSection ->
+                                                val sectionMovies = moviesByLanguage[languageSection].orEmpty()
+                                                if (sectionMovies.isNotEmpty()) {
+                                                    item(
+                                                        key = "lang_header_$languageSection",
+                                                        span = { GridItemSpan(maxLineSpan) }
+                                                    ) {
+                                                        Row(
+                                                            modifier = Modifier
+                                                                .fillMaxWidth()
+                                                                .padding(top = if (languageSection == orderedLanguages.first()) 2.dp else 10.dp, bottom = 2.dp),
+                                                            verticalAlignment = Alignment.CenterVertically,
+                                                            horizontalArrangement = Arrangement.SpaceBetween
+                                                        ) {
+                                                            Text(
+                                                                text = languageSection,
+                                                                color = Color.White,
+                                                                fontSize = 16.sp,
+                                                                fontWeight = FontWeight.SemiBold
+                                                            )
+                                                            Text(
+                                                                text = "${sectionMovies.size} ${if (sectionMovies.size == 1) "movie" else "movies"}",
+                                                                color = Color(0xFF94A3B8),
+                                                                fontSize = 12.sp
+                                                            )
+                                                        }
+                                                    }
+                                                    items(
+                                                        items = sectionMovies,
+                                                        key = { it.id },
+                                                        contentType = { "movie_poster_card" }
+                                                    ) { movie ->
+                                                        MoviePosterCard(
+                                                            movie = movie,
+                                                            onClick = {
+                                                                if (onPlayMovie != null) {
+                                                                    onPlayMovie(movie.id)
+                                                                } else {
+                                                                    onVideoSelected(movie)
+                                                                }
+                                                            },
+                                                            modifier = Modifier.fillMaxWidth(),
+                                                            downloadStatus = allDownloadRecords[movie.id]?.status,
+                                                            downloadProgress = allDownloadRecords[movie.id]?.progressFraction ?: 0f,
+                                                            onDownloadClick = { handleMovieDownloadAction(movie) }
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            val targetMovies = if (selectedMovieLanguage != "All") {
+                                                moviesByLanguage[selectedMovieLanguage].orEmpty()
+                                            } else {
+                                                displayMovies
+                                            }
+                                            items(
+                                                items = targetMovies,
+                                                key = { it.id },
+                                                contentType = { "movie_poster_card" }
+                                            ) { movie ->
+                                                MoviePosterCard(
+                                                    movie = movie,
+                                                    onClick = {
+                                                        if (onPlayMovie != null) {
+                                                            onPlayMovie(movie.id)
+                                                        } else {
+                                                            onVideoSelected(movie)
+                                                        }
+                                                    },
+                                                    modifier = Modifier.fillMaxWidth(),
+                                                    downloadStatus = allDownloadRecords[movie.id]?.status,
+                                                    downloadProgress = allDownloadRecords[movie.id]?.progressFraction ?: 0f,
+                                                    onDownloadClick = { handleMovieDownloadAction(movie) }
+                                                )
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
 
-                        HomeCatalogFilter.TV_SERIES.title -> {
+                        HomeCatalogFilter.TV_SERIES.title, "TV Series" -> {
                             // Full-screen Cinematic List of All TV Series (Continue Watching hidden)
-                            if (displaySeries.isEmpty()) {
+                            if (displaySeries.isEmpty() && !uiState.isInitialLoading && !uiState.isLoading) {
                                 CatalogEmptyView(
                                     title = if (searchQuery.isNotBlank()) "No Matching Series Found" else "No TV Series Found",
                                     subtitle = if (searchQuery.isNotBlank()) {
@@ -782,12 +913,7 @@ fun HomeScreen(
                                             )
                                         }
                                         !isHistoryLoaded -> {
-                                            // Stable placeholder container during initial hydration (avoids flashing featured hero)
-                                            Box(
-                                                modifier = Modifier
-                                                    .fillMaxWidth()
-                                                    .height(210.dp)
-                                            )
+                                            ShimmerHeroBillboard()
                                         }
                                         heroMovie != null || heroSeries != null -> {
                                             HeroBillboardSection(
@@ -808,7 +934,10 @@ fun HomeScreen(
                                                         if (onPlayMovie != null) onPlayMovie(it.id) else onVideoSelected(it)
                                                     } ?: heroSeries?.let { onSeriesSelected(it) }
                                                 },
-                                                onRemoveResume = null
+                                                onRemoveResume = null,
+                                                downloadStatus = heroMovie?.let { allDownloadRecords[it.id]?.status },
+                                                downloadProgress = heroMovie?.let { allDownloadRecords[it.id]?.progressFraction } ?: 0f,
+                                                onDownloadClick = heroMovie?.let { movie -> { handleMovieDownloadAction(movie) } }
                                             )
                                         }
                                     }
@@ -817,8 +946,11 @@ fun HomeScreen(
                                 if (displayMovies.isNotEmpty()) {
                                     item(key = "home_movies_preview") {
                                         SectionHeader(
-                                            title = "Trending Movies",
-                                            onSeeAllClick = { viewModel.selectFilter(HomeCatalogFilter.MOVIES.title) }
+                                            title = "Movies",
+                                            onSeeAllClick = {
+                                                selectedMovieLanguage = "All"
+                                                viewModel.selectFilter(HomeCatalogFilter.MOVIES.title)
+                                            }
                                         )
                                         LazyRow(
                                             modifier = Modifier.fillMaxWidth(),
@@ -839,7 +971,10 @@ fun HomeScreen(
                                                             onVideoSelected(movie)
                                                         }
                                                     },
-                                                    modifier = Modifier.width(220.dp)
+                                                    modifier = Modifier.width(220.dp),
+                                                    downloadStatus = allDownloadRecords[movie.id]?.status,
+                                                    downloadProgress = allDownloadRecords[movie.id]?.progressFraction ?: 0f,
+                                                    onDownloadClick = { handleMovieDownloadAction(movie) }
                                                 )
                                             }
                                         }
@@ -852,7 +987,7 @@ fun HomeScreen(
                                             Spacer(modifier = Modifier.height(14.dp))
                                         }
                                         SectionHeader(
-                                            title = "Popular Series",
+                                            title = "Series",
                                             onSeeAllClick = { viewModel.selectFilter(HomeCatalogFilter.TV_SERIES.title) }
                                         )
                                         LazyRow(
@@ -877,7 +1012,7 @@ fun HomeScreen(
                                     }
                                 }
 
-                                if (displayMovies.isEmpty() && displaySeries.isEmpty() && !uiState.isLoading) {
+                                if (displayMovies.isEmpty() && displaySeries.isEmpty() && !uiState.isInitialLoading && !uiState.isLoading) {
                                     item(key = "home_empty_view") {
                                         CatalogEmptyView(
                                             title = if (searchQuery.isNotBlank()) "No Matching Media Found" else "Dedicated Folders Empty",
@@ -913,15 +1048,18 @@ fun HomeScreen(
                     }
                 }
             }
-            }
         }
-        }
+    }
+}
+}
 
         // 2. Overlaid Tab Destinations
         if (uiState.currentTab == NavigationTab.RECENT) {
             RecentScreen(
                 playbackHistoryManager = viewModel.playbackHistoryManager,
                 viewModel = viewModel,
+                moviesList = uiState.movies.ifEmpty { uiState.moviesList.map { it.toMovie() } },
+                tvSeriesList = uiState.tvSeriesList,
                 onResumeItem = { historyItem ->
                     val sId = if (historyItem.isSeries) {
                         if (!historyItem.seriesId.isNullOrBlank()) historyItem.seriesId
@@ -1180,6 +1318,71 @@ private fun DriveFolderOnboardingDialog(
 }
 
 /**
+ * Compact circular glass download button matching WatchlistBookmarkButton and EpisodeItemRow.
+ */
+@Composable
+fun MovieDownloadButton(
+    status: com.clotube.app.data.DownloadStatus?,
+    progressFraction: Float,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    size: Dp = 28.dp
+) {
+    val view = androidx.compose.ui.platform.LocalView.current
+    val interactionSource = remember { MutableInteractionSource() }
+
+    Box(
+        modifier = modifier
+            .size(size)
+            .clip(CircleShape)
+            .background(Color(0xB308090D))
+            .border(BorderStroke(0.5.dp, Color(0x29FFFFFF)), CircleShape)
+            .clickable(
+                interactionSource = interactionSource,
+                indication = ripple(bounded = true, color = Color.White.copy(alpha = 0.2f))
+            ) {
+                view.triggerClickHaptic()
+                onClick()
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        when (status) {
+            com.clotube.app.data.DownloadStatus.COMPLETED -> {
+                Icon(
+                    imageVector = Icons.Outlined.FileDownloadDone,
+                    contentDescription = "Saved Offline",
+                    tint = AccentBlue,
+                    modifier = Modifier.size(size * 0.58f)
+                )
+            }
+            com.clotube.app.data.DownloadStatus.DOWNLOADING -> {
+                CircularProgressIndicator(
+                    progress = { progressFraction.coerceIn(0.02f, 1f) },
+                    modifier = Modifier.size(size * 0.62f),
+                    color = AccentBlue,
+                    strokeWidth = 2.dp
+                )
+            }
+            com.clotube.app.data.DownloadStatus.QUEUED -> {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(size * 0.62f),
+                    color = Color(0xFF94A3B8),
+                    strokeWidth = 2.dp
+                )
+            }
+            else -> {
+                Icon(
+                    imageVector = Icons.Outlined.FileDownload,
+                    contentDescription = "Save Offline",
+                    tint = Color.White.copy(alpha = 0.85f),
+                    modifier = Modifier.size(size * 0.58f)
+                )
+            }
+        }
+    }
+}
+
+/**
  * Top 16:9 OTT Hero Billboard Banner with high-res backdrop, dynamic Continue Watching status,
  * progress bar, and Resume or Watch Now actions.
  */
@@ -1194,7 +1397,10 @@ private fun HeroBillboardSection(
     onResume: (com.clotube.app.data.WatchProgress) -> Unit = {},
     onResumeContinueWatching: ((ContinueWatchingItem) -> Unit)? = null,
     onInspect: () -> Unit,
-    onRemoveResume: (() -> Unit)? = null
+    onRemoveResume: (() -> Unit)? = null,
+    downloadStatus: com.clotube.app.data.DownloadStatus? = null,
+    downloadProgress: Float = 0f,
+    onDownloadClick: (() -> Unit)? = null
 ) {
     val isResumeMode = continueWatching != null || (lastWatched != null && (lastWatched.positionMs >= 1000L || lastWatched.progressFraction > 0f))
 
@@ -1340,7 +1546,10 @@ private fun HeroBillboardSection(
                 Spacer(modifier = Modifier.height(10.dp))
 
                 // Action Buttons
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                     if (isResumeMode) {
                         Button(
                             onClick = {
@@ -1406,6 +1615,15 @@ private fun HeroBillboardSection(
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text("Details", fontSize = 12.sp, color = Color.White)
+                    }
+
+                    if (movie != null && onDownloadClick != null) {
+                        MovieDownloadButton(
+                            status = downloadStatus,
+                            progressFraction = downloadProgress,
+                            onClick = onDownloadClick,
+                            size = 38.dp
+                        )
                     }
 
                     if (isResumeMode && onRemoveResume != null) {
@@ -1481,7 +1699,10 @@ private fun SectionHeader(
 fun MovieCard(
     movie: VideoItem,
     onClick: () -> Unit,
-    modifier: Modifier = Modifier.width(220.dp)
+    modifier: Modifier = Modifier.width(220.dp),
+    downloadStatus: com.clotube.app.data.DownloadStatus? = null,
+    downloadProgress: Float = 0f,
+    onDownloadClick: (() -> Unit)? = null
 ) {
     val context = LocalContext.current
     val revision = WatchlistManager.watchlistRevision
@@ -1541,8 +1762,8 @@ fun MovieCard(
                         .crossfade(150)
                         .size(width = 440, height = 248) // Exact 2x pixel density for 220dp x 124dp card
                         .bitmapConfig(Bitmap.Config.HARDWARE) // Direct GPU texture
-                        .memoryCacheKey("movie_thumb_${movie.id}")
-                        .diskCacheKey("movie_thumb_${movie.id}")
+                        .memoryCacheKey("movie_thumb_${movie.id}_${effectiveThumb.hashCode()}")
+                        .diskCacheKey("movie_thumb_${movie.id}_${effectiveThumb.hashCode()}")
                         .build(),
                     contentDescription = movie.displayTitle,
                     contentScale = ContentScale.Crop,
@@ -1603,6 +1824,15 @@ fun MovieCard(
                             color = Color.White
                         )
                     }
+                }
+
+                if (onDownloadClick != null) {
+                    MovieDownloadButton(
+                        status = downloadStatus,
+                        progressFraction = downloadProgress,
+                        onClick = onDownloadClick,
+                        size = 28.dp
+                    )
                 }
 
                 WatchlistBookmarkButton(
@@ -1728,7 +1958,10 @@ private fun extractYearFromTitle(title: String): String? {
 fun MoviePosterCard(
     movie: VideoItem,
     onClick: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    downloadStatus: com.clotube.app.data.DownloadStatus? = null,
+    downloadProgress: Float = 0f,
+    onDownloadClick: (() -> Unit)? = null
 ) {
     val context = LocalContext.current
     val revision = WatchlistManager.watchlistRevision
@@ -1803,8 +2036,8 @@ fun MoviePosterCard(
                             .crossfade(150)
                             .size(width = 300, height = 450)
                             .bitmapConfig(Bitmap.Config.HARDWARE)
-                            .memoryCacheKey("movie_thumb_${movie.id}")
-                            .diskCacheKey("movie_thumb_${movie.id}")
+                            .memoryCacheKey("movie_thumb_${movie.id}_${effectiveThumb.hashCode()}")
+                            .diskCacheKey("movie_thumb_${movie.id}_${effectiveThumb.hashCode()}")
                             .build(),
                         contentDescription = movie.displayTitle,
                         contentScale = ContentScale.Crop,
@@ -1899,6 +2132,15 @@ fun MoviePosterCard(
                         }
                     }
 
+                    if (onDownloadClick != null) {
+                        MovieDownloadButton(
+                            status = downloadStatus,
+                            progressFraction = downloadProgress,
+                            onClick = onDownloadClick,
+                            size = 26.dp
+                        )
+                    }
+
                     WatchlistBookmarkButton(
                         status = currentStatus,
                         onClick = { showBottomSheet = true },
@@ -1990,25 +2232,39 @@ fun SeriesCard(
     var fallbackPoster by remember(series.id) { mutableStateOf("") }
     var imageLoadFailed by remember(series.id) { mutableStateOf(false) }
 
-    val initialThumb = series.thumbnailUrl.ifBlank { series.backdropUrl ?: series.posterUrl ?: "" }
+    val officialSeriesArt = remember(series.id, series.posterUrl, series.backdropUrl, series.thumbnailUrl) {
+        listOfNotNull(series.posterUrl, series.backdropUrl, series.thumbnailUrl)
+            .map { it.trim() }
+            .firstOrNull { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
+            .orEmpty()
+    }
+
     val effectiveThumb = when {
-        fallbackPoster.isNotBlank() -> fallbackPoster
-        !imageLoadFailed && initialThumb.isNotBlank() -> initialThumb
+        fallbackPoster.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(fallbackPoster) -> fallbackPoster
+        !imageLoadFailed && officialSeriesArt.isNotBlank() -> officialSeriesArt
         else -> ""
     }
 
-    LaunchedEffect(series.id, series.title, imageLoadFailed) {
-        if ((initialThumb.isBlank() || imageLoadFailed) && fallbackPoster.isBlank()) {
+    LaunchedEffect(series.id, series.title, officialSeriesArt, imageLoadFailed) {
+        if ((officialSeriesArt.isBlank() || imageLoadFailed) && (fallbackPoster.isBlank() || OnlineMetadataResolver.isDriveVideoFrameUrl(fallbackPoster))) {
             withContext(Dispatchers.IO) {
                 try {
+                    val cachedRecord = MetadataDiskCache.get("series:${series.title.trim().lowercase()}")
+                    val cachedArt = cachedRecord?.posterUrl?.takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
+                        ?: cachedRecord?.backdropUrl?.takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
+                    if (!cachedArt.isNullOrBlank()) {
+                        fallbackPoster = cachedArt
+                        return@withContext
+                    }
+
                     val searchResults = GlobalCatalogSearchEngine.searchOnlineCatalog(series.title)
-                    val best = searchResults.firstOrNull { it.posterUrl.isNotBlank() }?.posterUrl
-                        ?: searchResults.firstOrNull { it.backdropUrl.isNotBlank() }?.backdropUrl
+                    val best = searchResults.firstOrNull { it.posterUrl.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it.posterUrl) }?.posterUrl
+                        ?: searchResults.firstOrNull { it.backdropUrl.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it.backdropUrl) }?.backdropUrl
                     if (!best.isNullOrBlank()) {
                         fallbackPoster = best
                     } else {
                         val resolved = OnlineMetadataResolver.resolveSeries(series.title).posterUrl
-                        if (!resolved.isNullOrBlank()) {
+                        if (!resolved.isNullOrBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(resolved)) {
                             fallbackPoster = resolved
                         }
                     }
@@ -2034,14 +2290,15 @@ fun SeriesCard(
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
             if (effectiveThumb.isNotBlank()) {
+                val thumbUrl = effectiveThumb
                 AsyncImage(
                     model = ImageRequest.Builder(LocalContext.current)
-                        .data(effectiveThumb)
+                        .data(thumbUrl)
                         .crossfade(150)
                         .size(width = 440, height = 248) // Exact 2x pixel density for 220dp x 124dp card
                         .bitmapConfig(Bitmap.Config.HARDWARE) // Direct GPU texture
-                        .memoryCacheKey("series_poster_${series.id}")
-                        .diskCacheKey("series_poster_${series.id}")
+                        .memoryCacheKey("series_official_poster_${series.id}")
+                        .diskCacheKey("series_official_poster_${series.id}")
                         .build(),
                     contentDescription = series.title,
                     modifier = Modifier.fillMaxSize(),
@@ -2069,12 +2326,9 @@ fun SeriesCard(
                 }
             }
 
-            // Season count tag anchored to TopEnd ("OTT SERIES" and "Tap to explore" removed)
+            // Season count tag anchored to TopEnd (renders ONLY when series.seasons.isNotEmpty())
             val seasonDisplay = when {
                 series.seasons.isNotEmpty() -> if (series.seasons.size == 1) "1 Season" else "${series.seasons.size} Seasons"
-                !series.totalSeasonsFormatted.contains("explore", ignoreCase = true) &&
-                series.totalSeasonsFormatted.isNotBlank() &&
-                series.totalSeasonsFormatted != "TV Series" -> series.totalSeasonsFormatted
                 else -> null
             }
 
@@ -2157,12 +2411,23 @@ fun SeriesCard(
 
                 // Secondary Line (Total Episodes & Genre)
                 val totalEps = series.totalEpisodes
-                val epText = if (totalEps > 0) "$totalEps Episodes" else ""
-                val genreClean = series.genreFormatted.replace("OTT SERIES", "").trim().trim('•').trim()
-                val metaParts = listOfNotNull(
-                    epText.ifBlank { null },
-                    genreClean.takeIf { it.isNotBlank() && it != "TV Series" }
-                ).ifEmpty { listOf(series.totalSeasonsFormatted) }
+                val epText = if (totalEps > 0) (if (totalEps == 1) "1 Episode" else "$totalEps Episodes") else ""
+                val genreClean = series.genreFormatted
+                    .replace("OTT SERIES", "")
+                    .replace("Tap to explore", "")
+                    .trim()
+                    .trim('•')
+                    .trim()
+                    .let { if (it.isBlank() || it.equals("TV Series", ignoreCase = true)) "Series" else it }
+
+                val metaParts = if (totalEps > 0) {
+                    listOfNotNull(
+                        epText,
+                        genreClean.takeIf { it != "Series" }
+                    )
+                } else {
+                    listOf(genreClean)
+                }
 
                 Text(
                     text = metaParts.joinToString(" • "),
@@ -2408,12 +2673,22 @@ fun SeriesOverlayCard(
                     )
                     Spacer(modifier = Modifier.height(1.dp))
                     val totalEps = series.totalEpisodes
-                    val epText = if (totalEps > 0) "$totalEps Episodes" else ""
-                    val genreClean = series.genre.replace("OTT SERIES", "").trim().trim('•').trim()
-                    val metaParts = listOfNotNull(
-                        epText.ifBlank { null },
-                        genreClean.takeIf { it.isNotBlank() && it != "TV Series" }
-                    ).ifEmpty { listOf("${series.seasons.size} Seasons") }
+                    val epText = if (totalEps > 0) (if (totalEps == 1) "1 Episode" else "$totalEps Episodes") else ""
+                    val genreClean = series.genre
+                        .replace("OTT SERIES", "")
+                        .replace("Tap to explore", "")
+                        .trim()
+                        .trim('•')
+                        .trim()
+                        .let { if (it.isBlank() || it.equals("TV Series", ignoreCase = true)) "Series" else it }
+                    val metaParts = if (totalEps > 0) {
+                        listOfNotNull(
+                            epText,
+                            genreClean.takeIf { it != "Series" }
+                        )
+                    } else {
+                        listOf(genreClean)
+                    }
 
                     Text(
                         text = metaParts.joinToString(" • "),
@@ -2466,14 +2741,15 @@ fun MoviePosterCard(
         ) {
             Box(modifier = Modifier.fillMaxSize()) {
                 if (!movie.thumbnailUrl.isNullOrBlank()) {
+                    val effectiveThumb = movie.thumbnailUrl
                     AsyncImage(
                         model = ImageRequest.Builder(LocalContext.current)
-                            .data(movie.thumbnailUrl)
+                            .data(effectiveThumb)
                             .crossfade(150)
                             .size(width = 300, height = 450)
                             .bitmapConfig(Bitmap.Config.HARDWARE)
-                            .memoryCacheKey("movie_thumb_${movie.id}")
-                            .diskCacheKey("movie_thumb_${movie.id}")
+                            .memoryCacheKey("movie_thumb_${movie.id}_${effectiveThumb.hashCode()}")
+                            .diskCacheKey("movie_thumb_${movie.id}_${effectiveThumb.hashCode()}")
                             .build(),
                         contentDescription = movie.title,
                         contentScale = ContentScale.Crop,
@@ -2558,6 +2834,50 @@ fun SeriesRowCard(
     val currentStatus = WatchlistManager.getStatus(series.id, series.title)
     var showBottomSheet by remember { mutableStateOf(false) }
 
+    var fallbackPoster by remember(series.id) { mutableStateOf("") }
+    var imageLoadFailed by remember(series.id) { mutableStateOf(false) }
+
+    val officialSeriesArt = remember(series.id, series.posterUrl, series.backdropUrl, series.thumbnailUrl) {
+        listOfNotNull(series.posterUrl, series.backdropUrl, series.thumbnailUrl)
+            .map { it.trim() }
+            .firstOrNull { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
+            .orEmpty()
+    }
+
+    val effectiveThumb = when {
+        fallbackPoster.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(fallbackPoster) -> fallbackPoster
+        !imageLoadFailed && officialSeriesArt.isNotBlank() -> officialSeriesArt
+        else -> ""
+    }
+
+    LaunchedEffect(series.id, series.title, officialSeriesArt, imageLoadFailed) {
+        if ((officialSeriesArt.isBlank() || imageLoadFailed) && (fallbackPoster.isBlank() || OnlineMetadataResolver.isDriveVideoFrameUrl(fallbackPoster))) {
+            withContext(Dispatchers.IO) {
+                try {
+                    val cachedRecord = MetadataDiskCache.get("series:${series.title.trim().lowercase()}")
+                    val cachedArt = cachedRecord?.posterUrl?.takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
+                        ?: cachedRecord?.backdropUrl?.takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
+                    if (!cachedArt.isNullOrBlank()) {
+                        fallbackPoster = cachedArt
+                        return@withContext
+                    }
+
+                    val searchResults = GlobalCatalogSearchEngine.searchOnlineCatalog(series.title)
+                    val best = searchResults.firstOrNull { it.posterUrl.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it.posterUrl) }?.posterUrl
+                        ?: searchResults.firstOrNull { it.backdropUrl.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it.backdropUrl) }?.backdropUrl
+                    if (!best.isNullOrBlank()) {
+                        fallbackPoster = best
+                    } else {
+                        val resolved = OnlineMetadataResolver.resolveSeries(series.title).posterUrl
+                        if (!resolved.isNullOrBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(resolved)) {
+                            fallbackPoster = resolved
+                        }
+                    }
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
     val interactionSource = remember { MutableInteractionSource() }
     Card(
         modifier = modifier
@@ -2581,23 +2901,41 @@ fun SeriesRowCard(
                     .weight(0.40f)
                     .fillMaxHeight()
             ) {
-                val thumbUrl = series.backdropUrl?.ifBlank { null }
-                    ?: series.thumbnailUrl.ifBlank { null }
-                    ?: series.posterUrl.orEmpty()
-
-                AsyncImage(
-                    model = ImageRequest.Builder(LocalContext.current)
-                        .data(thumbUrl)
-                        .crossfade(150)
-                        .size(width = 440, height = 248)
-                        .bitmapConfig(Bitmap.Config.HARDWARE)
-                        .memoryCacheKey("series_poster_${series.id}")
-                        .diskCacheKey("series_poster_${series.id}")
-                        .build(),
-                    contentDescription = series.title,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxSize()
-                )
+                if (effectiveThumb.isNotBlank()) {
+                    AsyncImage(
+                        model = ImageRequest.Builder(LocalContext.current)
+                            .data(effectiveThumb)
+                            .crossfade(150)
+                            .size(width = 440, height = 248)
+                            .bitmapConfig(Bitmap.Config.HARDWARE)
+                            .memoryCacheKey("series_official_poster_${series.id}")
+                            .diskCacheKey("series_official_poster_${series.id}")
+                            .build(),
+                        contentDescription = series.title,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize(),
+                        onError = { imageLoadFailed = true },
+                        onSuccess = { imageLoadFailed = false }
+                    )
+                } else {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(
+                                Brush.verticalGradient(
+                                    colors = listOf(Color(0xFF1E2638), Color(0xFF0F1420))
+                                )
+                            ),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Tv,
+                            contentDescription = null,
+                            tint = TextTertiary,
+                            modifier = Modifier.size(32.dp)
+                        )
+                    }
+                }
 
                 // Top-Start Status Pill
                 if (currentStatus != WatchlistStatus.UNWATCHED) {
@@ -2676,46 +3014,53 @@ fun SeriesRowCard(
 
                 // Seasons count & total episodes count in #94A3B8
                 val totalEps = series.totalEpisodes
-                val epText = if (totalEps > 0) "$totalEps Episodes" else ""
-                val cleanSeason = when {
+                val epText = if (totalEps > 0) (if (totalEps == 1) "1 Episode" else "$totalEps Episodes") else ""
+                val seasonDisplay = when {
                     series.seasons.isNotEmpty() -> if (series.seasons.size == 1) "1 Season" else "${series.seasons.size} Seasons"
-                    !series.totalSeasonsFormatted.contains("explore", ignoreCase = true) &&
-                    series.totalSeasonsFormatted.isNotBlank() &&
-                    series.totalSeasonsFormatted != "TV Series" -> series.totalSeasonsFormatted
-                    else -> "TV Series"
+                    else -> null
                 }
 
-                val countParts = listOfNotNull(cleanSeason, epText.ifBlank { null })
-                val countText = countParts.joinToString(" • ")
-
-                Text(
-                    text = countText,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Normal,
-                    color = TextSecondary, // #94A3B8
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-
-                Spacer(modifier = Modifier.height(6.dp))
-
-                // Genre tags in #94A3B8
                 val genreClean = series.genreFormatted
                     .replace("OTT SERIES", "")
                     .replace("Tap to explore", "")
                     .trim()
                     .trim('•')
                     .trim()
-                    .ifBlank { "Drama" }
+                    .let { if (it.isBlank() || it.equals("TV Series", ignoreCase = true)) "Series" else it }
 
-                Text(
-                    text = genreClean,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Normal,
-                    color = TextSecondary, // #94A3B8
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+                if (seasonDisplay != null) {
+                    val countParts = listOfNotNull(seasonDisplay, epText.ifBlank { null })
+                    Text(
+                        text = countParts.joinToString(" • "),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Normal,
+                        color = TextSecondary, // #94A3B8
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+
+                    if (genreClean != "Series") {
+                        Spacer(modifier = Modifier.height(6.dp))
+
+                        Text(
+                            text = genreClean,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Normal,
+                            color = TextSecondary, // #94A3B8
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                } else {
+                    Text(
+                        text = genreClean,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Normal,
+                        color = TextSecondary, // #94A3B8
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
             }
         }
     }
@@ -2878,11 +3223,15 @@ fun ContinueWatchingCard(
         border = BorderStroke(1.dp, SurfaceBorder)
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
+            val isOfficial = !OnlineMetadataResolver.isDriveVideoFrameUrl(data.displayThumbnailUrl)
+            val cacheKey = if (isOfficial) "official_poster_${data.mediaId}" else "drive_frame_${data.mediaId}"
             // 1. High-Resolution Episode / Movie Artwork
             AsyncImage(
                 model = ImageRequest.Builder(LocalContext.current)
                     .data(data.displayThumbnailUrl)
                     .crossfade(300)
+                    .memoryCacheKey(cacheKey)
+                    .diskCacheKey(cacheKey)
                     .build(),
                 contentDescription = data.episodeTitle,
                 contentScale = ContentScale.Crop,
@@ -3150,7 +3499,6 @@ fun HomeScreen(
     onMovieClick: (Movie) -> Unit,
     onSeriesClick: (Series) -> Unit,
     onContinueWatchingClick: (Episode) -> Unit,
-    onSearchClick: () -> Unit,
     onProfileClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -3164,6 +3512,29 @@ fun HomeScreen(
     val continueWatchingItem by viewModel.continueWatchingItem.collectAsState()
     val resolvedCwItem by viewModel.resolvedContinueWatching.collectAsState()
     val continueWatchingDisplayItem by viewModel.continueWatchingDisplayState.collectAsState()
+
+    var selectedMovieLanguage by remember { mutableStateOf("All") }
+    val displayMovies = remember(movies) {
+        val seenIds = HashSet<String>()
+        movies.filter { movie ->
+            movie.id.isNotBlank() && seenIds.add(movie.id)
+        }
+    }
+    val moviesByLanguage = remember(displayMovies) {
+        displayMovies.groupBy { movie ->
+            val section = MovieIndustryResolver.resolveMovieSection(movie)
+            section.ifBlank { movie.language.ifBlank { "English" } }
+        }
+    }
+    val orderedLanguages = remember(moviesByLanguage) {
+        MovieIndustryResolver.sortIndustrySections(moviesByLanguage.keys)
+    }
+
+    LaunchedEffect(orderedLanguages) {
+        if (selectedMovieLanguage != "All" && selectedMovieLanguage !in orderedLanguages) {
+            selectedMovieLanguage = "All"
+        }
+    }
 
     val isHomeVisible = currentNavTab == HomeNavigationTab.HOME
 
@@ -3182,14 +3553,14 @@ fun HomeScreen(
                 .then(if (!isHomeVisible) Modifier.zIndex(-1f) else Modifier.zIndex(0f))
         ) {
             // ========================================================
-            // 1. TOP APP BAR (Branding, Search Pill, Account Avatar)
+            // 1. TOP APP BAR (Branding on Left, Account Avatar on Right)
             // ========================================================
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 16.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Text(
                     text = "Clotube",
@@ -3197,39 +3568,6 @@ fun HomeScreen(
                     fontSize = 22.sp,
                     fontWeight = FontWeight.Bold
                 )
-
-                Surface(
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(40.dp)
-                        .clip(RoundedCornerShape(20.dp))
-                        .clickable { onSearchClick() },
-                    shape = RoundedCornerShape(20.dp),
-                    color = SurfaceElevated,
-                    border = BorderStroke(1.dp, SurfaceBorder)
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(horizontal = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.Search,
-                            contentDescription = "Search",
-                            tint = Color(0xFF64748B),
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Text(
-                            text = "Search movies, series...",
-                            color = Color(0xFF64748B),
-                            fontSize = 13.sp,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-                }
 
                 Box(
                     modifier = Modifier
@@ -3412,21 +3750,26 @@ fun HomeScreen(
                             }
 
                             // Movies Preview Carousel
-                            item(key = "home_movies_preview") {
-                                SectionHeader(
-                                    title = "Trending Movies",
-                                    onSeeAllClick = { selectedFilter = HomeCatalogFilter.MOVIES }
-                                )
-                                LazyRow(
-                                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
-                                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                                ) {
-                                    items(movies, key = { it.id }) { movie ->
-                                        MovieOverlayCard(
-                                            movie = movie,
-                                            onClick = { onMovieClick(movie) },
-                                            modifier = Modifier.width(220.dp)
-                                        )
+                            if (movies.isNotEmpty()) {
+                                item(key = "home_movies_preview") {
+                                    SectionHeader(
+                                        title = "Movies",
+                                        onSeeAllClick = {
+                                            selectedMovieLanguage = "All"
+                                            selectedFilter = HomeCatalogFilter.MOVIES
+                                        }
+                                    )
+                                    LazyRow(
+                                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                                    ) {
+                                        items(displayMovies, key = { it.id }) { movie ->
+                                            MovieOverlayCard(
+                                                movie = movie,
+                                                onClick = { onMovieClick(movie) },
+                                                modifier = Modifier.width(220.dp)
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -3435,7 +3778,7 @@ fun HomeScreen(
                             item(key = "home_series_preview") {
                                 Spacer(modifier = Modifier.height(14.dp))
                                 SectionHeader(
-                                    title = "Popular Series",
+                                    title = "Series",
                                     onSeeAllClick = { selectedFilter = HomeCatalogFilter.TV_SERIES }
                                 )
                                 LazyRow(
@@ -3459,19 +3802,113 @@ fun HomeScreen(
                         if (movies.isEmpty()) {
                             CatalogEmptyView("No movies available in your Drive folder")
                         } else {
-                            LazyVerticalGrid(
-                                columns = GridCells.Fixed(3),
-                                modifier = Modifier.fillMaxSize(),
-                                contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 8.dp, bottom = 110.dp),
-                                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                                verticalArrangement = Arrangement.spacedBy(14.dp)
-                            ) {
-                                items(movies, key = { it.id }) { movie ->
-                                    MoviePosterCard(
-                                        movie = movie,
-                                        onClick = { onMovieClick(movie) },
-                                        modifier = Modifier.fillMaxWidth()
-                                    )
+                            Column(modifier = Modifier.fillMaxSize()) {
+                                if (orderedLanguages.size > 1) {
+                                    LazyRow(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(horizontal = 16.dp, vertical = 6.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        val pillOptions = listOf("All") + orderedLanguages
+                                        items(pillOptions, key = { it }) { languageOption ->
+                                            val isSelected = selectedMovieLanguage == languageOption
+                                            val backgroundColor by animateColorAsState(
+                                                targetValue = if (isSelected) Color.White else SurfaceDefault,
+                                                animationSpec = AppleTvMotion.fluidSpring(),
+                                                label = "secMovieLangFilterChipBg_$languageOption"
+                                            )
+                                            val textColor by animateColorAsState(
+                                                targetValue = if (isSelected) Color(0xFF08090D) else TextSecondary,
+                                                animationSpec = AppleTvMotion.fluidSpring(),
+                                                label = "secMovieLangFilterChipText_$languageOption"
+                                            )
+                                            val interactionSource = remember { MutableInteractionSource() }
+                                            Surface(
+                                                modifier = Modifier
+                                                    .appleTvPressable(interactionSource, pressedScale = 0.94f)
+                                                    .clip(RoundedCornerShape(20.dp))
+                                                    .clickable(
+                                                        interactionSource = interactionSource,
+                                                        indication = ripple(bounded = true)
+                                                    ) { selectedMovieLanguage = languageOption },
+                                                shape = RoundedCornerShape(20.dp),
+                                                color = backgroundColor,
+                                                border = if (isSelected) null else BorderStroke(1.dp, SurfaceBorder)
+                                            ) {
+                                                Text(
+                                                    text = languageOption,
+                                                    fontSize = 12.sp,
+                                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                                                    color = textColor,
+                                                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+
+                                LazyVerticalGrid(
+                                    columns = GridCells.Fixed(3),
+                                    modifier = Modifier.fillMaxSize(),
+                                    contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 8.dp, bottom = 110.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                                ) {
+                                    if (selectedMovieLanguage == "All" && orderedLanguages.size > 1) {
+                                        orderedLanguages.forEach { languageSection ->
+                                            val sectionMovies = moviesByLanguage[languageSection].orEmpty()
+                                            if (sectionMovies.isNotEmpty()) {
+                                                item(
+                                                    key = "sec_lang_header_$languageSection",
+                                                    span = { GridItemSpan(maxLineSpan) }
+                                                ) {
+                                                    Row(
+                                                        modifier = Modifier
+                                                            .fillMaxWidth()
+                                                            .padding(top = if (languageSection == orderedLanguages.first()) 2.dp else 10.dp, bottom = 2.dp),
+                                                        verticalAlignment = Alignment.CenterVertically,
+                                                        horizontalArrangement = Arrangement.SpaceBetween
+                                                    ) {
+                                                        Text(
+                                                            text = languageSection,
+                                                            color = Color.White,
+                                                            fontSize = 16.sp,
+                                                            fontWeight = FontWeight.SemiBold
+                                                        )
+                                                        Text(
+                                                            text = "${sectionMovies.size} ${if (sectionMovies.size == 1) "movie" else "movies"}",
+                                                            color = Color(0xFF94A3B8),
+                                                            fontSize = 12.sp
+                                                        )
+                                                    }
+                                                }
+                                                items(
+                                                    items = sectionMovies,
+                                                    key = { it.id }
+                                                ) { movie ->
+                                                    MoviePosterCard(
+                                                        movie = movie,
+                                                        onClick = { onMovieClick(movie) },
+                                                        modifier = Modifier.fillMaxWidth()
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        val targetMovies = if (selectedMovieLanguage != "All") {
+                                            moviesByLanguage[selectedMovieLanguage].orEmpty()
+                                        } else {
+                                            displayMovies
+                                        }
+                                        items(targetMovies, key = { it.id }) { movie ->
+                                            MoviePosterCard(
+                                                movie = movie,
+                                                onClick = { onMovieClick(movie) },
+                                                modifier = Modifier.fillMaxWidth()
+                                            )
+                                        }
+                                    }
                                 }
                             }
                         }

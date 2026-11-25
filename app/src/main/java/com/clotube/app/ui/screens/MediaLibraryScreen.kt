@@ -1,6 +1,7 @@
 package com.clotube.app.ui.screens
 
 import androidx.activity.compose.BackHandler
+import com.clotube.app.model.toMovie
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.LinearEasing
@@ -285,6 +286,8 @@ fun MediaLibraryScreen(
             RecentScreen(
                 playbackHistoryManager = viewModel.playbackHistoryManager,
                 viewModel = viewModel,
+                moviesList = uiState.movies.ifEmpty { uiState.moviesList.map { it.toMovie() } },
+                tvSeriesList = uiState.tvSeriesList,
                 onResumeItem = { historyItem ->
                     if (historyItem.isSeries && !historyItem.seriesId.isNullOrBlank()) {
                         val s = viewModel.getSeriesById(historyItem.seriesId)
@@ -377,7 +380,7 @@ fun MediaLibraryScreen(
             HomeFilterChipsRow(
                 selectedFilter = when (uiState.selectedFilter) {
                     HomeCatalogFilter.MOVIES.title -> HomeCatalogFilter.MOVIES
-                    HomeCatalogFilter.TV_SERIES.title -> HomeCatalogFilter.TV_SERIES
+                    HomeCatalogFilter.TV_SERIES.title, "TV Series" -> HomeCatalogFilter.TV_SERIES
                     else -> HomeCatalogFilter.ALL
                 },
                 onFilterSelected = { filter ->
@@ -418,7 +421,7 @@ fun MediaLibraryScreen(
                         )
                         Spacer(modifier = Modifier.height(12.dp))
                         Text(
-                            text = if (uiState.selectedFilter == "Movies") "No movies found" else if (uiState.selectedFilter == "TV Series") "No TV series found" else "No videos found",
+                            text = if (uiState.selectedFilter == "Movies") "No movies found" else if (uiState.selectedFilter == "TV Series" || uiState.selectedFilter == "Series") "No series found" else "No videos found",
                             fontSize = 16.sp,
                             fontWeight = FontWeight.Bold,
                             color = TextHighEmphasis
@@ -449,7 +452,7 @@ fun MediaLibraryScreen(
                         }
                     }
                 }
-            } else if (uiState.selectedFilter == "TV Series") {
+            } else if (uiState.selectedFilter == "TV Series" || uiState.selectedFilter == "Series") {
                 // TV Series OTT Cards Grid
                 LazyVerticalGrid(
                     columns = GridCells.Fixed(2),

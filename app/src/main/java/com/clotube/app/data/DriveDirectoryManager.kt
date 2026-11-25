@@ -3,6 +3,8 @@ package com.clotube.app.data
 import com.google.api.services.drive.Drive
 import com.google.api.services.drive.model.File
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -23,32 +25,38 @@ object DriveDirectoryManager {
     suspend fun resolveHierarchy(drive: Drive): AndroidResolvedDirectories = withContext(Dispatchers.IO) {
         resolveMutex.withLock {
             val rootId = getOrCreateFolder(drive, "clotube", parentId = null)
-            val historyId = getOrCreateFolder(drive, "History", parentId = rootId)
 
-            val scopedMovies = findChildFolder(drive, "Movies", rootId)
-            val moviesId = if (scopedMovies != null && hasFiles(drive, scopedMovies)) {
-                scopedMovies
-            } else {
-                resolveLegacyFolder(drive, setOf("movies", "movie", "films", "cinema"))
-                    ?: scopedMovies
-                    ?: getOrCreateFolder(drive, "Movies", parentId = rootId)
+            coroutineScope {
+                val moviesDeferred = async(Dispatchers.IO) {
+                    val scopedMovies = findChildFolder(drive, "Movies", rootId)
+                    if (scopedMovies != null && hasFiles(drive, scopedMovies)) {
+                        scopedMovies
+                    } else {
+                        scopedMovies ?: getOrCreateFolder(drive, "Movies", parentId = rootId)
+                    }
+                }
+
+                val seriesDeferred = async(Dispatchers.IO) {
+                    val scopedSeries = findChildFolder(drive, "Series", rootId)
+                    if (scopedSeries != null && hasFiles(drive, scopedSeries)) {
+                        scopedSeries
+                    } else {
+                        scopedSeries ?: getOrCreateFolder(drive, "Series", parentId = rootId)
+                    }
+                }
+
+                val historyDeferred = async(Dispatchers.IO) {
+                    findChildFolder(drive, "History", rootId)
+                        ?: getOrCreateFolder(drive, "History", parentId = rootId)
+                }
+
+                AndroidResolvedDirectories(
+                    clotubeRootId = rootId,
+                    moviesFolderId = moviesDeferred.await(),
+                    seriesFolderId = seriesDeferred.await(),
+                    historyFolderId = historyDeferred.await()
+                )
             }
-
-            val scopedSeries = findChildFolder(drive, "Series", rootId)
-            val seriesId = if (scopedSeries != null && hasFiles(drive, scopedSeries)) {
-                scopedSeries
-            } else {
-                resolveLegacyFolder(drive, setOf("series", "tv series", "tv shows", "shows"))
-                    ?: scopedSeries
-                    ?: getOrCreateFolder(drive, "Series", parentId = rootId)
-            }
-
-            AndroidResolvedDirectories(
-                clotubeRootId = rootId,
-                moviesFolderId = moviesId,
-                seriesFolderId = seriesId,
-                historyFolderId = historyId
-            )
         }
     }
 

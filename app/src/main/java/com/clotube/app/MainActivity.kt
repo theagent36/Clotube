@@ -49,18 +49,18 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.lifecycleScope
 import com.clotube.app.data.DriveWatchHistorySync
-import com.clotube.app.data.playbackDataStore
 import com.clotube.app.navigation.ClotubeNavHost
 import com.clotube.app.network.ClotubeNetworkMonitor
 import com.clotube.app.ui.theme.ClotubeTheme
 import com.clotube.app.viewmodel.VideoViewModel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 class MainActivity : ComponentActivity() {
     private val videoViewModel: VideoViewModel by viewModels()
-    private val dataStore by lazy { applicationContext.playbackDataStore }
     private val driveWatchHistorySync by lazy { DriveWatchHistorySync.getInstance(this) }
 
     private val authRecoveryLauncher = registerForActivityResult(
@@ -291,39 +291,46 @@ fun ClotubeBootScreen(
     val letterAlphas = remember { List(letters.size) { Animatable(0f) } }
 
     LaunchedEffect(Unit) {
-        // 1. Kick off cloud sync and catalog hydration asynchronously in the background
-        viewModel.prepareInitialState()
+        // 1. Start authoritative Drive watch history & catalog hydration immediately
+        val bootHydrationJob = async {
+            withTimeoutOrNull(10_500L) {
+                viewModel.prepareInitialState()
+            }
+        }
 
         // 2. Play brand animation smoothly
         launch {
             iconAlpha.animateTo(
                 targetValue = 1f,
-                animationSpec = tween(durationMillis = 240)
+                animationSpec = tween(durationMillis = 280)
             )
         }
         iconScale.animateTo(
             targetValue = 1f,
             animationSpec = spring(
                 dampingRatio = Spring.DampingRatioMediumBouncy,
-                stiffness = Spring.StiffnessMedium
+                stiffness = Spring.StiffnessLow
             )
         )
 
-        delay(80)
+        delay(120)
 
-        // Rapid sequential character reveal
         letters.forEachIndexed { index, _ ->
             launch {
-                delay(index * 55L)
+                delay(index * 75L)
                 letterAlphas[index].animateTo(
                     targetValue = 1f,
-                    animationSpec = tween(durationMillis = 160)
+                    animationSpec = tween(durationMillis = 180)
                 )
             }
         }
 
-        // Brief hold to view the completed wordmark, then transition immediately
-        delay(400)
+        // Minimum visual hold so the wordmark is clearly legible
+        delay(600)
+
+        // 3. Hold boot screen until Drive history & Continue Watching item are 100% resolved
+        bootHydrationJob.await()
+
         onBootComplete()
     }
 

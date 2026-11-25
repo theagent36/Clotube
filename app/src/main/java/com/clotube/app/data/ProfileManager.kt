@@ -86,6 +86,18 @@ object ProfileManager {
     }
 
     /**
+     * Loads the profile registry synchronously if not already initialized.
+     */
+    fun ensureLoadedSync(context: Context) {
+        if (isInitialized) return
+        synchronized(this) {
+            if (isInitialized) return
+            loadRegistryLocked(context)
+            isInitialized = true
+        }
+    }
+
+    /**
      * Loads the profile registry from disk into memory.
      */
     suspend fun ensureLoaded(context: Context) = withContext(Dispatchers.IO) {

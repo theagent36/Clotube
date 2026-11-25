@@ -3,14 +3,9 @@ package com.clotube.app.data
 import android.accounts.Account
 import android.content.Context
 import android.util.Log
-import androidx.datastore.core.DataStore
-import androidx.datastore.preferences.core.Preferences
-import androidx.datastore.preferences.core.booleanPreferencesKey
-import androidx.datastore.preferences.core.edit
-import androidx.datastore.preferences.core.floatPreferencesKey
-import androidx.datastore.preferences.core.intPreferencesKey
-import androidx.datastore.preferences.core.longPreferencesKey
-import androidx.datastore.preferences.core.stringPreferencesKey
+import com.clotube.app.auth.GoogleAuthRepository
+import com.clotube.app.data.ByocConfigManager
+import com.clotube.app.data.TokenRepository
 import com.google.android.gms.auth.api.signin.GoogleSignIn
 import com.google.api.client.googleapis.extensions.android.gms.auth.GoogleAccountCredential
 import com.google.api.client.googleapis.json.GoogleJsonResponseException
@@ -19,47 +14,47 @@ import com.google.api.client.http.javanet.NetHttpTransport
 import com.google.api.client.json.gson.GsonFactory
 import com.google.api.services.drive.Drive
 import com.google.api.services.drive.DriveScopes
-import kotlinx.coroutines.*
-import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
-import java.util.Collections
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 enum class SyncPriority(val level: Int) {
-    CRITICAL_WATCH_STATE(1), // Mark / Unmark watched
-    TIMESTAMPS_AND_SEEK(2),  // Progress & resume timestamps
-    BACKGROUND_SYNC(3)       // Periodic remote pull
+    CRITICAL_WATCH_STATE(1),
+    TIMESTAMPS_AND_SEEK(2),
+    BACKGROUND_SYNC(3)
 }
 
 class DriveWatchHistorySync(private val context: Context) {
 
     private val appContext: Context = context.applicationContext
-    private val TAG = "ClotubeSync"
-    private val syncScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private val cachedFileId = AtomicReference<String?>(null)
+    val syncScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val cachedActiveFileId = AtomicReference<String?>(null)
+    private val cachedArchiveFileId = AtomicReference<String?>(null)
     private val cachedHistoryFolderId = AtomicReference<String?>(null)
-    private val lastUploadedHash = AtomicReference<String>("")
     private val uploadMutex = Mutex()
     private val lastUploadTime = AtomicLong(0L)
-    private val isSyncingFromCloud = AtomicBoolean(false)
+    private val isPullingFromCloud = AtomicBoolean(false)
     private val lastCloudPullTimeMs = AtomicLong(0L)
-
-    private data class SyncTarget(
-        val fileId: String?,
-        val parentFolderId: String,
-        val isV2: Boolean
-    )
+    private var debouncedProgressJob: Job? = null
 
     fun invalidateCache() {
-        cachedFileId.set(null)
+        cachedActiveFileId.set(null)
+        cachedArchiveFileId.set(null)
         cachedHistoryFolderId.set(null)
-        lastUploadedHash.set("")
         lastCloudPullTimeMs.set(0L)
     }
 
@@ -70,15 +65,13 @@ class DriveWatchHistorySync(private val context: Context) {
         dirs.historyFolderId
     }
 
-    private suspend fun resolveTarget(driveService: Drive): SyncTarget = withContext(Dispatchers.IO) {
-        val historyFolderId = resolveHistoryFolderId(driveService)
-
-        cachedFileId.get()?.takeIf { it.isNotBlank() }?.let { cachedId ->
-            return@withContext SyncTarget(cachedId, historyFolderId, isV2 = true)
-        }
-
-        val v2Res = driveService.files().list()
-            .setQ("'$historyFolderId' in parents and name = '$ACTIVE_SYNC_FILE' and trashed = false")
+    private fun findFileInHistoryFolder(
+        driveService: Drive,
+        historyFolderId: String,
+        fileName: String
+    ): String? {
+        val scopedRes = driveService.files().list()
+            .setQ("'$historyFolderId' in parents and name = '$fileName' and trashed = false")
             .setOrderBy("modifiedTime desc")
             .setFields("files(id, parents, modifiedTime)")
             .setSupportsAllDrives(true)
@@ -86,15 +79,11 @@ class DriveWatchHistorySync(private val context: Context) {
             .setPageSize(5)
             .execute()
 
-        val v2Id = v2Res.files?.firstOrNull()?.id
-        if (v2Id != null) {
-            cachedFileId.set(v2Id)
-            return@withContext SyncTarget(v2Id, historyFolderId, isV2 = true)
-        }
+        val scopedId = scopedRes.files?.firstOrNull()?.id
+        if (!scopedId.isNullOrBlank()) return scopedId
 
-        // Fallback: locate clotube_active_sync.json anywhere in Drive (e.g., if PC created a sibling Clotube/History folder)
-        val globalV2Res = driveService.files().list()
-            .setQ("name = '$ACTIVE_SYNC_FILE' and trashed = false")
+        val globalRes = driveService.files().list()
+            .setQ("name = '$fileName' and trashed = false")
             .setOrderBy("modifiedTime desc")
             .setFields("files(id, parents, modifiedTime)")
             .setSupportsAllDrives(true)
@@ -102,930 +91,394 @@ class DriveWatchHistorySync(private val context: Context) {
             .setPageSize(5)
             .execute()
 
-        val globalV2 = globalV2Res.files?.firstOrNull()
-        if (globalV2 != null && !globalV2.id.isNullOrBlank()) {
-            val resolvedParent = globalV2.parents?.firstOrNull()?.takeIf { it.isNotBlank() } ?: historyFolderId
-            cachedFileId.set(globalV2.id)
-            cachedHistoryFolderId.set(resolvedParent)
-            return@withContext SyncTarget(globalV2.id, resolvedParent, isV2 = true)
-        }
-
-        val scopedLegacy = driveService.files().list()
-            .setQ("'$historyFolderId' in parents and name = '$LEGACY_SYNC_FILE' and trashed = false")
-            .setFields("files(id)")
-            .setSupportsAllDrives(true)
-            .setIncludeItemsFromAllDrives(true)
-            .setPageSize(1)
-            .execute()
-
-        val scopedLegacyId = scopedLegacy.files?.firstOrNull()?.id
-        if (scopedLegacyId != null) {
-            return@withContext SyncTarget(scopedLegacyId, historyFolderId, isV2 = false)
-        }
-
-        val rootLegacyId = findLegacyRootHistoryFileId(driveService)
-        if (rootLegacyId != null) {
-            return@withContext SyncTarget(rootLegacyId, historyFolderId, isV2 = false)
-        }
-        SyncTarget(null, historyFolderId, isV2 = true)
-    }
-
-    // Priority-based task request holder
-    private class SyncTask(
-        val priority: SyncPriority,
-        val dataStore: DataStore<Preferences>,
-        val onComplete: CompletableDeferred<Boolean>? = null
-    ) : Comparable<SyncTask> {
-        override fun compareTo(other: SyncTask): Int = this.priority.level.compareTo(other.priority.level)
-    }
-
-    private val taskChannel = Channel<SyncTask>(Channel.UNLIMITED)
-
-    init {
-        // Background Priority Queue Consumer
-        syncScope.launch {
-            while (isActive) {
-                val firstTask = taskChannel.receive()
-                val pending = mutableListOf<SyncTask>()
-                pending.add(firstTask)
-
-                // Drain any immediately available tasks to sort by priority
-                var next = taskChannel.tryReceive().getOrNull()
-                while (next != null) {
-                    pending.add(next)
-                    next = taskChannel.tryReceive().getOrNull()
-                }
-
-                // Sort: CRITICAL_WATCH_STATE (1) first, TIMESTAMPS_AND_SEEK (2), BACKGROUND_SYNC (3)
-                pending.sort()
-
-                val criticalTasks = pending.filter { it.priority == SyncPriority.CRITICAL_WATCH_STATE }
-                val progressTasks = pending.filter { it.priority == SyncPriority.TIMESTAMPS_AND_SEEK }
-                val backgroundTasks = pending.filter { it.priority == SyncPriority.BACKGROUND_SYNC }
-
-                // 1. Process all Critical tasks first (mark/unmark watched)
-                for (task in criticalTasks) {
-                    try {
-                        val success = executeDirectUploadInternal(task.dataStore, task.priority)
-                        task.onComplete?.complete(success)
-                    } catch (e: Exception) {
-                        Log.e(TAG, "SyncTask failure: ${e.message}", e)
-                        task.onComplete?.complete(false)
-                    }
-                }
-
-                // 2. Process latest progress task (deduplicating redundant progress snapshots)
-                if (progressTasks.isNotEmpty()) {
-                    val latestProgress = progressTasks.last()
-                    progressTasks.dropLast(1).forEach { it.onComplete?.complete(true) }
-                    try {
-                        val success = executeDirectUploadInternal(latestProgress.dataStore, latestProgress.priority)
-                        latestProgress.onComplete?.complete(success)
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Progress task failure: ${e.message}", e)
-                        latestProgress.onComplete?.complete(false)
-                    }
-                }
-
-                // 3. Process background reconciliation tasks
-                for (task in backgroundTasks) {
-                    try {
-                        val success = executeDirectUploadInternal(task.dataStore, task.priority)
-                        task.onComplete?.complete(success)
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Background task failure: ${e.message}", e)
-                        task.onComplete?.complete(false)
-                    }
-                }
+        val globalMatch = globalRes.files?.firstOrNull()
+        if (globalMatch != null && !globalMatch.id.isNullOrBlank()) {
+            globalMatch.parents?.firstOrNull()?.takeIf { it.isNotBlank() }?.let {
+                cachedHistoryFolderId.set(it)
             }
+            return globalMatch.id
         }
+        return null
     }
 
-    /**
-     * Priority 1: High-priority immediate dispatch for marking watched/unwatched.
-     * Bypasses debouncing and pulls; uploads the local DataStore snapshot directly within 100ms.
-     * Runs under NonCancellable so app backgrounding cannot cancel an in-flight HTTP request.
-     */
-    fun enqueueImmediateWatchState(dataStore: DataStore<Preferences>) {
-        syncScope.launch(NonCancellable) {
-            Log.d(TAG, "[P1 - CRITICAL] Enqueuing immediate watch status push to Drive...")
-            val deferred = CompletableDeferred<Boolean>()
-            taskChannel.send(SyncTask(SyncPriority.CRITICAL_WATCH_STATE, dataStore, deferred))
-            deferred.await()
-        }
-    }
-
-    /**
-     * Priority 2: Periodic timestamp update (debounced/queued every 8-10 seconds).
-     */
-    fun enqueueProgressUpdate(dataStore: DataStore<Preferences>) {
-        val now = System.currentTimeMillis()
-        if (now - lastUploadTime.get() < 8000L) {
-            return // Throttled: progress updates wait at least 8 seconds between uploads
-        }
-        syncScope.launch(NonCancellable) {
-            taskChannel.send(SyncTask(SyncPriority.TIMESTAMPS_AND_SEEK, dataStore))
-        }
-    }
-
-    /**
-     * Flushes progress immediately on pause or player exit.
-     */
-    fun flushProgressImmediately(dataStore: DataStore<Preferences>) {
-        syncScope.launch(NonCancellable) {
-            taskChannel.send(SyncTask(SyncPriority.TIMESTAMPS_AND_SEEK, dataStore))
-        }
-    }
-
-    /**
-     * Priority 3: Low-priority background sync and remote pull.
-     */
-    fun enqueueBackgroundSync(dataStore: DataStore<Preferences>) {
-        syncScope.launch(NonCancellable) {
-            taskChannel.send(SyncTask(SyncPriority.BACKGROUND_SYNC, dataStore))
-        }
-    }
-
-    /**
-     * Legacy compatibility bridge for existing callers.
-     */
-    fun backupImmediately(dataStore: DataStore<Preferences>? = null) {
-        val target = dataStore ?: appContext.playbackDataStore
-        enqueueImmediateWatchState(target)
-    }
-
-    fun triggerThrottledBackup(dataStore: DataStore<Preferences>) {
-        enqueueProgressUpdate(dataStore)
-    }
-
-    /**
-     * Triggers an immediate force-upload to Drive.
-     *
-     * When force=true the enqueued task is processed as CRITICAL_WATCH_STATE priority,
-     * which causes executeDirectUploadInternal to skip both the 15-second debounce window
-     * AND the hash-equality guard, uploading the current payload unconditionally.
-     */
-    fun pushHistoryAsync(dataStore: DataStore<Preferences>? = null, force: Boolean = false) {
-        val target = dataStore ?: appContext.playbackDataStore
-        enqueueImmediateWatchState(target)
-    }
-
-    suspend fun executeDirectUpload(dataStore: DataStore<Preferences>? = null): Boolean {
-        val target = dataStore ?: appContext.playbackDataStore
-        return executeDirectUploadInternal(target, SyncPriority.CRITICAL_WATCH_STATE)
-    }
-
-    private suspend fun buildV2PayloadJson(dataStore: DataStore<Preferences>): String = withContext(Dispatchers.IO) {
-        val allEntries = dataStore.data.first().asMap()
-        val combined = mutableMapOf<String, AndroidTypedEntry>()
-
-        allEntries.forEach { (key, value) ->
-            val typed = when (value) {
-                is Long -> AndroidTypedEntry("long", value)
-                is Int -> AndroidTypedEntry("int", value)
-                is Float -> AndroidTypedEntry("float", value)
-                is Boolean -> AndroidTypedEntry("boolean", value)
-                is String -> AndroidTypedEntry("string", value)
-                else -> null
-            }
-            if (typed != null) {
-                combined[key.name] = typed
-            }
-        }
-
-        val email = GoogleSignIn.getLastSignedInAccount(appContext)?.email.orEmpty()
-        if (email.isNotBlank()) {
-            val localProfileEntries = AndroidWatchHistoryManager.loadLocalSync(appContext, email)
-            val snapshot = synchronized(localProfileEntries) { localProfileEntries.toMap() }
-            snapshot.forEach { (keyName, entry) ->
-                val tsKey = resolveTimestampKey(keyName)
-                val profileTs = (snapshot[tsKey]?.value as? Number)?.toLong() ?: 0L
-                val dsTs = (combined[tsKey]?.value as? Number)?.toLong() ?: 0L
-                if (!combined.containsKey(keyName) || profileTs > dsTs) {
-                    combined[keyName] = entry
-                }
-            }
-        }
-
-        AndroidWatchHistoryManager.buildV2PayloadFromEntries(combined).toJsonString()
-    }
-
-    /**
-     * Core upload worker. Runs under [NonCancellable] + [Dispatchers.IO] to guarantee
-     * that in-flight Drive HTTP calls are never interrupted by coroutine cancellation
-     * (e.g., user navigating away while an unwatch is being uploaded).
-     *
-     * Debounce / hash-guard bypass:
-     * - When [priority] == [SyncPriority.CRITICAL_WATCH_STATE], both guards are skipped
-     *   unconditionally, so the payload is always uploaded regardless of timing or content.
-     * - For [SyncPriority.TIMESTAMPS_AND_SEEK] and [SyncPriority.BACKGROUND_SYNC], the
-     *   hash equality check is applied, but the 15-second wall-clock gate is NOT applied
-     *   here (the caller-side [enqueueProgressUpdate] already enforces the 8-second gate).
-     */
-    private suspend fun executeDirectUploadInternal(
-        dataStore: DataStore<Preferences>,
-        priority: SyncPriority
-    ): Boolean = uploadMutex.withLock {
-        withContext(NonCancellable + Dispatchers.IO) {
-            try {
-                val driveService = getDriveService()
-                if (driveService == null) {
-                    Log.e(TAG, "Sync aborted: Google Drive service unavailable")
-                    return@withContext false
-                }
-
-                var target = resolveTarget(driveService)
-
-                // For background sync, perform remote pull and merge first
-                if (priority == SyncPriority.BACKGROUND_SYNC && target.fileId != null) {
-                    try {
-                        val outputStream = ByteArrayOutputStream()
-                        driveService.files().get(target.fileId)
-                            .setSupportsAllDrives(true)
-                            .executeMediaAndDownloadTo(outputStream)
-                        val remoteJson = outputStream.toString("UTF-8")
-                        if (remoteJson.isNotBlank()) {
-                            mergeRemotePayload(dataStore, remoteJson)
-                        }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Background pre-pull failed: ${e.message}")
-                    }
-                }
-
-                val payloadJson = buildV2PayloadJson(dataStore)
-                val payloadHash = payloadJson.hashCode().toString()
-
-                // CRITICAL_WATCH_STATE bypasses BOTH the debounce timer AND the hash-equality check,
-                // ensuring that mark/unmark operations always reach Drive regardless of recent uploads
-                // or identical-looking payloads from an immediately preceding background sync.
-                if (priority != SyncPriority.CRITICAL_WATCH_STATE &&
-                    target.isV2 &&
-                    target.fileId != null &&
-                    payloadHash == lastUploadedHash.get()
-                ) {
-                    return@withContext true
-                }
-
-                val mediaContent = ByteArrayContent.fromString("application/json", payloadJson)
-                Log.d(TAG, "[${priority.name}] Uploading v2 payload (${mediaContent.length} bytes) to clotube/History/$ACTIVE_SYNC_FILE...")
-
-                if (target.fileId != null && target.isV2) {
-                    try {
-                        driveService.files().update(target.fileId, null, mediaContent)
-                            .setSupportsAllDrives(true)
-                            .execute()
-                        cachedFileId.set(target.fileId)
-                        lastUploadedHash.set(payloadHash)
-                        lastUploadTime.set(System.currentTimeMillis())
-                        Log.i(TAG, "SUCCESS! [${priority.name}] Updated $ACTIVE_SYNC_FILE in clotube/History/ (${target.fileId}, ${mediaContent.length} bytes)")
-                        return@withContext true
-                    } catch (e: GoogleJsonResponseException) {
-                        if (e.statusCode == 404 || (e.statusCode == 403 && e.details?.errors?.any { it.reason == "appNotAuthorizedToFile" } == true)) {
-                            invalidateCache()
-                            target = resolveTarget(driveService)
-                        } else {
-                            throw e
-                        }
-                    }
-                }
-
-                if (target.fileId != null && target.isV2) {
-                    driveService.files().update(target.fileId, null, mediaContent)
-                        .setSupportsAllDrives(true)
-                        .execute()
-                    cachedFileId.set(target.fileId)
-                    lastUploadedHash.set(payloadHash)
-                    lastUploadTime.set(System.currentTimeMillis())
-                    Log.i(TAG, "SUCCESS! [${priority.name}] Updated $ACTIVE_SYNC_FILE in clotube/History/ (${target.fileId}, ${mediaContent.length} bytes)")
-                    return@withContext true
-                }
-
-                // File does not exist in clotube/History/: create clotube_active_sync.json
-                val metadata = com.google.api.services.drive.model.File().apply {
-                    name = ACTIVE_SYNC_FILE
-                    mimeType = "application/json"
-                    parents = listOf(target.parentFolderId)
-                }
-                val created = driveService.files().create(metadata, mediaContent)
-                    .setSupportsAllDrives(true)
-                    .execute()
-
-                cachedFileId.set(created.id)
-                lastUploadedHash.set(payloadHash)
-                lastUploadTime.set(System.currentTimeMillis())
-                Log.i(TAG, "SUCCESS! Created $ACTIVE_SYNC_FILE in clotube/History/ (fileId: ${created.id}, folderId: ${target.parentFolderId}, ${mediaContent.length} bytes)")
-                true
-            } catch (e: Exception) {
-                Log.e(TAG, "Direct cloud sync failed: ${e.message}", e)
-                false
-            }
-        }
-    }
-
-    fun resolveTimestampKey(key: String): String {
-        return if (key.startsWith("series_resume_")) {
-            val suffix = when {
-                key.endsWith("_series_title") -> "_series_title"
-                key.endsWith("_episode_id") -> "_episode_id"
-                key.endsWith("_episode_title") -> "_episode_title"
-                key.endsWith("_season_num") -> "_season_num"
-                key.endsWith("_episode_num") -> "_episode_num"
-                key.endsWith("_pos_ms") -> "_pos_ms"
-                key.endsWith("_dur_ms") -> "_dur_ms"
-                key.endsWith("_fraction") -> "_fraction"
-                key.endsWith("_thumb") -> "_thumb"
-                key.endsWith("_timestamp") -> "_timestamp"
-                else -> ""
-            }
-            if (suffix.isNotEmpty()) {
-                val seriesId = key.removePrefix("series_resume_").removeSuffix(suffix)
-                "series_resume_${seriesId}_timestamp"
-            } else {
-                "${key.substringBeforeLast('_')}_timestamp"
-            }
-        } else if (key.startsWith("snapshot_")) {
-            "snapshot_timestamp"
-        } else if (key.startsWith("global_") || key.startsWith("last_global_")) {
-            "global_latest_timestamp"
-        } else {
-            val suffix = when {
-                key.endsWith("_title") -> "_title"
-                key.endsWith("_pos") -> "_pos"
-                key.endsWith("_dur") -> "_dur"
-                key.endsWith("_fraction") -> "_fraction"
-                key.endsWith("_timestamp") -> "_timestamp"
-                key.endsWith("_is_series") -> "_is_series"
-                key.endsWith("_is_watched") -> "_is_watched"
-                key.endsWith("_series_id") -> "_series_id"
-                key.endsWith("_series_title") -> "_series_title"
-                key.endsWith("_season_num") -> "_season_num"
-                key.endsWith("_episode_num") -> "_episode_num"
-                key.endsWith("_thumb") -> "_thumb"
-                else -> ""
-            }
-            if (suffix.isNotEmpty()) {
-                val fileId = key.removeSuffix(suffix)
-                "${fileId}_timestamp"
-            } else {
-                "${key.substringBeforeLast('_')}_timestamp"
-            }
-        }
-    }
-
-    /**
-     * Merges a remote payload into the local DataStore and the profile-scoped file cache.
-     *
-     * For V2 payloads, the merge now faithfully propagates unwatch events originating from
-     * Android or Desktop:
-     * - Active items whose remote timestamp wins are written with their exact `isWatched` flag,
-     *   so a remote isWatched=false clears the local `_is_watched` DataStore key.
-     * - `watchedIds`-only entries (no corresponding active item) are merged additively with the
-     *   existing timestamp-wins guard.
-     */
-    suspend fun mergeRemotePayload(dataStore: DataStore<Preferences>, remoteJson: String): Boolean {
-        if (remoteJson.isBlank()) return false
+    private fun downloadJsonFile(driveService: Drive, fileId: String): String? {
         return try {
-            val email = ProfileManager.activeProfileEmail.value?.takeIf { it.isNotBlank() }
-                ?: GoogleSignIn.getLastSignedInAccount(appContext)?.email.orEmpty()
-
-            if (AndroidWatchHistoryManager.isV2Payload(remoteJson)) {
-                val payload = WatchHistoryPayloadV2.fromJsonString(remoteJson)
-                val normalizedUpdatedAt = WatchHistoryPayloadV2.normalizeTimestampMs(payload.updatedAt)
-                val activeById = payload.active.associateBy { it.id }
-                val remoteWatchedSet = (payload.watchedIds + payload.active.filter { it.isWatched }.map { it.id })
-                    .filter { it.isNotBlank() }
-                    .toSet()
-
-                dataStore.edit { prefs ->
-                    val existingKeyNames = prefs.asMap().keys.map { it.name }.toSet()
-
-                    // 1. Apply watchedIds and active[].w == true:
-                    //    Write ${id}_is_watched = true and ${id}_fraction = 1.0f into playbackDataStore
-                    //    (unless local ${id}_timestamp is strictly newer and explicitly marked unwatched),
-                    //    so episodes completed on PC immediately stop appearing as in-progress candidates.
-                    for (id in remoteWatchedSet) {
-                        val localTs = prefs[longPreferencesKey("${id}_timestamp")] ?: 0L
-                        val localExplicitWatched = prefs[booleanPreferencesKey("${id}_is_watched")]
-                        val remoteItemTs = WatchHistoryPayloadV2.normalizeTimestampMs(
-                            activeById[id]?.timestamp ?: normalizedUpdatedAt
-                        )
-                        val localStrictlyNewerUnwatched = localExplicitWatched == false && localTs > remoteItemTs
-                        if (!localStrictlyNewerUnwatched) {
-                            prefs[booleanPreferencesKey("${id}_is_watched")] = true
-                            prefs[floatPreferencesKey("${id}_fraction")] = 1.0f
-                            if (!existingKeyNames.contains("${id}_timestamp") || remoteItemTs > localTs) {
-                                prefs[longPreferencesKey("${id}_timestamp")] = remoteItemTs
-                            }
-                        }
-                    }
-
-                    // 2. Apply active items: compare remote.timestamp > localTimestamp (or missing locally);
-                    //    preserve actual in-progress positionMs and fraction for unwatched items.
-                    for (item in payload.active) {
-                        if (item.id.isBlank()) continue
-                        val itemTs = WatchHistoryPayloadV2.normalizeTimestampMs(item.timestamp)
-                        val localTs = prefs[longPreferencesKey("${item.id}_timestamp")] ?: 0L
-                        val isMissing = !existingKeyNames.contains("${item.id}_pos") &&
-                            !existingKeyNames.contains("${item.id}_is_watched")
-                        if (itemTs > localTs || isMissing) {
-                            if (item.title.isNotBlank()) {
-                                prefs[stringPreferencesKey("${item.id}_title")] = item.title
-                            }
-                            val isItemWatched = item.isWatched || item.id in remoteWatchedSet
-                            val effectiveFrac = if (isItemWatched) {
-                                1.0f
-                            } else if (item.durationMs > 0L) {
-                                (item.positionMs.toFloat() / item.durationMs.toFloat()).coerceIn(0f, 1f)
-                            } else {
-                                item.progressFraction.coerceIn(0f, 1f)
-                            }
-                            val effectivePos = if (isItemWatched) {
-                                if (item.positionMs > 0L) item.positionMs else item.durationMs
-                            } else {
-                                item.positionMs
-                            }
-                            prefs[longPreferencesKey("${item.id}_pos")] = effectivePos
-                            prefs[longPreferencesKey("${item.id}_dur")] = item.durationMs
-                            prefs[floatPreferencesKey("${item.id}_fraction")] = effectiveFrac
-                            prefs[longPreferencesKey("${item.id}_timestamp")] = itemTs
-                            prefs[booleanPreferencesKey("${item.id}_is_watched")] = isItemWatched
-                            val isSeries = !item.seriesId.isNullOrBlank() ||
-                                item.seasonNumber != null || item.episodeNumber != null
-                            prefs[booleanPreferencesKey("${item.id}_is_series")] = isSeries
-                            if (!item.seriesId.isNullOrBlank()) {
-                                prefs[stringPreferencesKey("${item.id}_series_id")] = item.seriesId
-                            }
-                            if (item.seasonNumber != null) {
-                                prefs[intPreferencesKey("${item.id}_season_num")] = item.seasonNumber
-                            }
-                            if (item.episodeNumber != null) {
-                                prefs[intPreferencesKey("${item.id}_episode_num")] = item.episodeNumber
-                            }
-                        }
-                    }
-
-                    // 3. Apply resume series pointers AND synchronize target episodeId keys so
-                    //    rolled-over episodes (e.g., S07:E10 with pos=0) are immediately selected.
-                    for ((sid, res) in payload.resume) {
-                        if (sid.isBlank() || res.episodeId.isBlank()) continue
-                        val resTs = WatchHistoryPayloadV2.normalizeTimestampMs(res.timestamp)
-                        val prefix = "series_resume_$sid"
-                        val localTs = prefs[longPreferencesKey("${prefix}_timestamp")] ?: 0L
-                        val isMissing = !existingKeyNames.contains("${prefix}_episode_id")
-                        if (resTs > localTs || isMissing) {
-                            val frac = if (res.durationMs > 0L) {
-                                (res.positionMs.toFloat() / res.durationMs.toFloat()).coerceIn(0f, 1f)
-                            } else {
-                                0f
-                            }
-                            prefs[stringPreferencesKey("${prefix}_episode_id")] = res.episodeId
-                            prefs[intPreferencesKey("${prefix}_season_num")] = res.seasonNumber
-                            prefs[intPreferencesKey("${prefix}_episode_num")] = res.episodeNumber
-                            prefs[longPreferencesKey("${prefix}_pos_ms")] = res.positionMs
-                            prefs[longPreferencesKey("${prefix}_dur_ms")] = res.durationMs
-                            prefs[floatPreferencesKey("${prefix}_fraction")] = frac
-                            prefs[longPreferencesKey("${prefix}_timestamp")] = resTs
-                            val epTitle = activeById[res.episodeId]?.title?.takeIf { it.isNotBlank() }
-                            if (epTitle != null) {
-                                prefs[stringPreferencesKey("${prefix}_episode_title")] = epTitle
-                            }
-
-                            // Synchronize target episodeId record so PlaybackHistoryManager & VideoViewModel pick it up immediately
-                            val epId = res.episodeId
-                            val localEpTs = prefs[longPreferencesKey("${epId}_timestamp")] ?: 0L
-                            val targetEpTs = maxOf(localEpTs, resTs)
-                            prefs[longPreferencesKey("${epId}_timestamp")] = targetEpTs
-                            val isResumeCompleted = res.durationMs > 0L && res.positionMs >= (res.durationMs * 0.90f)
-                            if (!isResumeCompleted) {
-                                prefs[booleanPreferencesKey("${epId}_is_watched")] = false
-                            }
-                            if (!existingKeyNames.contains("${epId}_pos") || resTs >= localEpTs) {
-                                prefs[longPreferencesKey("${epId}_pos")] = res.positionMs
-                            }
-                            if (!existingKeyNames.contains("${epId}_dur") || resTs >= localEpTs) {
-                                prefs[longPreferencesKey("${epId}_dur")] = res.durationMs
-                            }
-                            if (!existingKeyNames.contains("${epId}_fraction") || resTs >= localEpTs) {
-                                prefs[floatPreferencesKey("${epId}_fraction")] = frac
-                            }
-                            prefs[booleanPreferencesKey("${epId}_is_series")] = true
-                            prefs[stringPreferencesKey("${epId}_series_id")] = sid
-                            prefs[intPreferencesKey("${epId}_season_num")] = res.seasonNumber
-                            prefs[intPreferencesKey("${epId}_episode_num")] = res.episodeNumber
-                            if (epTitle != null) {
-                                prefs[stringPreferencesKey("${epId}_title")] = epTitle
-                            }
-                        }
-                    }
-
-                    // 4. Update / Invalidate global_latest_* Snapshot Keys:
-                    //    Compare newest remote unwatched active/resume entry against prefs[SNAPSHOT_TIMESTAMP].
-                    val currentSnapTs = prefs[PlaybackHistoryManager.SNAPSHOT_TIMESTAMP] ?: 0L
-                    val currentSnapId = prefs[PlaybackHistoryManager.SNAPSHOT_FILE_ID]
-
-                    val candidateResume = payload.resume.entries
-                        .filter { (_, res) ->
-                            res.episodeId.isNotBlank() &&
-                                res.episodeId !in remoteWatchedSet &&
-                                (res.durationMs == 0L || res.positionMs < (res.durationMs * 0.90f))
-                        }
-                        .maxByOrNull { WatchHistoryPayloadV2.normalizeTimestampMs(it.value.timestamp) }
-
-                    val candidateActive = payload.active
-                        .filter {
-                            it.id.isNotBlank() &&
-                                !it.isWatched &&
-                                it.id !in remoteWatchedSet &&
-                                it.progressFraction < 0.90f
-                        }
-                        .maxByOrNull { WatchHistoryPayloadV2.normalizeTimestampMs(it.timestamp) }
-
-                    val resumeWinnerTs = candidateResume?.let {
-                        WatchHistoryPayloadV2.normalizeTimestampMs(it.value.timestamp)
-                    } ?: 0L
-                    val activeWinnerTs = candidateActive?.let {
-                        WatchHistoryPayloadV2.normalizeTimestampMs(it.timestamp)
-                    } ?: 0L
-                    val bestRemoteTs = maxOf(resumeWinnerTs, activeWinnerTs)
-
-                    if (bestRemoteTs > currentSnapTs) {
-                        if (candidateResume != null && resumeWinnerTs >= activeWinnerTs) {
-                            val sid = candidateResume.key
-                            val res = candidateResume.value
-                            val epTitle = activeById[res.episodeId]?.title?.takeIf { it.isNotBlank() }
-                                ?: prefs[stringPreferencesKey("${res.episodeId}_title")]
-                                ?: ""
-                            val frac = if (res.durationMs > 0L) {
-                                (res.positionMs.toFloat() / res.durationMs.toFloat()).coerceIn(0f, 1f)
-                            } else {
-                                0f
-                            }
-                            prefs[PlaybackHistoryManager.SNAPSHOT_FILE_ID] = res.episodeId
-                            if (epTitle.isNotBlank()) {
-                                prefs[PlaybackHistoryManager.SNAPSHOT_TITLE] = epTitle
-                            } else {
-                                prefs.remove(PlaybackHistoryManager.SNAPSHOT_TITLE)
-                            }
-                            prefs[PlaybackHistoryManager.SNAPSHOT_SERIES_ID] = sid
-                            prefs[PlaybackHistoryManager.SNAPSHOT_IS_SERIES] = true
-                            prefs[PlaybackHistoryManager.SNAPSHOT_SEASON_NUMBER] = res.seasonNumber
-                            prefs[PlaybackHistoryManager.SNAPSHOT_EPISODE_NUMBER] = res.episodeNumber
-                            prefs[PlaybackHistoryManager.SNAPSHOT_POSITION_MS] = res.positionMs
-                            prefs[PlaybackHistoryManager.SNAPSHOT_DURATION_MS] = res.durationMs
-                            prefs[PlaybackHistoryManager.SNAPSHOT_FRACTION] = frac
-                            prefs[PlaybackHistoryManager.SNAPSHOT_TIMESTAMP] = resumeWinnerTs
-                        } else if (candidateActive != null) {
-                            val act = candidateActive
-                            prefs[PlaybackHistoryManager.SNAPSHOT_FILE_ID] = act.id
-                            if (act.title.isNotBlank()) {
-                                prefs[PlaybackHistoryManager.SNAPSHOT_TITLE] = act.title
-                            }
-                            if (!act.seriesId.isNullOrBlank()) {
-                                prefs[PlaybackHistoryManager.SNAPSHOT_SERIES_ID] = act.seriesId
-                                prefs[PlaybackHistoryManager.SNAPSHOT_IS_SERIES] = true
-                            } else {
-                                prefs.remove(PlaybackHistoryManager.SNAPSHOT_SERIES_ID)
-                                prefs[PlaybackHistoryManager.SNAPSHOT_IS_SERIES] =
-                                    act.seasonNumber != null || act.episodeNumber != null
-                            }
-                            act.seasonNumber?.let { prefs[PlaybackHistoryManager.SNAPSHOT_SEASON_NUMBER] = it }
-                            act.episodeNumber?.let { prefs[PlaybackHistoryManager.SNAPSHOT_EPISODE_NUMBER] = it }
-                            prefs[PlaybackHistoryManager.SNAPSHOT_POSITION_MS] = act.positionMs
-                            prefs[PlaybackHistoryManager.SNAPSHOT_DURATION_MS] = act.durationMs
-                            prefs[PlaybackHistoryManager.SNAPSHOT_FRACTION] = act.progressFraction
-                            prefs[PlaybackHistoryManager.SNAPSHOT_TIMESTAMP] = activeWinnerTs
-                        }
-                    } else if (currentSnapId != null &&
-                        (currentSnapId in remoteWatchedSet || prefs[booleanPreferencesKey("${currentSnapId}_is_watched")] == true)
-                    ) {
-                        // Invalidate stale snapshot pointing to a completed item
-                        prefs.remove(PlaybackHistoryManager.SNAPSHOT_FILE_ID)
-                        prefs.remove(PlaybackHistoryManager.SNAPSHOT_TITLE)
-                        prefs.remove(PlaybackHistoryManager.SNAPSHOT_SERIES_NAME)
-                        prefs.remove(PlaybackHistoryManager.SNAPSHOT_SERIES_ID)
-                        prefs.remove(PlaybackHistoryManager.SNAPSHOT_SEASON_NUMBER)
-                        prefs.remove(PlaybackHistoryManager.SNAPSHOT_EPISODE_NUMBER)
-                        prefs.remove(PlaybackHistoryManager.SNAPSHOT_IS_SERIES)
-                        prefs.remove(PlaybackHistoryManager.SNAPSHOT_THUMBNAIL_URL)
-                        prefs.remove(PlaybackHistoryManager.SNAPSHOT_POSITION_MS)
-                        prefs.remove(PlaybackHistoryManager.SNAPSHOT_DURATION_MS)
-                        prefs.remove(PlaybackHistoryManager.SNAPSHOT_FRACTION)
-                        prefs.remove(PlaybackHistoryManager.SNAPSHOT_TIMESTAMP)
-                    }
-
-                    // 5. Update global metadata timestamps if remote is newer
-                    val remoteGlobalTs = maxOf(
-                        payload.active.maxOfOrNull { WatchHistoryPayloadV2.normalizeTimestampMs(it.timestamp) } ?: 0L,
-                        payload.resume.values.maxOfOrNull { WatchHistoryPayloadV2.normalizeTimestampMs(it.timestamp) } ?: 0L,
-                        normalizedUpdatedAt
-                    )
-                    val localGlobalTs = prefs[longPreferencesKey("last_global_watch_timestamp")] ?: 0L
-                    if (remoteGlobalTs > localGlobalTs) {
-                        prefs[longPreferencesKey("last_global_watch_timestamp")] = remoteGlobalTs
-                        prefs[longPreferencesKey("global_last_watched_timestamp")] = remoteGlobalTs
-                    }
-                }
-
-                if (email.isNotBlank()) {
-                    AndroidWatchHistoryManager.mergeRemoteV2Payload(appContext, email, remoteJson)
-                }
-                Log.i(TAG, "Successfully merged remote v2 watch history ($ACTIVE_SYNC_FILE) from Google Drive")
-                return true
-            }
-
-            val rootJson = JSONObject(remoteJson)
-            val entriesJson = rootJson.optJSONObject("entries") ?: return false
-            val remoteUpdatedAt = WatchHistoryPayloadV2.normalizeTimestampMs(rootJson.optLong("updatedAt", 0L))
-
-            dataStore.edit { prefs ->
-                val currentPrefs = prefs.asMap()
-                val existingKeyNames = currentPrefs.keys.map { it.name }.toSet()
-                val keysIterator = entriesJson.keys()
-
-                while (keysIterator.hasNext()) {
-                    val keyName = keysIterator.next()
-                    val entryObj = entriesJson.optJSONObject(keyName)
-                    val tsKey = resolveTimestampKey(keyName)
-                    val remoteTsEntry = entriesJson.optJSONObject(tsKey)
-                    val remoteTs = WatchHistoryPayloadV2.normalizeTimestampMs(
-                        remoteTsEntry?.optLong("value", 0L)
-                            ?: if (keyName == tsKey) (entryObj?.optLong("value", 0L) ?: 0L) else remoteUpdatedAt
-                    )
-
-                    val localTs = (currentPrefs[longPreferencesKey(tsKey)] as? Long)
-                        ?: if (keyName == tsKey) (currentPrefs[longPreferencesKey(keyName)] as? Long ?: 0L) else 0L
-
-                    val isNewer = remoteTs > localTs
-                    val isMissingLocally = !existingKeyNames.contains(keyName)
-
-                    if (isNewer || isMissingLocally) {
-                        if (entryObj != null) {
-                            val type = entryObj.optString("type")
-                            when (type) {
-                                "long" -> prefs[longPreferencesKey(keyName)] = entryObj.optLong("value", 0L)
-                                "int" -> prefs[intPreferencesKey(keyName)] = entryObj.optInt("value", 0)
-                                "float" -> prefs[floatPreferencesKey(keyName)] = entryObj.optDouble("value", 0.0).toFloat()
-                                "boolean" -> prefs[booleanPreferencesKey(keyName)] = entryObj.optBoolean("value", false)
-                                else -> prefs[stringPreferencesKey(keyName)] = entryObj.optString("value", "")
-                            }
-                        } else {
-                            when (val rawVal = entriesJson.opt(keyName)) {
-                                is Long -> prefs[longPreferencesKey(keyName)] = rawVal
-                                is Int -> prefs[intPreferencesKey(keyName)] = rawVal
-                                is Double -> prefs[floatPreferencesKey(keyName)] = rawVal.toFloat()
-                                is Float -> prefs[floatPreferencesKey(keyName)] = rawVal
-                                is Boolean -> prefs[booleanPreferencesKey(keyName)] = rawVal
-                                is String -> prefs[stringPreferencesKey(keyName)] = rawVal
-                            }
-                        }
-                    }
-                }
-
-                val remoteGlobalTs = (entriesJson.optJSONObject("global_latest_timestamp")?.optLong("value", 0L) ?: 0L)
-                    .takeIf { it > 0L }
-                    ?: (entriesJson.optJSONObject("last_global_watch_timestamp")?.optLong("value", 0L) ?: 0L)
-                    .takeIf { it > 0L }
-                    ?: remoteUpdatedAt
-
-                val localGlobalTs = prefs[longPreferencesKey("global_latest_timestamp")] ?: 0L
-                if (remoteGlobalTs > localGlobalTs) {
-                    prefs[longPreferencesKey("last_global_watch_timestamp")] = remoteGlobalTs
-                    prefs[longPreferencesKey("global_last_watched_timestamp")] = remoteGlobalTs
-                    prefs[longPreferencesKey("global_latest_timestamp")] = remoteGlobalTs
-                }
-            }
-            if (email.isNotBlank()) {
-                AndroidWatchHistoryManager.mergeRemotePayload(appContext, email, remoteJson)
-            }
-            Log.i(TAG, "Successfully merged remote legacy v1 watch history from Google Drive")
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "Error merging remote history payload: ${e.message}", e)
-            false
+            val out = ByteArrayOutputStream()
+            driveService.files().get(fileId)
+                .setSupportsAllDrives(true)
+                .executeMediaAndDownloadTo(out)
+            out.toString("UTF-8").takeIf { it.isNotBlank() }
+        } catch (e: GoogleJsonResponseException) {
+            if (e.statusCode == 404) null else throw e
         }
     }
 
-    private fun findScopedHistoryFileId(driveService: Drive, historyFolderId: String, fileName: String = ACTIVE_SYNC_FILE): String? {
-        val query = "'$historyFolderId' in parents and name = '$fileName' and trashed = false"
-        val response = driveService.files().list()
-            .setQ(query)
-            .setFields("files(id, name)")
-            .setSupportsAllDrives(true)
-            .setIncludeItemsFromAllDrives(true)
-            .setPageSize(5)
-            .execute()
-        val foundId = response.files?.firstOrNull()?.id
-        if (foundId != null && fileName == ACTIVE_SYNC_FILE) {
-            cachedFileId.set(foundId)
-        }
-        return foundId
-    }
-
-    private fun findLegacyRootHistoryFileId(driveService: Drive): String? {
-        val query = "name = '$LEGACY_SYNC_FILE' and trashed = false"
-        val response = driveService.files().list()
-            .setQ(query)
-            .setFields("files(id, name, parents)")
-            .setSupportsAllDrives(true)
-            .setIncludeItemsFromAllDrives(true)
-            .setPageSize(10)
-            .execute()
-        val files = response.files.orEmpty()
-        val rootMatch = files.firstOrNull { it.parents?.contains("root") == true }
-        return (rootMatch ?: files.firstOrNull())?.id
-    }
-
-    suspend fun syncFromCloud(
-        dataStore: DataStore<Preferences>,
-        force: Boolean = false
-    ): Boolean = withContext(NonCancellable + Dispatchers.IO) {
+    /**
+     * Authoritative pull from clotube/History/clotube_active_sync.json and clotube_archive.json.
+     * Replaces volatile RAM state completely—zero local disk caching or merging.
+     */
+    suspend fun syncFromCloud(force: Boolean = false): Boolean = withContext(Dispatchers.IO) {
         val now = System.currentTimeMillis()
-        val lastPull = lastCloudPullTimeMs.get()
-        if (!force && (now - lastPull < CLOUD_PULL_COOLDOWN_MS)) {
-            Log.d(TAG, "Skipping duplicate syncFromCloud (cooldown active: ${now - lastPull}ms)")
-            return@withContext false
+        if (!force && (now - lastCloudPullTimeMs.get() < CLOUD_PULL_COOLDOWN_MS)) {
+            return@withContext true
         }
-        if (!isSyncingFromCloud.compareAndSet(false, true)) {
-            Log.d(TAG, "Skipping concurrent syncFromCloud (already in flight)")
+        if (!isPullingFromCloud.compareAndSet(false, true)) {
             return@withContext false
         }
 
         try {
             val driveService = getDriveService() ?: return@withContext false
-            if (force) {
-                cachedFileId.set(null)
+            val historyFolderId = resolveHistoryFolderId(driveService)
+
+            val activeFileId = cachedActiveFileId.get()
+                ?: findFileInHistoryFolder(driveService, historyFolderId, ACTIVE_SYNC_FILE)?.also {
+                    cachedActiveFileId.set(it)
+                }
+
+            val archiveFileId = cachedArchiveFileId.get()
+                ?: findFileInHistoryFolder(driveService, historyFolderId, ARCHIVE_SYNC_FILE)?.also {
+                    cachedArchiveFileId.set(it)
+                }
+
+            val activeJson = activeFileId?.let { downloadJsonFile(driveService, it) }
+            val archiveJson = archiveFileId?.let { downloadJsonFile(driveService, it) }
+
+            val activeEntries = if (activeJson != null) parseActiveSyncJson(activeJson) else emptyMap()
+            val archivedIds = if (archiveJson != null) parseArchiveJson(archiveJson) else emptySet()
+
+            AndroidWatchHistoryManager.replaceAllFromDrive(activeEntries, archivedIds)
+            lastCloudPullTimeMs.set(System.currentTimeMillis())
+            Log.i(
+                TAG,
+                "Pulled directly from Drive: activeEntries=${activeEntries.size}, archivedIds=${archivedIds.size}"
+            )
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Direct Drive pull failed: ${e.message}", e)
+            if (e is GoogleJsonResponseException && (e.statusCode == 401 || e.statusCode == 403)) {
+                onAuthFailureListener?.invoke()
             }
-            var target = resolveTarget(driveService)
-            val fileId = target.fileId ?: run {
-                lastCloudPullTimeMs.set(System.currentTimeMillis())
-                Log.d(TAG, "No remote history file in clotube/History/ or root to pull")
-                return@withContext false
+            false
+        } finally {
+            isPullingFromCloud.set(false)
+        }
+    }
+
+    private fun parseActiveSyncJson(remoteJson: String): Map<String, AndroidTypedEntry> {
+        val result = mutableMapOf<String, AndroidTypedEntry>()
+        val payload = WatchHistoryPayloadV2.fromJsonString(remoteJson)
+        val updatedAt = WatchHistoryPayloadV2.normalizeTimestampMs(payload.updatedAt)
+        if (updatedAt > 0L) {
+            result["global_latest_timestamp"] = AndroidTypedEntry("long", updatedAt)
+        }
+
+        val activeById = payload.active.associateBy { it.id }
+
+        for (watchedId in payload.watchedIds) {
+            if (watchedId.isNotBlank()) {
+                result["${watchedId}_is_watched"] = AndroidTypedEntry("boolean", true)
+                result["${watchedId}_fraction"] = AndroidTypedEntry("float", 1.0f)
+            }
+        }
+
+        for (item in payload.active) {
+            if (item.id.isBlank()) continue
+            val id = item.id
+            val itemTs = WatchHistoryPayloadV2.normalizeTimestampMs(item.timestamp)
+            val frac = if (item.isWatched) {
+                1.0f
+            } else if (item.durationMs > 0L) {
+                (item.positionMs.toFloat() / item.durationMs.toFloat()).coerceIn(0f, 1f)
+            } else {
+                item.progressFraction.coerceIn(0f, 1f)
+            }
+            val isSeries = !item.seriesId.isNullOrBlank() ||
+                (item.seasonNumber != null && item.seasonNumber > 0) ||
+                (item.episodeNumber != null && item.episodeNumber > 0)
+
+            result["${id}_title"] = AndroidTypedEntry("string", item.title)
+            result["${id}_pos"] = AndroidTypedEntry("long", item.positionMs)
+            result["${id}_dur"] = AndroidTypedEntry("long", item.durationMs)
+            result["${id}_fraction"] = AndroidTypedEntry("float", frac)
+            result["${id}_timestamp"] = AndroidTypedEntry("long", itemTs)
+            result["${id}_is_watched"] = AndroidTypedEntry("boolean", item.isWatched)
+            result["${id}_is_series"] = AndroidTypedEntry("boolean", isSeries)
+            if (!item.seriesId.isNullOrBlank()) {
+                result["${id}_series_id"] = AndroidTypedEntry("string", item.seriesId)
+            }
+            if (!item.seriesTitle.isNullOrBlank()) {
+                result["${id}_series_title"] = AndroidTypedEntry("string", item.seriesTitle)
+            }
+            if (item.seasonNumber != null && item.seasonNumber > 0) {
+                result["${id}_season_num"] = AndroidTypedEntry("int", item.seasonNumber)
+            }
+            if (item.episodeNumber != null && item.episodeNumber > 0) {
+                result["${id}_episode_num"] = AndroidTypedEntry("int", item.episodeNumber)
+            }
+            if (!item.thumbnailUrl.isNullOrBlank()) {
+                result["${id}_thumb"] = AndroidTypedEntry("string", item.thumbnailUrl)
+                result["${id}_thumbnail_url"] = AndroidTypedEntry("string", item.thumbnailUrl)
+            }
+        }
+
+        // Parse payload.resume (JSON key "resume") and link directly to target episodeId
+        for ((seriesId, resume) in payload.resume) {
+            if (seriesId.isBlank() || resume.episodeId.isBlank()) continue
+            val resTs = WatchHistoryPayloadV2.normalizeTimestampMs(resume.timestamp)
+            val frac = if (resume.durationMs > 0L) {
+                (resume.positionMs.toFloat() / resume.durationMs.toFloat()).coerceIn(0f, 1f)
+            } else {
+                0f
+            }
+            val linkedActive = activeById[resume.episodeId]
+            val epTitle = linkedActive?.title?.takeIf { it.isNotBlank() } ?: ""
+
+            val p = "series_resume_${seriesId}"
+            result["${p}_episode_id"] = AndroidTypedEntry("string", resume.episodeId)
+            result["${p}_season_num"] = AndroidTypedEntry("int", resume.seasonNumber)
+            result["${p}_episode_num"] = AndroidTypedEntry("int", resume.episodeNumber)
+            result["${p}_pos_ms"] = AndroidTypedEntry("long", resume.positionMs)
+            result["${p}_dur_ms"] = AndroidTypedEntry("long", resume.durationMs)
+            result["${p}_fraction"] = AndroidTypedEntry("float", frac)
+            result["${p}_timestamp"] = AndroidTypedEntry("long", resTs)
+            if (epTitle.isNotBlank()) {
+                result["${p}_episode_title"] = AndroidTypedEntry("string", epTitle)
             }
 
-            val outputStream = ByteArrayOutputStream()
+            // Ensure the target episodeId entry reflects the latest resume timestamp & series metadata
+            val epId = resume.episodeId
+            val existingEpTs = (result["${epId}_timestamp"]?.value as? Number)?.toLong() ?: 0L
+            if (resTs >= existingEpTs) {
+                result["${epId}_timestamp"] = AndroidTypedEntry("long", resTs)
+                result["${epId}_pos"] = AndroidTypedEntry("long", resume.positionMs)
+                result["${epId}_dur"] = AndroidTypedEntry("long", resume.durationMs)
+                result["${epId}_fraction"] = AndroidTypedEntry("float", frac)
+                val isCompleted = resume.durationMs > 0L && resume.positionMs >= (resume.durationMs * 0.90f)
+                result["${epId}_is_watched"] = AndroidTypedEntry("boolean", isCompleted)
+            }
+            result["${epId}_is_series"] = AndroidTypedEntry("boolean", true)
+            result["${epId}_series_id"] = AndroidTypedEntry("string", seriesId)
+            if (resume.seasonNumber > 0) result["${epId}_season_num"] = AndroidTypedEntry("int", resume.seasonNumber)
+            if (resume.episodeNumber > 0) result["${epId}_episode_num"] = AndroidTypedEntry("int", resume.episodeNumber)
+            if (epTitle.isNotBlank() && !result.containsKey("${epId}_title")) {
+                result["${epId}_title"] = AndroidTypedEntry("string", epTitle)
+            }
+        }
+
+        return result
+    }
+
+    private fun parseArchiveJson(archiveJson: String): Set<String> {
+        val ids = mutableSetOf<String>()
+        try {
+            val root = JSONObject(archiveJson)
+            val watchedArr = root.optJSONArray("watchedIds")
+            if (watchedArr != null) {
+                for (i in 0 until watchedArr.length()) {
+                    val id = watchedArr.optString(i).trim()
+                    if (id.isNotBlank()) ids.add(id)
+                }
+            }
+            val itemsArr = root.optJSONArray("items")
+            if (itemsArr != null) {
+                for (i in 0 until itemsArr.length()) {
+                    val obj = itemsArr.optJSONObject(i) ?: continue
+                    val id = obj.optString("id").trim()
+                    if (id.isNotBlank()) ids.add(id)
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not parse $ARCHIVE_SYNC_FILE:${e.message}")
+        }
+        return ids
+    }
+
+    private fun buildArchiveJsonString(archiveIds: Set<String>): String {
+        val root = JSONObject()
+        root.put("v", 2)
+        root.put("updatedAt", System.currentTimeMillis())
+        val arr = JSONArray()
+        archiveIds.sorted().forEach { arr.put(it) }
+        root.put("watchedIds", arr)
+        return root.toString()
+    }
+
+    /**
+     * Pushes current volatile state directly to clotube/History/clotube_active_sync.json
+     * (and updates clotube_archive.json if an archived item was unwatched or deleted).
+     */
+    suspend fun executeDirectUpload(
+        priority: SyncPriority = SyncPriority.CRITICAL_WATCH_STATE,
+        updateArchive: Boolean = false
+    ): Boolean = uploadMutex.withLock {
+        withContext(NonCancellable + Dispatchers.IO) {
             try {
-                driveService.files().get(fileId)
+                val driveService = getDriveService() ?: return@withContext false
+                val historyFolderId = resolveHistoryFolderId(driveService)
+
+                val activeSnapshot = AndroidWatchHistoryManager.snapshotEntries()
+                val activePayloadJson = WatchHistoryPayloadV2.fromTypedEntries(activeSnapshot).toJsonString()
+                val activeMedia = ByteArrayContent.fromString("application/json", activePayloadJson)
+
+                val activeOk = upsertHistoryFile(
+                    driveService = driveService,
+                    historyFolderId = historyFolderId,
+                    fileName = ACTIVE_SYNC_FILE,
+                    cachedIdRef = cachedActiveFileId,
+                    mediaContent = activeMedia,
+                    priority = priority
+                )
+
+                if (updateArchive) {
+                    val archiveJson = buildArchiveJsonString(AndroidWatchHistoryManager.snapshotArchivedIds())
+                    val archiveMedia = ByteArrayContent.fromString("application/json", archiveJson)
+                    upsertHistoryFile(
+                        driveService = driveService,
+                        historyFolderId = historyFolderId,
+                        fileName = ARCHIVE_SYNC_FILE,
+                        cachedIdRef = cachedArchiveFileId,
+                        mediaContent = archiveMedia,
+                        priority = priority
+                    )
+                }
+
+                lastUploadTime.set(System.currentTimeMillis())
+                activeOk
+            } catch (e: Exception) {
+                Log.e(TAG, "Direct Drive upload failed: ${e.message}", e)
+                if (e is GoogleJsonResponseException && (e.statusCode == 401 || e.statusCode == 403)) {
+                    onAuthFailureListener?.invoke()
+                }
+                false
+            }
+        }
+    }
+
+    private fun upsertHistoryFile(
+        driveService: Drive,
+        historyFolderId: String,
+        fileName: String,
+        cachedIdRef: AtomicReference<String?>,
+        mediaContent: ByteArrayContent,
+        priority: SyncPriority
+    ): Boolean {
+        var fileId = cachedIdRef.get() ?: findFileInHistoryFolder(driveService, historyFolderId, fileName)
+        if (fileId != null) {
+            try {
+                driveService.files().update(fileId, null, mediaContent)
                     .setSupportsAllDrives(true)
-                    .executeMediaAndDownloadTo(outputStream)
+                    .execute()
+                cachedIdRef.set(fileId)
+                Log.i(TAG, "SUCCESS! [${priority.name}] Updated $fileName directly on Drive ($fileId)")
+                return true
             } catch (e: GoogleJsonResponseException) {
-                if (e.statusCode == 404) {
-                    outputStream.reset()
-                    invalidateCache()
-                    target = resolveTarget(driveService)
-                    val refreshedId = target.fileId ?: return@withContext false
-                    driveService.files().get(refreshedId)
-                        .setSupportsAllDrives(true)
-                        .executeMediaAndDownloadTo(outputStream)
+                if (e.statusCode == 404 || e.statusCode == 403) {
+                    cachedIdRef.set(null)
+                    fileId = null
                 } else {
                     throw e
                 }
             }
+        }
 
-            val rawJson = outputStream.toString("UTF-8")
-            lastCloudPullTimeMs.set(System.currentTimeMillis())
-            if (rawJson.isBlank()) return@withContext false
+        val metadata = com.google.api.services.drive.model.File().apply {
+            name = fileName
+            mimeType = "application/json"
+            parents = listOf(historyFolderId)
+        }
+        val created = driveService.files().create(metadata, mediaContent)
+            .setSupportsAllDrives(true)
+            .execute()
+        cachedIdRef.set(created.id)
+        Log.i(TAG, "SUCCESS! [${priority.name}] Created $fileName directly on Drive (${created.id})")
+        return true
+    }
 
-            val merged = mergeRemotePayload(dataStore, rawJson)
-            if (!target.isV2) {
-                Log.i(TAG, "Migrating remote v1 history ($LEGACY_SYNC_FILE) to v2 ($ACTIVE_SYNC_FILE) in clotube/History/...")
-                enqueueImmediateWatchState(dataStore)
-            }
-            merged
-        } catch (e: Exception) {
-            Log.e(TAG, "Error pulling watch history from cloud: ${e.message}", e)
-            false
-        } finally {
-            isSyncingFromCloud.set(false)
+    fun enqueueImmediateWatchState(updateArchive: Boolean = false) {
+        debouncedProgressJob?.cancel()
+        syncScope.launch {
+            executeDirectUpload(SyncPriority.CRITICAL_WATCH_STATE, updateArchive = updateArchive)
         }
     }
 
-    suspend fun syncFromCloud(): Boolean = syncFromCloud(appContext.playbackDataStore)
-
-    /**
-     * Non-blocking trigger to pull watch history from cloud if cooldown expired or forced.
-     * When !force, applies a 5-second cooldown.
-     * When force=true, bypasses cooldown unconditionally.
-     */
-    fun pullFromCloudIfNeeded(
-        dataStore: DataStore<Preferences>? = null,
-        force: Boolean = false
-    ) {
-        val targetDataStore = dataStore ?: appContext.playbackDataStore
+    fun enqueueProgressUpdate() {
         val now = System.currentTimeMillis()
-        val lastPull = lastCloudPullTimeMs.get()
-        val cooldown = if (force) 0L else 5000L
-        if (!force && (now - lastPull < cooldown)) {
-            Log.d(TAG, "Skipping pullFromCloudIfNeeded (cooldown active: ${now - lastPull}ms)")
+        if (now - lastUploadTime.get() >= PROGRESS_UPLOAD_INTERVAL_MS) {
+            debouncedProgressJob?.cancel()
+            syncScope.launch {
+                executeDirectUpload(SyncPriority.TIMESTAMPS_AND_SEEK, updateArchive = false)
+            }
             return
         }
-        syncScope.launch(Dispatchers.IO) {
-            syncFromCloud(targetDataStore, force = force)
+        if (debouncedProgressJob?.isActive == true) return
+        debouncedProgressJob = syncScope.launch {
+            delay(PROGRESS_UPLOAD_INTERVAL_MS)
+            executeDirectUpload(SyncPriority.TIMESTAMPS_AND_SEEK, updateArchive = false)
         }
     }
 
-    suspend fun pullAndMerge(): Boolean = syncFromCloud(appContext.playbackDataStore)
-
-    suspend fun pullAndMergeHistoryFromDrive(dataStore: DataStore<Preferences>) = withContext(Dispatchers.IO) {
-        syncFromCloud(dataStore)
+    fun backupImmediately() {
+        enqueueImmediateWatchState(updateArchive = false)
     }
 
-    suspend fun deleteRemoteHistoryFile(): Boolean = withContext(NonCancellable + Dispatchers.IO) {
-        uploadMutex.withLock {
+    fun pullFromCloudIfNeeded(force: Boolean = false) {
+        syncScope.launch {
+            syncFromCloud(force = force)
+        }
+    }
+
+    suspend fun deleteRemoteHistoryFiles(): Boolean = uploadMutex.withLock {
+        withContext(NonCancellable + Dispatchers.IO) {
             try {
-                val driveService = getDriveService()
-                if (driveService == null) {
-                    Log.e(TAG, "Cannot delete remote file: Drive service unavailable")
-                    return@withLock false
-                }
-
-                val email = GoogleSignIn.getLastSignedInAccount(appContext)?.email.orEmpty()
-                if (email.isNotBlank()) {
-                    AndroidWatchHistoryManager.clearLocal(appContext, email)
-                }
-
+                val driveService = getDriveService() ?: return@withContext false
                 val historyFolderId = resolveHistoryFolderId(driveService)
-                val v2FileId = cachedFileId.get() ?: findScopedHistoryFileId(driveService, historyFolderId, ACTIVE_SYNC_FILE)
-                val scopedLegacyId = findScopedHistoryFileId(driveService, historyFolderId, LEGACY_SYNC_FILE)
-                val rootLegacyId = findLegacyRootHistoryFileId(driveService)
 
-                if (v2FileId == null && scopedLegacyId == null && rootLegacyId == null) {
-                    Log.d(TAG, "No remote watch history file found on Drive to delete")
-                    invalidateCache()
-                    return@withLock true
-                }
-
-                var primaryDeleted = v2FileId == null
-                if (v2FileId != null) {
-                    try {
-                        driveService.files().delete(v2FileId)
-                            .setSupportsAllDrives(true)
-                            .execute()
-                        primaryDeleted = true
-                        Log.i(TAG, "SUCCESS! Deleted $ACTIVE_SYNC_FILE from clotube/History/ (fileId: $v2FileId)")
-                    } catch (e: GoogleJsonResponseException) {
-                        if (e.statusCode == 404) {
-                            Log.d(TAG, "$ACTIVE_SYNC_FILE was already removed from Drive")
-                            primaryDeleted = true
-                        } else {
-                            throw e
-                        }
-                    }
-                }
-
-                listOfNotNull(scopedLegacyId, rootLegacyId)
-                    .distinct()
-                    .filter { it != v2FileId }
-                    .forEach { legacyId ->
+                listOf(
+                    ACTIVE_SYNC_FILE to cachedActiveFileId,
+                    ARCHIVE_SYNC_FILE to cachedArchiveFileId
+                ).forEach { (fileName, ref) ->
+                    val id = ref.get() ?: findFileInHistoryFolder(driveService, historyFolderId, fileName)
+                    if (id != null) {
                         try {
-                            driveService.files().delete(legacyId)
-                                .setSupportsAllDrives(true)
-                                .execute()
-                            Log.i(TAG, "Deleted legacy $LEGACY_SYNC_FILE (fileId: $legacyId)")
-                        } catch (e: Exception) {
-                            Log.w(TAG, "Could not delete legacy history file ($legacyId): ${e.message}")
-                        }
+                            driveService.files().delete(id).setSupportsAllDrives(true).execute()
+                            Log.i(TAG, "Deleted $fileName from Drive ($id)")
+                        } catch (_: Exception) {}
                     }
-
+                }
                 invalidateCache()
-                lastUploadTime.set(0L)
-                primaryDeleted
+                true
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to delete remote watch history file from Drive: ${e.message}", e)
+                Log.e(TAG, "Failed deleting Drive history files: ${e.message}", e)
                 false
             }
         }
     }
 
     private fun getDriveService(): Drive? {
-        // 0. When BYOC custom OAuth is active, always use Bearer token (never require Google Play Services account)
         if (ByocConfigManager.isByocConfigured(appContext)) {
             val token = runBlocking {
                 tokenProviderRef?.invoke()
                     ?: TokenRepository(appContext).getValidAccessToken(forceRefresh = false).takeIf { it.isNotBlank() }
-                    ?: com.clotube.app.auth.GoogleAuthRepository(appContext).getAccessToken().getOrNull()
+                    ?: GoogleAuthRepository(appContext).getAccessToken().getOrNull()
             }
             if (!token.isNullOrBlank()) {
-                Log.d(TAG, "Using BYOC Bearer token for DriveWatchHistorySync")
                 return Drive.Builder(NetHttpTransport(), GsonFactory.getDefaultInstance()) { request ->
                     request.headers.authorization = "Bearer $token"
                 }.setApplicationName("Clotube").build()
             }
-            Log.e(TAG, "Cannot sync: BYOC is configured but no valid OAuth access token could be acquired")
             return null
         }
 
         val account = GoogleSignIn.getLastSignedInAccount(appContext)
         if (account == null) {
             val token = runBlocking {
-                tokenProviderRef?.invoke() ?: com.clotube.app.auth.GoogleAuthRepository(appContext).getAccessToken().getOrNull()
+                tokenProviderRef?.invoke() ?: GoogleAuthRepository(appContext).getAccessToken().getOrNull()
             }
             if (!token.isNullOrBlank()) {
-                Log.d(TAG, "Using Bearer token provider for Drive service")
                 return Drive.Builder(NetHttpTransport(), GsonFactory.getDefaultInstance()) { request ->
                     request.headers.authorization = "Bearer $token"
                 }.setApplicationName("Clotube").build()
             }
-            Log.e(TAG, "Cannot sync: GoogleSignIn account is null and no token available")
             return null
         }
 
@@ -1045,17 +498,18 @@ class DriveWatchHistorySync(private val context: Context) {
     companion object {
         private const val TAG = "ClotubeSync"
         private const val ACTIVE_SYNC_FILE = "clotube_active_sync.json"
-        private const val LEGACY_SYNC_FILE = "clotube_watch_history.json"
-        private const val CLOUD_PULL_COOLDOWN_MS = 5_000L
+        private const val ARCHIVE_SYNC_FILE = "clotube_archive.json"
+        private const val CLOUD_PULL_COOLDOWN_MS = 3_000L
+        private const val PROGRESS_UPLOAD_INTERVAL_MS = 8_000L
 
         @Volatile
         private var defaultInstance: DriveWatchHistorySync? = null
 
         @Volatile
-        private var onAuthFailure: (suspend () -> Unit)? = null
+        private var tokenProviderRef: (suspend () -> String)? = null
 
         @Volatile
-        private var tokenProviderRef: (suspend () -> String)? = null
+        private var onAuthFailureListener: (suspend () -> Unit)? = null
 
         fun getInstance(context: Context): DriveWatchHistorySync {
             return defaultInstance ?: synchronized(this) {
@@ -1063,122 +517,47 @@ class DriveWatchHistorySync(private val context: Context) {
             }
         }
 
-        fun init(
-            context: Context,
-            dataStore: DataStore<Preferences>? = null,
-            tokenProvider: (suspend () -> String)? = null
-        ) {
+        fun init(context: Context, tokenProvider: (suspend () -> String)? = null) {
+            AndroidWatchHistoryManager.purgeAllLocalDiskCaches(context)
             val instance = getInstance(context)
             if (tokenProvider != null) {
                 this.tokenProviderRef = tokenProvider
             }
-            if (dataStore != null) {
-                instance.syncScope.launch {
-                    instance.syncFromCloud(dataStore)
-                }
+            instance.syncScope.launch {
+                instance.syncFromCloud(force = true)
             }
-        }
-
-        fun setOnAuthFailureListener(listener: suspend () -> Unit) {
-            this.onAuthFailure = listener
         }
 
         fun setTokenProvider(provider: suspend () -> String) {
             this.tokenProviderRef = provider
         }
 
-        fun triggerThrottledBackup(dataStore: DataStore<Preferences>) {
-            defaultInstance?.enqueueProgressUpdate(dataStore)
+        fun setOnAuthFailureListener(listener: suspend () -> Unit) {
+            this.onAuthFailureListener = listener
         }
 
-        fun triggerThrottledBackup(
-            dataStore: DataStore<Preferences>,
-            tokenProvider: suspend () -> String,
-            context: Context? = null
+        fun pushHistoryAsync(
+            context: Context,
+            force: Boolean = false,
+            updateArchive: Boolean = false
         ) {
-            val inst = context?.let { getInstance(it) } ?: defaultInstance
-            inst?.enqueueProgressUpdate(dataStore)
-        }
-
-        fun triggerImmediateBackup(
-            dataStore: DataStore<Preferences>,
-            tokenProvider: suspend () -> String,
-            context: Context? = null
-        ) {
-            val inst = context?.let { getInstance(it) } ?: defaultInstance
-            inst?.enqueueImmediateWatchState(dataStore)
-        }
-
-        fun backupImmediately(dataStore: DataStore<Preferences>? = null) {
-            defaultInstance?.backupImmediately(dataStore)
-        }
-
-        fun pushHistoryAsync(dataStore: DataStore<Preferences>? = null) {
-            defaultInstance?.pushHistoryAsync(dataStore)
-        }
-
-        /**
-         * Static companion entry-point for push triggered by [AndroidWatchHistoryManager.setEpisodeWatched].
-         * When force=true, the enqueued task runs as CRITICAL_WATCH_STATE priority, bypassing
-         * both the 15-second debounce window and the hash-equality guard in
-         * [executeDirectUploadInternal], guaranteeing the unwatch reaches Drive immediately.
-         */
-        fun pushHistoryAsync(context: Context, force: Boolean = false) {
             val inst = getInstance(context)
-            val dataStore = context.applicationContext.playbackDataStore
             if (force) {
-                inst.enqueueImmediateWatchState(dataStore)
+                inst.enqueueImmediateWatchState(updateArchive = updateArchive)
             } else {
-                inst.enqueueProgressUpdate(dataStore)
+                inst.enqueueProgressUpdate()
             }
         }
 
-        suspend fun pullAndMerge(context: Context): Boolean {
-            return getInstance(context).pullAndMerge()
+        fun pullFromCloudIfNeeded(context: Context, force: Boolean = false) {
+            val inst = getInstance(context)
+            inst.syncScope.launch {
+                inst.syncFromCloud(force = force)
+            }
         }
 
-        fun pullFromCloudIfNeeded(
-            context: Context? = null,
-            dataStore: DataStore<Preferences>? = null,
-            force: Boolean = false
-        ) {
-            val inst = context?.let { getInstance(it) } ?: defaultInstance
-            inst?.pullFromCloudIfNeeded(dataStore, force)
-        }
-
-        fun backupToCloudImmediately(dataStore: DataStore<Preferences>? = null) {
-            defaultInstance?.backupImmediately(dataStore)
-        }
-
-        suspend fun syncFromCloud(
-            dataStore: DataStore<Preferences>,
-            context: Context? = null
-        ): Boolean {
-            val inst = context?.let { getInstance(it) } ?: defaultInstance
-            return inst?.syncFromCloud(dataStore) ?: false
-        }
-
-        suspend fun pullAndMergeHistoryFromDrive(
-            dataStore: DataStore<Preferences>,
-            tokenProvider: suspend () -> String,
-            context: Context? = null
-        ) {
-            val inst = context?.let { getInstance(it) } ?: defaultInstance
-            inst?.pullAndMergeHistoryFromDrive(dataStore)
-        }
-
-        suspend fun pushLocalHistoryToDrive(
-            dataStore: DataStore<Preferences>,
-            tokenProvider: suspend () -> String,
-            context: Context? = null
-        ) {
-            val inst = context?.let { getInstance(it) } ?: defaultInstance
-            inst?.executeDirectUpload(dataStore)
-        }
-
-        suspend fun deleteRemoteHistoryFile(context: Context? = null): Boolean {
-            val inst = context?.let { getInstance(it) } ?: defaultInstance
-            return inst?.deleteRemoteHistoryFile() ?: false
+        fun backupImmediately(context: Context) {
+            getInstance(context).enqueueImmediateWatchState(updateArchive = false)
         }
     }
 }

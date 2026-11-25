@@ -303,6 +303,23 @@ class DriveFolderManager(
      * Inspects Google Drive hierarchy via DriveDirectoryManager and local DataStore for Movies and Series folders.
      */
     suspend fun checkFoldersStatus(): Result<DriveFoldersStatus> = withContext(Dispatchers.IO) {
+        val prefs = context.dataStore.data.first()
+        val savedMoviesId = prefs[KEY_MOVIES_FOLDER_ID]
+        val savedSeriesId = prefs[KEY_SERIES_FOLDER_ID]
+        val hasValidSavedFolders = !savedMoviesId.isNullOrBlank() && savedMoviesId != "root" &&
+                !savedSeriesId.isNullOrBlank() && savedSeriesId != "root"
+        if (hasValidSavedFolders) {
+            return@withContext Result.success(
+                DriveFoldersStatus(
+                    moviesFolderId = savedMoviesId,
+                    seriesFolderId = savedSeriesId,
+                    isMoviesMissing = false,
+                    isSeriesMissing = false,
+                    needsOnboarding = false
+                )
+            )
+        }
+
         authRepository.getAccessToken().getOrNull()
             ?: return@withContext Result.failure(IllegalStateException("User not authenticated"))
 
@@ -438,12 +455,21 @@ class DriveFolderManager(
                             streamUri = streamUri
                         )
                     }
+                    val fileLangHint = MovieIndustryResolver.extractLanguageFromFileName(rawName)
+                    val effectiveLang = fileLangHint
+                        ?: movieMeta.originalLanguage.ifBlank { null }
+                        ?: MovieIndustryResolver.deduceLanguageFromScript(movieMeta.officialTitle)
+                    val industryInfo = MovieIndustryResolver.toIndustryInfo(effectiveLang)
                     allMovies.add(
                         videoItem.copy(
                             displayTitle = movieMeta.officialTitle,
                             thumbnailUrl = finalThumb,
                             externalSubtitles = matchingSubs,
-                            genreFormatted = movieMeta.genre
+                            genreFormatted = movieMeta.genre,
+                            language = industryInfo.language,
+                            industry = industryInfo.sectionLabel,
+                            sourceFolder = "",
+                            isFolderClassified = false
                         )
                     )
                 }
@@ -556,11 +582,27 @@ class DriveFolderManager(
                 val movieMeta = com.clotube.app.data.metadata.OnlineMetadataResolver.resolveMovie(finalTitle)
                 val finalThumb = movieMeta.posterUrl.ifBlank { localImgThumb ?: parsedItem.thumbnailUrl }
 
+                val folderClassification = MovieIndustryResolver.classifyDriveFolder(folderName, isDirectChildOfMoviesRoot = true)
+                val hasFolderClass = folderClassification != null && folderClassification.isExplicitCategoryFolder
+                val fileLangHint = MovieIndustryResolver.extractLanguageFromFileName(rawVideoName)
+                val effectiveLang = if (hasFolderClass) {
+                    folderClassification.language
+                } else {
+                    fileLangHint
+                        ?: movieMeta.originalLanguage.ifBlank { null }
+                        ?: MovieIndustryResolver.deduceLanguageFromScript(movieMeta.officialTitle)
+                }
+                val industryInfo = MovieIndustryResolver.toIndustryInfo(if (hasFolderClass) folderClassification.industry else effectiveLang)
+
                 parsedItem.copy(
                     displayTitle = movieMeta.officialTitle,
                     thumbnailUrl = finalThumb,
                     externalSubtitles = externalSubtitleTracks,
-                    genreFormatted = movieMeta.genre
+                    genreFormatted = movieMeta.genre,
+                    language = industryInfo.language,
+                    industry = industryInfo.sectionLabel,
+                    sourceFolder = if (hasFolderClass) folderName else "",
+                    isFolderClassified = hasFolderClass
                 )
             }
         } catch (e: Exception) {

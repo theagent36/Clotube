@@ -32,6 +32,8 @@ data class CachedMetadataRecord(
     val year: String = "",
     val rating: String = "",
     val genre: String = "",
+    val language: String = "",
+    val originalLanguage: String = "",
     val tvMazeId: Long = -1L,
     val cachedAt: Long = System.currentTimeMillis()
 ) : Serializable {
@@ -46,6 +48,9 @@ data class CachedMetadataRecord(
         put("year", year)
         put("rating", rating)
         put("genre", genre)
+        val resolvedLang = language.ifBlank { originalLanguage }
+        put("language", resolvedLang)
+        put("originalLanguage", resolvedLang)
         put("tvMazeId", tvMazeId)
         put("cachedAt", cachedAt)
     }
@@ -55,6 +60,7 @@ data class CachedMetadataRecord(
             val key = json.optString("cacheKey", "").trim()
             val title = json.optString("title", "").trim()
             if (key.isBlank() || title.isBlank()) return null
+            val parsedLang = json.optString("language", json.optString("originalLanguage", "")).trim()
             return CachedMetadataRecord(
                 cacheKey = key,
                 title = title,
@@ -65,6 +71,8 @@ data class CachedMetadataRecord(
                 year = json.optString("year", ""),
                 rating = json.optString("rating", ""),
                 genre = json.optString("genre", ""),
+                language = parsedLang,
+                originalLanguage = parsedLang,
                 tvMazeId = json.optLong("tvMazeId", -1L),
                 cachedAt = json.optLong("cachedAt", System.currentTimeMillis())
             )
@@ -101,30 +109,33 @@ object MetadataDiskCache {
 
         mutex.withLock {
             if (isLoaded) return@withLock
-            val file = getCacheFile(context)
-            if (file.exists() && file.length() > 0) {
-                try {
-                    val raw = file.readText(Charsets.UTF_8)
-                    val json = JSONObject(raw)
-                    val entriesObj = json.optJSONObject("entries")
-                    if (entriesObj != null) {
-                        val now = System.currentTimeMillis()
-                        val keys = entriesObj.keys()
-                        var count = 0
-                        while (keys.hasNext()) {
-                            val key = keys.next()
-                            val itemObj = entriesObj.optJSONObject(key) ?: continue
-                            val record = CachedMetadataRecord.fromJsonObject(itemObj) ?: continue
-                            // Exclude expired records
-                            if (now - record.cachedAt < TTL_MILLIS) {
-                                memoryMap[record.cacheKey] = record
-                                count++
+            val cacheFiles = listOf(getCacheFile(context), File(context.cacheDir, "movie_metadata_cache.json"))
+            for (file in cacheFiles) {
+                if (file.exists() && file.length() > 0) {
+                    try {
+                        val raw = file.readText(Charsets.UTF_8)
+                        val json = JSONObject(raw)
+                        val entriesObj = json.optJSONObject("entries")
+                        if (entriesObj != null) {
+                            val now = System.currentTimeMillis()
+                            val keys = entriesObj.keys()
+                            var count = 0
+                            while (keys.hasNext()) {
+                                val key = keys.next()
+                                val itemObj = entriesObj.optJSONObject(key) ?: continue
+                                val record = CachedMetadataRecord.fromJsonObject(itemObj) ?: continue
+                                if (record.cacheKey.startsWith("movie") && record.posterUrl.isBlank()) continue
+                                // Exclude expired records
+                                if (now - record.cachedAt < TTL_MILLIS) {
+                                    memoryMap[record.cacheKey] = record
+                                    count++
+                                }
                             }
+                            Log.d(TAG, "Loaded $count valid metadata records from ${file.name}")
                         }
-                        Log.d(TAG, "Loaded $count valid metadata records from disk cache")
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed reading metadata cache from ${file.name}: ${e.message}")
                     }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed reading metadata cache: ${e.message}")
                 }
             }
             isLoaded = true
@@ -137,6 +148,10 @@ object MetadataDiskCache {
     fun get(key: String): CachedMetadataRecord? {
         val cleanKey = key.trim().lowercase()
         val record = memoryMap[cleanKey] ?: return null
+        if (record.cacheKey.startsWith("movie") && record.posterUrl.isBlank()) {
+            memoryMap.remove(cleanKey)
+            return null
+        }
         if (System.currentTimeMillis() - record.cachedAt >= TTL_MILLIS) {
             memoryMap.remove(cleanKey)
             return null
@@ -148,6 +163,10 @@ object MetadataDiskCache {
      * Stores a record in memory and schedules a debounced write to disk.
      */
     suspend fun put(context: Context, record: CachedMetadataRecord) {
+        // Never persist a movie metadata record with an empty posterUrl as a permanent hit
+        if (record.cacheKey.startsWith("movie") && record.posterUrl.isBlank()) {
+            return
+        }
         val cleanKey = record.cacheKey.trim().lowercase()
         memoryMap[cleanKey] = record.copy(cacheKey = cleanKey)
 

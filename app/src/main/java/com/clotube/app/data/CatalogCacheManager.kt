@@ -63,31 +63,6 @@ class CatalogCacheManager(private val context: Context) {
         }
     }
 
-    private fun findNonEmptyProfileCatalogFallback(excludeFile: File): CachedCatalog? {
-        return try {
-            val profilesDir = File(appContext.filesDir, "profiles")
-            if (!profilesDir.exists() || !profilesDir.isDirectory) return null
-            val subDirs = profilesDir.listFiles { f -> f.isDirectory } ?: return null
-            for (dir in subDirs) {
-                val candidate = File(dir, "cached_catalog.json")
-                if (candidate.absolutePath == excludeFile.absolutePath) continue
-                if (candidate.exists() && candidate.length() > 0) {
-                    val raw = candidate.readText(Charsets.UTF_8)
-                    if (raw.isNotBlank()) {
-                        val type = object : TypeToken<CachedCatalog>() {}.type
-                        val catalog = gson.fromJson<CachedCatalog>(raw, type)
-                        if (catalog != null && (catalog.movies.isNotEmpty() || catalog.series.isNotEmpty())) {
-                            return catalog
-                        }
-                    }
-                }
-            }
-            null
-        } catch (_: Exception) {
-            null
-        }
-    }
-
     fun getCachedCatalogSync(): CachedCatalog = readCatalogFromDiskSync()
 
     fun readCatalogFromDiskSync(): CachedCatalog {
@@ -106,38 +81,32 @@ class CatalogCacheManager(private val context: Context) {
                     } else {
                         CachedCatalog()
                     }
-                } else {
-                    // Check fallback: files/profiles/*/cached_catalog.json
-                    val fallbackCatalog = findNonEmptyProfileCatalogFallback(targetFile)
-                    if (fallbackCatalog != null && (fallbackCatalog.movies.isNotEmpty() || fallbackCatalog.series.isNotEmpty())) {
-                        fallbackCatalog
-                    } else if (legacyRootCacheFile.exists() && legacyRootCacheFile.length() > 0) {
-                        // One-time migration from legacy root directory to profile directory
-                        val legacyJson = legacyRootCacheFile.readText(Charsets.UTF_8)
-                        if (legacyJson.isNotBlank()) {
-                            val type = object : TypeToken<CachedCatalog>() {}.type
-                            val migrated = gson.fromJson<CachedCatalog>(legacyJson, type) ?: CachedCatalog()
-                            try {
-                                val targetDir = targetFile.parentFile ?: appContext.filesDir
-                                if (!targetDir.exists()) targetDir.mkdirs()
-                                targetFile.writeText(legacyJson, Charsets.UTF_8)
-                            } catch (_: Exception) {}
-                            migrated
-                        } else {
-                            CachedCatalog()
-                        }
-                    } else if (legacySeriesCacheFile.exists() && legacySeriesCacheFile.length() > 0) {
-                        val legacyJson = legacySeriesCacheFile.readText(Charsets.UTF_8)
-                        if (legacyJson.isNotBlank()) {
-                            val type = object : TypeToken<List<TvSeries>>() {}.type
-                            val legacySeries = gson.fromJson<List<TvSeries>>(legacyJson, type) ?: emptyList()
-                            CachedCatalog(series = legacySeries)
-                        } else {
-                            CachedCatalog()
-                        }
+                } else if (legacyRootCacheFile.exists() && legacyRootCacheFile.length() > 0) {
+                    // One-time migration from legacy root directory to profile directory
+                    val legacyJson = legacyRootCacheFile.readText(Charsets.UTF_8)
+                    if (legacyJson.isNotBlank()) {
+                        val type = object : TypeToken<CachedCatalog>() {}.type
+                        val migrated = gson.fromJson<CachedCatalog>(legacyJson, type) ?: CachedCatalog()
+                        try {
+                            val targetDir = targetFile.parentFile ?: appContext.filesDir
+                            if (!targetDir.exists()) targetDir.mkdirs()
+                            targetFile.writeText(legacyJson, Charsets.UTF_8)
+                        } catch (_: Exception) {}
+                        migrated
                     } else {
                         CachedCatalog()
                     }
+                } else if (legacySeriesCacheFile.exists() && legacySeriesCacheFile.length() > 0) {
+                    val legacyJson = legacySeriesCacheFile.readText(Charsets.UTF_8)
+                    if (legacyJson.isNotBlank()) {
+                        val type = object : TypeToken<List<TvSeries>>() {}.type
+                        val legacySeries = gson.fromJson<List<TvSeries>>(legacyJson, type) ?: emptyList()
+                        CachedCatalog(series = legacySeries)
+                    } else {
+                        CachedCatalog()
+                    }
+                } else {
+                    CachedCatalog()
                 }
             } catch (_: Exception) {
                 CachedCatalog()

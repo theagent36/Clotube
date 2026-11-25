@@ -10,10 +10,11 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.OutOfQuotaPolicy
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
+import com.clotube.app.data.AndroidWatchHistoryManager
 import com.clotube.app.data.DriveWatchHistorySync
 import com.clotube.app.data.DriveWatchlistSync
+import com.clotube.app.data.SyncPriority
 import com.clotube.app.data.WatchlistManager
-import com.clotube.app.data.playbackDataStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
@@ -23,7 +24,7 @@ import java.io.IOException
  * Android WorkManager CoroutineWorker ensuring cloud synchronization resilience across
  * process termination, swipe-to-kill, and background lifecycle transitions.
  *
- * Synchronizes both watch history (clotube_watch_history.json) and watchlist (clotube_watchlist.json)
+ * Synchronizes both watch history (clotube_active_sync.json / clotube_archive.json) and watchlist (clotube_watchlist.json)
  * on Google Drive inside an uninterrupted NonCancellable coroutine scope.
  */
 class DriveSyncWorker(
@@ -35,17 +36,21 @@ class DriveSyncWorker(
         Log.i(TAG, "[DriveSyncWorker] Background sync worker started by Android OS...")
 
         try {
-            // 1. Ensure WatchlistManager and local DataStore are initialized
+            // 1. Ensure WatchlistManager is initialized
             WatchlistManager.ensureLoaded(applicationContext)
-            val dataStore = applicationContext.playbackDataStore
 
-            // 2. Execute bidirectional Drive sync for watch history (clotube_watch_history.json)
+            // 2. Execute direct upload for watch history
             val historySync = DriveWatchHistorySync.getInstance(applicationContext)
-            val historySuccess = try {
-                historySync.executeDirectUpload(dataStore)
-            } catch (e: Exception) {
-                Log.w(TAG, "[DriveSyncWorker] Watch history sync execution error: ${e.message}")
-                false
+            val historySuccess = if (AndroidWatchHistoryManager.snapshotEntries().isNotEmpty()) {
+                try {
+                    historySync.executeDirectUpload(SyncPriority.CRITICAL_WATCH_STATE)
+                } catch (e: Exception) {
+                    Log.w(TAG, "[DriveSyncWorker] Watch history sync execution error: ${e.message}")
+                    false
+                }
+            } else {
+                Log.d(TAG, "[DriveSyncWorker] Volatile watch history empty; skipping overwrite")
+                true
             }
 
             // 3. Execute bidirectional Drive sync for watchlist (clotube_watchlist.json)

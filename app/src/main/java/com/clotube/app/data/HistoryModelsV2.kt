@@ -12,10 +12,16 @@ data class HistoryItemEntityV2(
     val isWatched: Boolean = false,
     val seriesId: String? = null,
     val seasonNumber: Int? = null,
-    val episodeNumber: Int? = null
+    val episodeNumber: Int? = null,
+    val seriesTitle: String? = null,
+    val thumbnailUrl: String? = null
 ) {
     val progressFraction: Float
         get() = if (durationMs > 0L) (positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f) else 0f
+
+    val fraction: Float get() = progressFraction
+    val timestampMs: Long get() = timestamp
+    val isSeries: Boolean get() = !seriesId.isNullOrBlank() || seasonNumber != null || episodeNumber != null
 
     fun toJsonObject(): JSONObject = JSONObject().apply {
         put("id", id)
@@ -27,6 +33,8 @@ data class HistoryItemEntityV2(
         if (!seriesId.isNullOrBlank()) put("sid", seriesId)
         if (seasonNumber != null) put("s", seasonNumber)
         if (episodeNumber != null) put("e", episodeNumber)
+        if (!seriesTitle.isNullOrBlank()) put("st", seriesTitle)
+        if (!thumbnailUrl.isNullOrBlank()) put("thumb", thumbnailUrl)
     }
 
     companion object {
@@ -40,7 +48,9 @@ data class HistoryItemEntityV2(
                 isWatched = obj.optBoolean("w", false),
                 seriesId = if (obj.has("sid")) obj.optString("sid").ifBlank { null } else null,
                 seasonNumber = if (obj.has("s") && !obj.isNull("s")) obj.optInt("s") else null,
-                episodeNumber = if (obj.has("e") && !obj.isNull("e")) obj.optInt("e") else null
+                episodeNumber = if (obj.has("e") && !obj.isNull("e")) obj.optInt("e") else null,
+                seriesTitle = if (obj.has("st")) obj.optString("st").ifBlank { null } else null,
+                thumbnailUrl = if (obj.has("thumb")) obj.optString("thumb").ifBlank { null } else null
             )
         }
     }
@@ -52,8 +62,13 @@ data class SeriesResumeEntityV2(
     val episodeNumber: Int = 1,
     val positionMs: Long = 0L,
     val durationMs: Long = 0L,
-    val timestamp: Long = 0L
+    val timestamp: Long = 0L,
+    val seriesTitle: String? = null,
+    val episodeTitle: String? = null
 ) {
+    val fraction: Float get() = if (durationMs > 0L) (positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f) else 0f
+    val timestampMs: Long get() = timestamp
+
     fun toJsonObject(): JSONObject = JSONObject().apply {
         put("id", episodeId)
         put("s", seasonNumber)
@@ -84,6 +99,7 @@ data class WatchHistoryPayloadV2(
     val resume: Map<String, SeriesResumeEntityV2> = emptyMap(),
     val watchedIds: List<String> = emptyList()
 ) {
+    val seriesResume: Map<String, SeriesResumeEntityV2> get() = resume
     fun toJsonString(): String {
         val root = JSONObject()
         root.put("v", version)
@@ -223,6 +239,97 @@ data class WatchHistoryPayloadV2(
             }
 
             return WatchHistoryPayloadV2(v, updatedAt, activeList, resumeMap, watchedList)
+        }
+
+        fun fromTypedEntries(
+            entries: Map<String, AndroidTypedEntry>,
+            updatedAt: Long = System.currentTimeMillis()
+        ): WatchHistoryPayloadV2 {
+            val itemIds = linkedSetOf<String>()
+            val seriesResumeIds = linkedSetOf<String>()
+
+            for (key in entries.keys) {
+                if (key == "watch_history_list_json") continue
+                if (key.startsWith("series_resume_")) {
+                    val sid = key.removePrefix("series_resume_").substringBefore("_")
+                    if (sid.isNotBlank()) seriesResumeIds.add(sid)
+                } else {
+                    val id = key.substringBeforeLast("_")
+                    if (id.isNotBlank() && !id.startsWith("global_") && !id.startsWith("snapshot_") && !id.startsWith("last_global_")) {
+                        itemIds.add(id)
+                    }
+                }
+            }
+
+            val activeItems = mutableListOf<HistoryItemEntityV2>()
+            val watchedIds = linkedSetOf<String>()
+
+            for (id in itemIds) {
+                val title = (entries["${id}_title"]?.value as? String) ?: ""
+                val pos = (entries["${id}_pos"]?.value as? Number)?.toLong() ?: 0L
+                val dur = (entries["${id}_dur"]?.value as? Number)?.toLong() ?: 0L
+                val frac = (entries["${id}_fraction"]?.value as? Number)?.toFloat()
+                    ?: if (dur > 0L) (pos.toFloat() / dur.toFloat()).coerceIn(0f, 1f) else 0f
+                val ts = (entries["${id}_timestamp"]?.value as? Number)?.toLong() ?: 0L
+                val explicitWatched = (entries["${id}_is_watched"]?.value as? Boolean)
+                val isWatched = explicitWatched ?: (frac >= 0.90f)
+
+                val seriesId = (entries["${id}_series_id"]?.value as? String)?.ifBlank { null }
+                val seriesTitle = (entries["${id}_series_title"]?.value as? String)?.ifBlank { null }
+                val seasonNum = (entries["${id}_season_num"]?.value as? Number)?.toInt()
+                val episodeNum = (entries["${id}_episode_num"]?.value as? Number)?.toInt()
+                val thumb = (entries["${id}_thumbnail_url"]?.value as? String)?.ifBlank { null }
+                    ?: (entries["${id}_thumb"]?.value as? String)?.ifBlank { null }
+
+                if (isWatched) {
+                    watchedIds.add(id)
+                }
+                if (ts > 0L || pos > 0L || dur > 0L || isWatched) {
+                    activeItems.add(
+                        HistoryItemEntityV2(
+                            id = id,
+                            title = title,
+                            positionMs = pos,
+                            durationMs = dur,
+                            timestamp = ts,
+                            isWatched = isWatched,
+                            seriesId = seriesId,
+                            seasonNumber = seasonNum,
+                            episodeNumber = episodeNum,
+                            seriesTitle = seriesTitle,
+                            thumbnailUrl = thumb
+                        )
+                    )
+                }
+            }
+
+            val resumeMap = linkedMapOf<String, SeriesResumeEntityV2>()
+            for (sid in seriesResumeIds) {
+                val prefix = "series_resume_$sid"
+                val epId = (entries["${prefix}_episode_id"]?.value as? String)?.trim().orEmpty()
+                if (epId.isBlank()) continue
+                val sNum = (entries["${prefix}_season_num"]?.value as? Number)?.toInt() ?: 1
+                val eNum = (entries["${prefix}_episode_num"]?.value as? Number)?.toInt() ?: 1
+                val posMs = (entries["${prefix}_pos_ms"]?.value as? Number)?.toLong() ?: 0L
+                val durMs = (entries["${prefix}_dur_ms"]?.value as? Number)?.toLong() ?: 0L
+                val ts = (entries["${prefix}_timestamp"]?.value as? Number)?.toLong() ?: 0L
+                resumeMap[sid] = SeriesResumeEntityV2(
+                    episodeId = epId,
+                    seasonNumber = sNum,
+                    episodeNumber = eNum,
+                    positionMs = posMs,
+                    durationMs = durMs,
+                    timestamp = ts
+                )
+            }
+
+            return WatchHistoryPayloadV2(
+                version = 2,
+                updatedAt = updatedAt,
+                active = activeItems,
+                resume = resumeMap,
+                watchedIds = watchedIds.toList()
+            )
         }
     }
 }

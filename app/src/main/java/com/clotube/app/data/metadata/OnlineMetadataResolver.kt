@@ -1,11 +1,15 @@
 package com.clotube.app.data.metadata
 
+import android.content.Context
 import android.util.Log
 import com.clotube.app.ClotubeApp
 import com.clotube.app.data.CachedMetadataRecord
 import com.clotube.app.data.MetadataDiskCache
+import com.clotube.app.data.MovieIndustryResolver
 import com.clotube.app.data.WatchlistManager
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -20,7 +24,8 @@ data class MovieMetadata(
     val officialTitle: String,
     val posterUrl: String = "",
     val releaseYear: String = "",
-    val genre: String = "Movie • Cinema"
+    val genre: String = "Movie • Cinema",
+    val originalLanguage: String = ""
 )
 
 @androidx.annotation.Keep
@@ -79,85 +84,239 @@ object OnlineMetadataResolver {
         showMetadataCache.clear()
     }
 
+    fun isDriveVideoFrameUrl(url: String?): Boolean {
+        if (url.isNullOrBlank()) return false
+        val lower = url.lowercase()
+        return lower.contains("googleusercontent.com") ||
+                lower.contains("drive.google.com") ||
+                lower.contains("docs.google.com")
+    }
+
+    fun needsRevalidation(title: String, thumbnailUrl: String?): Boolean {
+        if (thumbnailUrl.isNullOrBlank()) return true
+        if (isDriveVideoFrameUrl(thumbnailUrl)) return true
+        val trimmed = title.trim()
+        val endsWithYear = Regex("""(?i)(?:[\(\[]\s*|\s+)(?:19\d{2}|20\d{2})(?:\s*[\)\]])?\s*$""").containsMatchIn(trimmed)
+        return endsWithYear
+    }
+
+    fun getCachedMovieMetadata(context: Context? = null, idOrTitle: String): MovieMetadata? {
+        val trimmed = idOrTitle.trim()
+        if (trimmed.isBlank()) return null
+
+        // 1. In-memory movieCache check
+        movieCache[trimmed]?.let {
+            if (it.posterUrl.isNotBlank() && !isDriveVideoFrameUrl(it.posterUrl)) return it
+        }
+        val norm = WatchlistManager.normalizeTitle(trimmed)
+        movieCache[norm]?.let {
+            if (it.posterUrl.isNotBlank() && !isDriveVideoFrameUrl(it.posterUrl)) return it
+        }
+        val (cleanQuery, _) = extractMovieQueryAndYear(trimmed)
+        if (cleanQuery.isNotBlank() && cleanQuery != trimmed) {
+            movieCache[cleanQuery]?.let {
+                if (it.posterUrl.isNotBlank() && !isDriveVideoFrameUrl(it.posterUrl)) return it
+            }
+            val normClean = WatchlistManager.normalizeTitle(cleanQuery)
+            movieCache[normClean]?.let {
+                if (it.posterUrl.isNotBlank() && !isDriveVideoFrameUrl(it.posterUrl)) return it
+            }
+        }
+
+        // 2. Disk cache check
+        val diskKeys = listOf(
+            trimmed.lowercase(),
+            "movie_${trimmed.lowercase()}",
+            "movie_$norm",
+            "movie_${norm.replace(" ", "_")}",
+            if (cleanQuery.isNotBlank()) "movie_${WatchlistManager.normalizeTitle(cleanQuery)}" else ""
+        ).filter { it.isNotBlank() }
+
+        for (key in diskKeys) {
+            val record = MetadataDiskCache.get(key)
+            if (record != null && record.posterUrl.isNotBlank() && !isDriveVideoFrameUrl(record.posterUrl)) {
+                val meta = MovieMetadata(
+                    officialTitle = record.title,
+                    posterUrl = record.posterUrl,
+                    releaseYear = record.year,
+                    genre = record.genre.ifBlank { "Movie • Cinema" },
+                    originalLanguage = record.originalLanguage
+                )
+                movieCache[trimmed] = meta
+                return meta
+            }
+        }
+
+        return null
+    }
+
+    private fun saveValidMovieCache(diskKey: String, meta: MovieMetadata) {
+        if (meta.posterUrl.isBlank() || isDriveVideoFrameUrl(meta.posterUrl)) return
+        try {
+            val app = try { ClotubeApp.instance } catch (_: Throwable) { null }
+            if (app != null) {
+                CoroutineScope(Dispatchers.IO).launch {
+                    MetadataDiskCache.put(
+                        app,
+                        CachedMetadataRecord(
+                            cacheKey = diskKey,
+                            title = meta.officialTitle,
+                            posterUrl = meta.posterUrl,
+                            year = meta.releaseYear,
+                            genre = meta.genre,
+                            language = meta.originalLanguage,
+                            originalLanguage = meta.originalLanguage
+                        )
+                    )
+                }
+            }
+        } catch (_: Exception) {}
+    }
+
     // ========================================================
     // 1. MOVIE METADATA RESOLUTION
     // ========================================================
 
     suspend fun resolveMovie(rawFileName: String): MovieMetadata = withContext(Dispatchers.IO) {
         val trimmed = rawFileName.trim()
-        movieCache[trimmed]?.let { return@withContext it }
+        movieCache[trimmed]?.let { cachedMeta ->
+            if (cachedMeta.posterUrl.isNotBlank() && !isDriveVideoFrameUrl(cachedMeta.posterUrl) && cachedMeta.originalLanguage.isNotBlank()) {
+                return@withContext cachedMeta
+            }
+        }
 
         val normTitle = WatchlistManager.normalizeTitle(trimmed)
         val diskKey = "movie_$normTitle"
         MetadataDiskCache.get(diskKey)?.let { cached ->
-            val meta = MovieMetadata(
-                officialTitle = cached.title,
-                posterUrl = cached.posterUrl,
-                releaseYear = cached.year,
-                genre = cached.genre.ifBlank { "Movie • Cinema" }
-            )
-            movieCache[trimmed] = meta
-            return@withContext meta
+            val cachedLang = cached.language.ifBlank { cached.originalLanguage }
+            if (cached.posterUrl.isNotBlank() && !isDriveVideoFrameUrl(cached.posterUrl) && cachedLang.isNotBlank()) {
+                val meta = MovieMetadata(
+                    officialTitle = cached.title,
+                    posterUrl = cached.posterUrl,
+                    releaseYear = cached.year,
+                    genre = cached.genre.ifBlank { "Movie • Cinema" },
+                    originalLanguage = cachedLang
+                )
+                movieCache[trimmed] = meta
+                return@withContext meta
+            }
         }
 
         val (cleanQuery, releaseYear) = extractMovieQueryAndYear(trimmed)
         if (cleanQuery.isBlank()) {
-            val fallback = MovieMetadata(officialTitle = toTitleCase(trimmed.substringBeforeLast('.')))
-            movieCache[trimmed] = fallback
+            val fallbackLang = MovieIndustryResolver.extractLanguageFromFileName(trimmed)
+                ?: MovieIndustryResolver.deduceLanguageFromScript(trimmed)
+            val fallback = MovieMetadata(
+                officialTitle = toTitleCase(trimmed.substringBeforeLast('.')),
+                originalLanguage = MovieIndustryResolver.toIndustryInfo(fallbackLang).language
+            )
             return@withContext fallback
+        }
+
+        // Check disk cache with clean query normalized if different from original diskKey
+        val cleanNorm = WatchlistManager.normalizeTitle(cleanQuery)
+        val cleanDiskKey = "movie_$cleanNorm"
+        if (cleanDiskKey != diskKey) {
+            MetadataDiskCache.get(cleanDiskKey)?.let { cached ->
+                val cachedLang = cached.language.ifBlank { cached.originalLanguage }
+                if (cached.posterUrl.isNotBlank() && !isDriveVideoFrameUrl(cached.posterUrl) && cachedLang.isNotBlank()) {
+                    val meta = MovieMetadata(
+                        officialTitle = cached.title,
+                        posterUrl = cached.posterUrl,
+                        releaseYear = cached.year,
+                        genre = cached.genre.ifBlank { "Movie • Cinema" },
+                        originalLanguage = cachedLang
+                    )
+                    movieCache[trimmed] = meta
+                    return@withContext meta
+                }
+            }
         }
 
         // Engine 1: IMDb Suggestion API (Universal: Hollywood, Bollywood, Amazon, Netflix)
         val imdbResult = fetchFromImdb(cleanQuery, releaseYear)
-        if (imdbResult != null && imdbResult.posterUrl.isNotBlank()) {
-            movieCache[trimmed] = imdbResult
-            try {
-                MetadataDiskCache.put(
-                    ClotubeApp.instance,
-                    CachedMetadataRecord(
-                        cacheKey = diskKey,
-                        title = imdbResult.officialTitle,
-                        posterUrl = imdbResult.posterUrl,
-                        year = imdbResult.releaseYear,
-                        genre = imdbResult.genre
-                    )
-                )
-            } catch (_: Exception) {}
-            return@withContext imdbResult
+
+        // Engine 2: TMDB Search API (Primary global catalog)
+        val tmdbResult = if (imdbResult == null || imdbResult.originalLanguage.isBlank()) {
+            fetchFromTmdb(cleanQuery, releaseYear)
+        } else null
+
+        if (imdbResult != null && imdbResult.posterUrl.isNotBlank() && !isDriveVideoFrameUrl(imdbResult.posterUrl)) {
+            val rawLang = tmdbResult?.originalLanguage?.ifBlank { imdbResult.originalLanguage }
+                ?.ifBlank { null }
+                ?: MovieIndustryResolver.extractLanguageFromFileName(trimmed)
+                ?: MovieIndustryResolver.deduceLanguageFromScript(imdbResult.officialTitle)
+            val info = MovieIndustryResolver.toIndustryInfo(rawLang)
+            val resolvedImdb = imdbResult.copy(originalLanguage = info.language)
+            movieCache[trimmed] = resolvedImdb
+            saveValidMovieCache(cleanDiskKey, resolvedImdb)
+            return@withContext resolvedImdb
         }
 
-        // Engine 2: iTunes Store API (Secondary)
-        val itunesResult = fetchFromItunes(cleanQuery, releaseYear)
-        if (itunesResult != null) {
-            val mergedResult = if (imdbResult != null && itunesResult.posterUrl.isBlank()) {
-                imdbResult.copy(posterUrl = itunesResult.posterUrl)
-            } else {
-                itunesResult
+        val activeTmdbResult = tmdbResult ?: fetchFromTmdb(cleanQuery, releaseYear)
+        if (activeTmdbResult != null && activeTmdbResult.posterUrl.isNotBlank() && !isDriveVideoFrameUrl(activeTmdbResult.posterUrl)) {
+            val rawLang = activeTmdbResult.originalLanguage.ifBlank {
+                MovieIndustryResolver.extractLanguageFromFileName(trimmed)
+                    ?: MovieIndustryResolver.deduceLanguageFromScript(activeTmdbResult.officialTitle)
             }
+            val info = MovieIndustryResolver.toIndustryInfo(rawLang)
+            val mergedResult = activeTmdbResult.copy(
+                officialTitle = imdbResult?.officialTitle?.ifBlank { activeTmdbResult.officialTitle } ?: activeTmdbResult.officialTitle,
+                releaseYear = activeTmdbResult.releaseYear.ifBlank { releaseYear ?: "" },
+                originalLanguage = info.language
+            )
             movieCache[trimmed] = mergedResult
-            try {
-                MetadataDiskCache.put(
-                    ClotubeApp.instance,
-                    CachedMetadataRecord(
-                        cacheKey = diskKey,
-                        title = mergedResult.officialTitle,
-                        posterUrl = mergedResult.posterUrl,
-                        year = mergedResult.releaseYear,
-                        genre = mergedResult.genre
-                    )
-                )
-            } catch (_: Exception) {}
+            saveValidMovieCache(cleanDiskKey, mergedResult)
             return@withContext mergedResult
         }
 
-        // Engine 3: Clean Fallback
-        val safeFallback = imdbResult ?: MovieMetadata(
+        // Engine 3: Cinemeta API (Open stream catalog)
+        val cinemetaResult = fetchFromCinemeta(cleanQuery, releaseYear)
+        if (cinemetaResult != null && cinemetaResult.posterUrl.isNotBlank() && !isDriveVideoFrameUrl(cinemetaResult.posterUrl)) {
+            val rawLang = cinemetaResult.originalLanguage.ifBlank {
+                MovieIndustryResolver.extractLanguageFromFileName(trimmed)
+                    ?: MovieIndustryResolver.deduceLanguageFromScript(cinemetaResult.officialTitle)
+            }
+            val info = MovieIndustryResolver.toIndustryInfo(rawLang)
+            val mergedResult = cinemetaResult.copy(
+                officialTitle = imdbResult?.officialTitle?.ifBlank { cinemetaResult.officialTitle } ?: cinemetaResult.officialTitle,
+                releaseYear = cinemetaResult.releaseYear.ifBlank { releaseYear ?: "" },
+                originalLanguage = info.language
+            )
+            movieCache[trimmed] = mergedResult
+            saveValidMovieCache(cleanDiskKey, mergedResult)
+            return@withContext mergedResult
+        }
+
+        // Engine 4: iTunes Store API (Secondary)
+        val itunesResult = fetchFromItunes(cleanQuery, releaseYear)
+        if (itunesResult != null && itunesResult.posterUrl.isNotBlank() && !isDriveVideoFrameUrl(itunesResult.posterUrl)) {
+            val rawLang = itunesResult.originalLanguage.ifBlank {
+                MovieIndustryResolver.extractLanguageFromFileName(trimmed)
+                    ?: MovieIndustryResolver.deduceLanguageFromScript(itunesResult.officialTitle)
+            }
+            val info = MovieIndustryResolver.toIndustryInfo(rawLang)
+            val mergedResult = itunesResult.copy(
+                officialTitle = imdbResult?.officialTitle?.ifBlank { itunesResult.officialTitle } ?: itunesResult.officialTitle,
+                releaseYear = itunesResult.releaseYear.ifBlank { releaseYear ?: "" },
+                originalLanguage = info.language
+            )
+            movieCache[trimmed] = mergedResult
+            saveValidMovieCache(cleanDiskKey, mergedResult)
+            return@withContext mergedResult
+        }
+
+        // Fallback: Return clean title without blank poster poisoning disk cache
+        val scriptLang = MovieIndustryResolver.extractLanguageFromFileName(trimmed)
+            ?: MovieIndustryResolver.deduceLanguageFromScript(cleanQuery)
+        val info = MovieIndustryResolver.toIndustryInfo(scriptLang)
+        val safeFallback = imdbResult ?: activeTmdbResult ?: cinemetaResult ?: itunesResult ?: MovieMetadata(
             officialTitle = toTitleCase(cleanQuery),
             posterUrl = "",
             releaseYear = releaseYear ?: "",
-            genre = "Movie • Cinema"
+            genre = "Movie • Cinema",
+            originalLanguage = info.language
         )
-        movieCache[trimmed] = safeFallback
         safeFallback
     }
 
@@ -308,6 +467,112 @@ object OnlineMetadataResolver {
             }
         } catch (e: Exception) {
             logE(TAG, "iTunes lookup failed for '$query': ${e.message}")
+        } finally {
+            connection?.disconnect()
+        }
+        return null
+    }
+
+    // ========================================================
+    // ENGINE 3: TMDB SEARCH API (Keyed, Comprehensive Global)
+    // ========================================================
+
+    private const val TMDB_API_KEY = "84148a68b492c79f33269f8323e0702e"
+
+    private fun fetchFromTmdb(query: String, targetYear: String?): MovieMetadata? {
+        var connection: HttpURLConnection? = null
+        try {
+            val encoded = URLEncoder.encode(query, "UTF-8")
+            val yearParam = if (!targetYear.isNullOrBlank()) "&year=$targetYear" else ""
+            val endpoint = "https://api.themoviedb.org/3/search/movie?api_key=$TMDB_API_KEY&query=$encoded$yearParam&include_adult=false&language=en-US&page=1"
+            connection = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 5000
+                readTimeout = 5000
+                setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) Clotube/3.7")
+            }
+
+            if (connection.responseCode == HttpURLConnection.HTTP_OK) {
+                val responseText = connection.inputStream.bufferedReader().use { it.readText() }
+                val json = JSONObject(responseText)
+                val results = json.optJSONArray("results") ?: return null
+
+                for (i in 0 until results.length()) {
+                    val item = results.getJSONObject(i)
+                    val title = item.optString("title").ifBlank { item.optString("original_title") }.trim()
+                    val posterPath = item.optString("poster_path", "")
+                    val releaseDate = item.optString("release_date", "")
+                    val year = releaseDate.take(4)
+                    val origLang = item.optString("original_language", "").trim()
+                    val canonicalLang = if (origLang.isNotBlank()) MovieIndustryResolver.toIndustryInfo(origLang).language else ""
+
+                    if (isTitleSimilar(query, title) && posterPath.isNotBlank()) {
+                        val posterUrl = "https://image.tmdb.org/t/p/w500$posterPath"
+                        logD(TAG, "TMDB match for '$query' -> '$title' ($year)")
+                        return MovieMetadata(
+                            officialTitle = title,
+                            posterUrl = posterUrl,
+                            releaseYear = year.ifBlank { targetYear ?: "" },
+                            genre = "Movie • Cinema",
+                            originalLanguage = canonicalLang
+                        )
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            logE(TAG, "TMDB lookup failed for '$query': ${e.message}")
+        } finally {
+            connection?.disconnect()
+        }
+        return null
+    }
+
+    // ========================================================
+    // ENGINE 4: CINEMETA API (Keyless Open Stream Catalog)
+    // ========================================================
+
+    private fun fetchFromCinemeta(query: String, targetYear: String?): MovieMetadata? {
+        var connection: HttpURLConnection? = null
+        try {
+            val encoded = URLEncoder.encode(query, "UTF-8")
+            val endpoint = "https://v3-cinemeta.strem.io/catalog/movie/top/search=$encoded.json"
+            connection = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 5000
+                readTimeout = 5000
+                setRequestProperty("User-Agent", "Clotube/1.0 (Android OTT)")
+            }
+
+            if (connection.responseCode == HttpURLConnection.HTTP_OK) {
+                val responseText = connection.inputStream.bufferedReader().use { it.readText() }
+                val json = JSONObject(responseText)
+                val metas = json.optJSONArray("metas") ?: return null
+
+                for (i in 0 until metas.length()) {
+                    val item = metas.getJSONObject(i)
+                    val name = item.optString("name", "").trim()
+                    val year = item.optString("year", "")
+                    val rawPoster = item.optString("poster", "").takeIf { it.isNotBlank() }
+
+                    if (isTitleSimilar(query, name) && rawPoster != null) {
+                        val highResPoster = rawPoster.replace(Regex("""\._V1_.*\.jpg$"""), "._V1_SX800.jpg")
+                        val genresArray = item.optJSONArray("genres")
+                        val genre = if (genresArray != null && genresArray.length() > 0) {
+                            "Movie • " + genresArray.getString(0)
+                        } else "Movie • Cinema"
+
+                        logD(TAG, "Cinemeta match for '$query' -> '$name' ($year)")
+                        return MovieMetadata(
+                            officialTitle = name,
+                            posterUrl = highResPoster,
+                            releaseYear = year.ifBlank { targetYear ?: "" },
+                            genre = genre
+                        )
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            logE(TAG, "Cinemeta lookup failed for '$query': ${e.message}")
         } finally {
             connection?.disconnect()
         }
@@ -638,14 +903,41 @@ object OnlineMetadataResolver {
         // Normalize underscores and dots to spaces early so word boundaries \b work on all tags
         text = text.replace('_', ' ').replace('.', ' ')
 
-        // 3. Extract 4-digit release year (1900-2099)
-        val yearMatcher = Pattern.compile("\\b(19\\d{2}|20\\d{2})\\b").matcher(text)
+        // 3. Extract parenthesized or bracketed release year first e.g. (2015), [2015], (2026)
+        val parenYearMatcher = Pattern.compile("[\\[\\(]\\s*(19\\d{2}|20\\d{2})\\s*[\\]\\)]").matcher(text)
         var year: String? = null
-        if (yearMatcher.find()) {
-            year = yearMatcher.group(1)
+        if (parenYearMatcher.find()) {
+            year = parenYearMatcher.group(1)
+            text = text.substring(0, parenYearMatcher.start()) + " " + text.substring(parenYearMatcher.end())
         }
 
-        // 4. Strip technical rip tags, codecs, audio, resolutions, and release tags
+        // 4. Extract bare trailing 4-digit year (e.g. "The Visit 2015", "Crime 101 2026")
+        if (year == null) {
+            val trailingYearMatcher = Pattern.compile("(?i)(?:^|\\s+)\\b(19\\d{2}|20\\d{2})\\b(?:\\s*$)").matcher(text)
+            if (trailingYearMatcher.find()) {
+                year = trailingYearMatcher.group(1)
+                text = text.substring(0, trailingYearMatcher.start()) + " " + text.substring(trailingYearMatcher.end())
+            }
+        }
+
+        // 5. Extract any other 4-digit release year (1900-2099)
+        if (year == null) {
+            val yearMatcher = Pattern.compile("\\b(19\\d{2}|20\\d{2})\\b").matcher(text)
+            var lastYearMatch: String? = null
+            var lastStart = -1
+            var lastEnd = -1
+            while (yearMatcher.find()) {
+                lastYearMatch = yearMatcher.group(1)
+                lastStart = yearMatcher.start()
+                lastEnd = yearMatcher.end()
+            }
+            if (lastYearMatch != null) {
+                year = lastYearMatch
+                text = text.substring(0, lastStart) + " " + text.substring(lastEnd)
+            }
+        }
+
+        // 6. Strip technical rip tags, codecs, audio, resolutions, and release tags
         val cleanupTags = listOf(
             "(?i)\\b(2160p|1080p|1080i|720p|480p|FHD|UHD|4K|HDTV|WEB-?DL|WEBRip|BluRay|BRRip|DVDRip|IMAX|Remux|WEB(\\s*Line)?|TeleSync|TS|CAM|HDCAM|HDTS|Line)\\b",
             "(?i)\\b(x264|x265|H\\.?264|H\\.?265|HEVC|AVC|10bit|8bit|HDR10?\\+?|DV|Dolby)\\b",
@@ -661,10 +953,19 @@ object OnlineMetadataResolver {
             text = text.replace(Regex(tag), " ")
         }
         if (year != null) {
-            text = text.replace(year, " ")
+            text = text.replace(Regex("\\b${Regex.escape(year)}\\b"), " ")
         }
 
-        // 5. Clean remaining punctuation, dangling parentheses, hyphens, and multi-spaces
+        // Strip any remaining bare trailing 4-digit year that might have emerged after tag stripping
+        val trailingBareYearMatcher = Pattern.compile("(?i)\\s+\\b(19\\d{2}|20\\d{2})\\b\\s*$").matcher(text)
+        if (trailingBareYearMatcher.find()) {
+            if (year == null) {
+                year = trailingBareYearMatcher.group(1)
+            }
+            text = text.substring(0, trailingBareYearMatcher.start())
+        }
+
+        // 7. Clean remaining punctuation, dangling parentheses, hyphens, and multi-spaces
         text = text.replace(Regex("[()\\[\\]{}]"), " ")
         text = text.replace(Regex("^\\s*-\\s*|\\s*-\\s*$"), " ")
         text = text.replace(Regex("\\s+"), " ").trim()

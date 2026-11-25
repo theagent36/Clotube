@@ -77,12 +77,15 @@ fun NativeVideoPlayerScreen(
             0L
         }
 
+        val movieThumb = movie?.thumbnailUrl?.takeIf { it.isNotBlank() } ?: movie?.fallbackThumbnailUrl
+
         try {
             viewModel.playbackHistoryManager.saveMoviePlaybackState(
                 fileId = fileId,
                 title = movieTitle,
                 positionMs = resumePositionMs.coerceAtLeast(1000L),
-                durationMs = movie?.durationMs?.coerceAtLeast(1000L) ?: 1000L
+                durationMs = movie?.durationMs?.coerceAtLeast(1000L) ?: 1000L,
+                thumbnailUrl = movieThumb
             )
         } catch (_: Throwable) {}
 
@@ -102,12 +105,14 @@ fun NativeVideoPlayerScreen(
                 val nativeLen = player.safeCall(0L) { length }
                 val dur = if (nativeLen > 0L) nativeLen else (movie?.durationMs ?: 0L)
                 if (pos > 1000L && dur > 0L) {
+                    val movieThumb = movie?.thumbnailUrl?.takeIf { it.isNotBlank() } ?: movie?.fallbackThumbnailUrl
                     try {
                         viewModel.playbackHistoryManager.saveMoviePlaybackState(
                             fileId = fileId,
                             title = movieTitle,
                             positionMs = pos,
-                            durationMs = dur
+                            durationMs = dur,
+                            thumbnailUrl = movieThumb
                         )
                     } catch (_: Throwable) {}
                 }
@@ -121,13 +126,15 @@ fun NativeVideoPlayerScreen(
         val nativeLen = player.safeCall(0L) { length }
         val dur = if (nativeLen > 0L) nativeLen else (movie?.durationMs ?: 0L)
         if (pos > 1000L && dur > 0L) {
+            val movieThumb = movie?.thumbnailUrl?.takeIf { it.isNotBlank() } ?: movie?.fallbackThumbnailUrl
             viewModel.viewModelScope.launch {
                 try {
                     viewModel.playbackHistoryManager.saveMoviePlaybackState(
                         fileId = fileId,
                         title = movieTitle,
                         positionMs = pos,
-                        durationMs = dur
+                        durationMs = dur,
+                        thumbnailUrl = movieThumb
                     )
                 } catch (_: Throwable) {}
             }

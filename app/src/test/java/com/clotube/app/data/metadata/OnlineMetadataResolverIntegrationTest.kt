@@ -43,6 +43,27 @@ class OnlineMetadataResolverIntegrationTest {
         val (q7, y7) = OnlineMetadataResolver.extractMovieQueryAndYear("Www.Uindex.Org - Dhurandhar the Revenge (2026).mkv")
         assertEquals("Dhurandhar the Revenge", q7)
         assertEquals("2026", y7)
+
+        val (q8, y8) = OnlineMetadataResolver.extractMovieQueryAndYear("The Visit 2015")
+        assertEquals("The Visit", q8)
+        assertEquals("2015", y8)
+
+        val (q9, y9) = OnlineMetadataResolver.extractMovieQueryAndYear("The Visit (2015)")
+        assertEquals("The Visit", q9)
+        assertEquals("2015", y9)
+
+        val (q10, y10) = OnlineMetadataResolver.extractMovieQueryAndYear("The Visit [2015]")
+        assertEquals("The Visit", q10)
+        assertEquals("2015", y10)
+    }
+
+    @Test
+    fun testNeedsRevalidation() {
+        assertTrue(OnlineMetadataResolver.needsRevalidation("The Visit", ""))
+        assertTrue(OnlineMetadataResolver.needsRevalidation("The Visit", "https://lh3.googleusercontent.com/drive-thumbnail"))
+        assertTrue(OnlineMetadataResolver.needsRevalidation("The Visit 2015", "https://m.media-amazon.com/images/poster.jpg"))
+        assertTrue(OnlineMetadataResolver.needsRevalidation("The Visit (2015)", "https://m.media-amazon.com/images/poster.jpg"))
+        assertTrue(!OnlineMetadataResolver.needsRevalidation("The Visit", "https://m.media-amazon.com/images/poster.jpg"))
     }
 
     @Test
@@ -101,6 +122,14 @@ class OnlineMetadataResolverIntegrationTest {
         val meta = OnlineMetadataResolver.resolveMovie("Crime 101 2026.mp4")
         assertEquals("Crime 101", meta.officialTitle)
         assertEquals("2026", meta.releaseYear)
+    }
+
+    @Test
+    fun testResolveMovie_TheVisit() = runBlocking {
+        val meta = OnlineMetadataResolver.resolveMovie("The Visit 2015.mkv")
+        assertEquals("The Visit", meta.officialTitle)
+        assertEquals("2015", meta.releaseYear)
+        assertTrue("Poster URL should not be blank", meta.posterUrl.isNotBlank())
     }
 
     @Test

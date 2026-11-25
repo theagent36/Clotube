@@ -3,7 +3,9 @@ package com.clotube.app.data.scanner
 import android.util.Log
 import com.clotube.app.data.DriveDirectoryManager
 import com.clotube.app.data.FreshBootScanResult
+import com.clotube.app.data.MediaArtworkResolver
 import com.clotube.app.data.MetadataDiskCache
+import com.clotube.app.data.MovieIndustryResolver
 import com.clotube.app.data.WatchlistManager
 import com.clotube.app.data.metadata.OnlineMetadataResolver
 import com.clotube.app.model.Episode
@@ -16,6 +18,10 @@ import com.google.api.services.drive.model.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
@@ -27,6 +33,7 @@ object DriveCatalogScanner {
 
     private const val TAG = "DriveCatalogScanner"
     private const val TEST_TAG = "ClotubeScannerTest"
+    const val INDEX_PACKET_SIZE = 4
     private const val FOLDER_MIME = "application/vnd.google-apps.folder"
     private const val SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
 
@@ -54,11 +61,11 @@ object DriveCatalogScanner {
             val driveService = getDriveService() ?: return@withContext FreshBootScanResult(emptyList(), emptyList())
             val dirs = DriveDirectoryManager.resolveHierarchy(driveService)
 
-            // 1. Rescan Movies Folder (Fast Raw Emit)
-            val freshMovies = scanMoviesDirect(driveService, dirs.moviesFolderId)
+            // 1. Rescan Movies Folder (Packet-of-4 progressive stream)
+            val freshMovies = scanMoviesRecursively(driveService, dirs.moviesFolderId ?: "")
 
-            // 2. Rescan Series Folders (Fast Raw Emit)
-            val freshSeries = scanSeriesDirect(driveService, dirs.seriesFolderId)
+            // 2. Rescan Series Folders (Packet-of-4 progressive stream)
+            val freshSeries = scanSeriesRecursively(driveService, dirs.seriesFolderId ?: "")
 
             Log.d(TAG, "Fresh-Boot scan complete: ${freshMovies.size} movies, ${freshSeries.size} series.")
             FreshBootScanResult(movies = freshMovies, series = freshSeries)
@@ -79,11 +86,36 @@ object DriveCatalogScanner {
                 semaphore.withPermit {
                     try {
                         val meta = OnlineMetadataResolver.resolveMovie(movie.title.ifBlank { movie.fileName })
-                        if (meta.officialTitle.isNotBlank() || meta.posterUrl.isNotBlank()) {
+                        val validPoster = meta.posterUrl.takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
+                            ?: movie.thumbnailUrl?.takeIf { !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
+                            ?: movie.fallbackThumbnailUrl
+
+                        val enrichedLang: String
+                        val enrichedIndustry: String
+                        if (movie.isFolderClassified) {
+                            enrichedLang = movie.language
+                            enrichedIndustry = movie.industry
+                        } else if (meta.originalLanguage.isNotBlank()) {
+                            val info = MovieIndustryResolver.toIndustryInfo(meta.originalLanguage)
+                            enrichedLang = info.language
+                            enrichedIndustry = info.sectionLabel
+                        } else {
+                            enrichedLang = movie.language
+                            enrichedIndustry = movie.industry
+                        }
+
+                        if (meta.officialTitle.isNotBlank() || !validPoster.isNullOrBlank() || enrichedIndustry != movie.industry) {
                             movie.copy(
                                 title = meta.officialTitle.ifBlank { movie.title },
-                                thumbnailUrl = meta.posterUrl.ifBlank { movie.thumbnailUrl },
-                                genre = meta.genre.ifBlank { movie.genre }
+                                thumbnailUrl = validPoster,
+                                fallbackThumbnailUrl = movie.fallbackThumbnailUrl.ifBlank {
+                                    if (OnlineMetadataResolver.isDriveVideoFrameUrl(movie.thumbnailUrl)) movie.thumbnailUrl.orEmpty() else ""
+                                },
+                                genre = meta.genre.ifBlank { movie.genre },
+                                language = enrichedLang,
+                                industry = enrichedIndustry,
+                                sourceFolder = movie.sourceFolder,
+                                isFolderClassified = movie.isFolderClassified
                             )
                         } else movie
                     } catch (e: Exception) {
@@ -136,12 +168,32 @@ object DriveCatalogScanner {
             val directMovies = fileRes.files?.mapNotNull { file ->
                 val fId = file.id ?: return@mapNotNull null
                 val durationMs = file.videoMediaMetadata?.durationMillis ?: 0L
+                val cleanTitle = cleanMovieTitle(file.name.orEmpty())
+                val driveThumb = file.thumbnailLink?.replace("=s220", "=s800").orEmpty()
+
+                val cachedMeta = OnlineMetadataResolver.getCachedMovieMetadata(idOrTitle = fId)
+                    ?: OnlineMetadataResolver.getCachedMovieMetadata(idOrTitle = cleanTitle)
+                val hasValidPoster = cachedMeta != null && cachedMeta.posterUrl.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(cachedMeta.posterUrl)
+                val finalTitle = if (hasValidPoster && cachedMeta?.officialTitle?.isNotBlank() == true) cachedMeta.officialTitle else cleanTitle
+                val finalThumb = if (hasValidPoster) cachedMeta!!.posterUrl else driveThumb
+
+                val fileLangHint = MovieIndustryResolver.extractLanguageFromFileName(file.name.orEmpty())
+                val effectiveLang = fileLangHint
+                    ?: cachedMeta?.originalLanguage?.ifBlank { null }
+                    ?: MovieIndustryResolver.deduceLanguageFromScript(finalTitle)
+                val industryInfo = MovieIndustryResolver.toIndustryInfo(effectiveLang)
+
                 Movie(
                     id = fId,
-                    title = cleanMovieTitle(file.name.orEmpty()),
+                    title = finalTitle,
                     fileName = file.name.orEmpty(),
                     durationMs = durationMs,
-                    thumbnailUrl = file.thumbnailLink?.replace("=s220", "=s800").orEmpty()
+                    thumbnailUrl = finalThumb,
+                    fallbackThumbnailUrl = driveThumb,
+                    language = industryInfo.language,
+                    industry = industryInfo.sectionLabel,
+                    sourceFolder = "",
+                    isFolderClassified = false
                 )
             } ?: emptyList()
 
@@ -177,16 +229,17 @@ object DriveCatalogScanner {
                 val showId = showFolder.id ?: return@mapNotNull null
                 val showName = showFolder.name ?: "Unknown Series"
                 val cleaned = cleanSeriesTitle(showName)
-                val norm = WatchlistManager.normalizeTitle(cleaned)
-                val cachedMeta = MetadataDiskCache.get("series:$cleaned")
-                    ?: MetadataDiskCache.get("series_$norm")
-                    ?: MetadataDiskCache.get("series:$norm")
-                val officialPoster = cachedMeta?.posterUrl?.takeIf { it.isNotBlank() } ?: ""
+                val cached = MetadataDiskCache.get("series:${cleaned.trim().lowercase()}")
+                val cachedArt = cached?.posterUrl?.takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
+                    ?: cached?.backdropUrl?.takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
+                    ?: ""
                 Series(
                     id = showId,
                     title = cleaned,
-                    posterUrl = officialPoster,
-                    genre = cachedMeta?.genre?.takeIf { it.isNotBlank() } ?: "TV Series",
+                    posterUrl = cachedArt,
+                    thumbnailUrl = cachedArt,
+                    backdropUrl = cachedArt,
+                    genre = cached?.genre?.ifBlank { "TV Series" } ?: "TV Series",
                     seasons = emptyList(),
                     totalEpisodes = 0
                 )
@@ -224,6 +277,11 @@ object DriveCatalogScanner {
 
                 // Resolve official movie title, high-res poster, and genre
                 val movieMeta = OnlineMetadataResolver.resolveMovie(rawName)
+                val fileLangHint = MovieIndustryResolver.extractLanguageFromFileName(rawName)
+                val effectiveLang = fileLangHint
+                    ?: movieMeta.originalLanguage.ifBlank { null }
+                    ?: MovieIndustryResolver.deduceLanguageFromScript(movieMeta.officialTitle)
+                val industryInfo = MovieIndustryResolver.toIndustryInfo(effectiveLang)
 
                 Movie(
                     id = fileId,
@@ -231,7 +289,11 @@ object DriveCatalogScanner {
                     durationMs = rawDurationMs,
                     formattedDuration = formatDuration(rawDurationMs),
                     resolution = "1080p FHD",
-                    thumbnailUrl = movieMeta.posterUrl.ifBlank { driveThumb }
+                    thumbnailUrl = movieMeta.posterUrl.ifBlank { driveThumb },
+                    language = industryInfo.language,
+                    industry = industryInfo.sectionLabel,
+                    sourceFolder = "",
+                    isFolderClassified = false
                 )
             }.sortedBy { it.title }
         } catch (e: Exception) {
@@ -240,21 +302,119 @@ object DriveCatalogScanner {
         }
     }
 
-    suspend fun scanMoviesRecursively(
+    suspend fun enrichSingleMovie(movie: Movie): Movie = withContext(Dispatchers.IO) {
+        try {
+            val meta = OnlineMetadataResolver.resolveMovie(movie.title.ifBlank { movie.fileName })
+            val validPoster = meta.posterUrl.takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
+                ?: movie.thumbnailUrl?.takeIf { !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
+                ?: movie.fallbackThumbnailUrl
+
+            val enrichedLang: String
+            val enrichedIndustry: String
+            if (movie.isFolderClassified) {
+                enrichedLang = movie.language
+                enrichedIndustry = movie.industry
+            } else if (meta.originalLanguage.isNotBlank()) {
+                val info = MovieIndustryResolver.toIndustryInfo(meta.originalLanguage)
+                enrichedLang = info.language
+                enrichedIndustry = info.sectionLabel
+            } else {
+                enrichedLang = movie.language
+                enrichedIndustry = movie.industry
+            }
+
+            movie.copy(
+                title = meta.officialTitle.ifBlank { movie.title },
+                thumbnailUrl = validPoster,
+                fallbackThumbnailUrl = movie.fallbackThumbnailUrl.ifBlank {
+                    if (OnlineMetadataResolver.isDriveVideoFrameUrl(movie.thumbnailUrl)) movie.thumbnailUrl.orEmpty() else ""
+                },
+                genre = meta.genre.ifBlank { movie.genre },
+                language = enrichedLang,
+                industry = enrichedIndustry,
+                sourceFolder = movie.sourceFolder,
+                isFolderClassified = movie.isFolderClassified
+            )
+        } catch (e: Exception) {
+            movie
+        }
+    }
+
+    suspend fun enrichSingleSeries(show: TvSeries): TvSeries = withContext(Dispatchers.IO) {
+        try {
+            val cleanTitle = cleanSeriesTitle(show.title)
+            val meta = OnlineMetadataResolver.resolveSeries(cleanTitle)
+            val validPoster = meta.posterUrl.takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
+                ?: show.posterUrl?.takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
+                ?: show.thumbnailUrl.takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
+                ?: ""
+
+            show.copy(
+                title = meta.officialTitle.ifBlank { show.title },
+                posterUrl = validPoster,
+                thumbnailUrl = validPoster,
+                backdropUrl = validPoster.ifBlank { show.backdropUrl },
+                genreFormatted = meta.genres.ifBlank { show.genreFormatted }
+            )
+        } catch (e: Exception) {
+            show
+        }
+    }
+
+    fun streamMoviesChunked(
         driveService: Drive,
         rootMoviesFolderId: String
-    ): List<Movie> = withContext(Dispatchers.IO) {
-        val discoveredMovies = mutableListOf<Movie>()
-        val folderQueue = ArrayDeque<Pair<String, String>>() // Pair(FolderId, FolderName)
+    ): Flow<List<Movie>> = flow {
+        if (rootMoviesFolderId.isBlank() || rootMoviesFolderId == "root") return@flow
+
+        val seenMovieIds = mutableSetOf<String>()
+        val moviePacket = mutableListOf<Movie>()
+
+        suspend fun emitMoviePacketIfFull() {
+            if (moviePacket.size >= INDEX_PACKET_SIZE) {
+                val batch = moviePacket.toList()
+                moviePacket.clear()
+                val enrichedPacket = coroutineScope {
+                    batch.map { movie ->
+                        async(Dispatchers.IO) {
+                            enrichSingleMovie(movie)
+                        }
+                    }.awaitAll()
+                }
+                emit(enrichedPacket)
+            }
+        }
+
+        suspend fun addMovie(movie: Movie) {
+            if (movie.id.isBlank() || !seenMovieIds.add(movie.id)) return
+            moviePacket.add(movie)
+            if (moviePacket.size == INDEX_PACKET_SIZE) {
+                emitMoviePacketIfFull()
+            }
+        }
+
+        data class MovieFolderScanTask(
+            val folderId: String,
+            val folderName: String,
+            val isMoviesRoot: Boolean = false,
+            val depth: Int = 0,
+            val inheritedLanguage: String? = null,
+            val inheritedIndustry: String? = null,
+            val inheritedSourceFolder: String = "",
+            val isCategoryFolder: Boolean = false
+        )
+        val folderQueue = ArrayDeque<MovieFolderScanTask>()
         val visitedFolderIds = mutableSetOf<String>()
 
-        folderQueue.add(Pair(rootMoviesFolderId, "Movies"))
+        folderQueue.add(MovieFolderScanTask(rootMoviesFolderId, "Movies", isMoviesRoot = true))
         visitedFolderIds.add(rootMoviesFolderId)
 
-        Log.d(TAG, "Starting recursive Movies scan from root: $rootMoviesFolderId")
+        Log.d(TAG, "Starting progressive Packet-of-4 Movies scan from root: $rootMoviesFolderId")
 
         while (folderQueue.isNotEmpty()) {
-            val (currentFolderId, currentFolderName) = folderQueue.poll() ?: break
+            val task = folderQueue.poll() ?: break
+            val currentFolderId = task.folderId
+            val currentFolderName = task.folderName
             val items = fetchFolderContents(driveService, currentFolderId)
 
             for (item in items) {
@@ -264,35 +424,111 @@ object DriveCatalogScanner {
 
                 if (isFolder) {
                     if (visitedFolderIds.add(resolvedId)) {
-                        folderQueue.add(Pair(resolvedId, item.name ?: "Untitled Folder"))
+                        val childName = item.name ?: "Untitled Folder"
+                        val folderClassification = MovieIndustryResolver.classifyDriveFolder(
+                            folderName = childName,
+                            isDirectChildOfMoviesRoot = task.isMoviesRoot
+                        )
+                        val nextLang = folderClassification?.language ?: task.inheritedLanguage
+                        val nextIndustry = folderClassification?.industry ?: task.inheritedIndustry
+                        val isExplicitCategory = folderClassification?.isExplicitCategoryFolder == true
+                        val nextSourceFolder = if (isExplicitCategory) {
+                            childName
+                        } else {
+                            task.inheritedSourceFolder.ifBlank { if (task.isCategoryFolder) currentFolderName else "" }
+                        }
+                        val nextIsCategory = isExplicitCategory || task.isCategoryFolder
+                        folderQueue.add(
+                            MovieFolderScanTask(
+                                folderId = resolvedId,
+                                folderName = childName,
+                                isMoviesRoot = false,
+                                depth = task.depth + 1,
+                                inheritedLanguage = nextLang,
+                                inheritedIndustry = nextIndustry,
+                                inheritedSourceFolder = nextSourceFolder,
+                                isCategoryFolder = nextIsCategory
+                            )
+                        )
                     }
                 } else if (isVideoFile(item)) {
                     val rawBytes = item.getSize()?.toLong() ?: 0L
                     val rawDurationMs = item.videoMediaMetadata?.durationMillis ?: 0L
                     val driveThumb = item.thumbnailLink?.replace("=s220", "=s800") ?: ""
-                    val cleanedTitle = cleanMovieTitle(item.name.orEmpty(), currentFolderName)
+                    val rawName = item.name.orEmpty()
+                    val targetName = if (!task.isMoviesRoot && !task.isCategoryFolder && MovieIndustryResolver.isGenericVideoFileName(rawName)) {
+                        currentFolderName
+                    } else {
+                        rawName
+                    }
+                    val cleanedTitle = cleanMovieTitle(targetName, currentFolderName)
+
+                    val cachedMeta = OnlineMetadataResolver.getCachedMovieMetadata(idOrTitle = resolvedId)
+                        ?: OnlineMetadataResolver.getCachedMovieMetadata(idOrTitle = cleanedTitle)
+                    val hasValidPoster = cachedMeta != null && cachedMeta.posterUrl.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(cachedMeta.posterUrl)
+                    val finalTitle = if (hasValidPoster && cachedMeta?.officialTitle?.isNotBlank() == true) cachedMeta.officialTitle else cleanedTitle
+                    val finalThumb = if (hasValidPoster) cachedMeta!!.posterUrl else driveThumb
+
+                    val hasFolderClassification = !task.inheritedLanguage.isNullOrBlank() || task.isCategoryFolder
+                    val fileLangHint = MovieIndustryResolver.extractLanguageFromFileName(rawName)
+                    val effectiveLang = task.inheritedIndustry
+                        ?: task.inheritedLanguage
+                        ?: fileLangHint
+                        ?: cachedMeta?.originalLanguage?.ifBlank { null }
+                        ?: MovieIndustryResolver.deduceLanguageFromScript(cleanedTitle)
+                    val industryInfo = MovieIndustryResolver.toIndustryInfo(effectiveLang)
+
+                    val effectiveSourceFolder = task.inheritedSourceFolder.ifBlank {
+                        if (task.isMoviesRoot) "" else currentFolderName
+                    }
 
                     val movie = Movie(
                         id = resolvedId,
-                        title = cleanedTitle,
-                        fileName = item.name.orEmpty(),
+                        title = finalTitle,
+                        fileName = rawName,
                         fileSize = formatFileSize(rawBytes),
                         mimeType = item.mimeType ?: "video/mp4",
-                        thumbnailUrl = driveThumb,
+                        thumbnailUrl = finalThumb,
+                        fallbackThumbnailUrl = driveThumb,
                         parentFolder = currentFolderName,
                         durationFormatted = if (rawDurationMs > 0L) formatDuration(rawDurationMs) else "00:00",
                         resolutionBadge = "1080p FHD",
-                        genre = "Movie",
-                        sizeBytes = rawBytes
+                        genre = cachedMeta?.genre?.takeIf { it.isNotBlank() } ?: "Movie",
+                        sizeBytes = rawBytes,
+                        language = industryInfo.language,
+                        industry = industryInfo.sectionLabel,
+                        sourceFolder = effectiveSourceFolder,
+                        isFolderClassified = hasFolderClassification
                     )
-                    discoveredMovies.add(movie)
-                    Log.d(TAG, "Discovered Movie: rawName='${item.name}', title='${movie.title}', thumb='${movie.thumbnailUrl}'")
+                    addMovie(movie)
                 }
             }
         }
 
-        Log.d(TAG, "Completed Movies scan. Total movies discovered: ${discoveredMovies.size}")
-        discoveredMovies.sortedBy { it.title }
+        // Flush remaining partial packet (1..3 movies)
+        if (moviePacket.isNotEmpty()) {
+            val batch = moviePacket.toList()
+            moviePacket.clear()
+            val enrichedPacket = coroutineScope {
+                batch.map { movie ->
+                    async(Dispatchers.IO) {
+                        enrichSingleMovie(movie)
+                    }
+                }.awaitAll()
+            }
+            emit(enrichedPacket)
+        }
+    }.flowOn(Dispatchers.IO)
+
+    suspend fun scanMoviesRecursively(
+        driveService: Drive,
+        rootMoviesFolderId: String
+    ): List<Movie> = withContext(Dispatchers.IO) {
+        val movies = mutableListOf<Movie>()
+        streamMoviesChunked(driveService, rootMoviesFolderId).collect { packet ->
+            movies.addAll(packet)
+        }
+        movies.distinctBy { it.id }.sortedBy { it.title }
     }
 
     // ========================================================
@@ -408,11 +644,30 @@ object DriveCatalogScanner {
         }
     }
 
-    suspend fun scanSeriesRecursively(
+    fun streamSeriesChunked(
         driveService: Drive,
         rootSeriesFolderId: String
-    ): List<TvSeries> = withContext(Dispatchers.IO) {
-        val discoveredSeriesList = mutableListOf<TvSeries>()
+    ): Flow<List<TvSeries>> = flow {
+        if (rootSeriesFolderId.isBlank() || rootSeriesFolderId == "root") return@flow
+
+        val seenSeriesIds = mutableSetOf<String>()
+        val seriesPacket = mutableListOf<TvSeries>()
+
+        suspend fun emitSeriesPacketIfFull() {
+            if (seriesPacket.size >= INDEX_PACKET_SIZE) {
+                val batch = seriesPacket.toList()
+                seriesPacket.clear()
+                val enrichedPacket = coroutineScope {
+                    batch.map { show ->
+                        async(Dispatchers.IO) {
+                            enrichSingleSeries(show)
+                        }
+                    }.awaitAll()
+                }
+                emit(enrichedPacket)
+            }
+        }
+
         val topSeriesItems = fetchFolderContents(driveService, rootSeriesFolderId)
 
         for (seriesFolder in topSeriesItems) {
@@ -421,16 +676,15 @@ object DriveCatalogScanner {
             if (!isFolder) continue
 
             val seriesId = resolveTargetId(seriesFolder)
-            val rawShowName = seriesFolder.name ?: "Untitled Series"
-            val drivePoster = seriesFolder.thumbnailLink?.takeIf { it.isNotBlank() } ?: ""
+            if (seriesId.isBlank() || !seenSeriesIds.add(seriesId)) continue
 
-            // Resolve official Show Title, Poster Art, and TVMaze ID
+            val rawShowName = seriesFolder.name ?: "Untitled Series"
+
             val seriesMeta = OnlineMetadataResolver.resolveSeries(rawShowName)
 
             val episodesFound = mutableListOf<Episode>()
             val discoveredSeasons = mutableMapOf<Int, Season>()
 
-            // Traverse series subfolders (e.g. Series -> The Mentalist -> Season 1 -> S01E08.mkv)
             val subFolderQueue = ArrayDeque<Pair<String, String>>()
             val visitedSubs = mutableSetOf<String>()
             subFolderQueue.add(Pair(seriesId, seriesMeta.officialTitle))
@@ -466,13 +720,11 @@ object DriveCatalogScanner {
                         val epDriveThumb = child.thumbnailLink?.takeIf { it.isNotBlank() } ?: ""
                         val fileSizeFormatted = formatFileSize(rawBytes)
 
-                        // Parse Season & Episode numbers
                         val parsedNumbers = OnlineMetadataResolver.parseSeasonAndEpisodeNumbers(child.name.orEmpty())
                         val (fallbackSeasonNum, fallbackEpNum) = parseSeasonAndEpisode(child.name.orEmpty(), currentSubName)
                         val actualSeasonNumber = parsedNumbers?.first ?: fallbackSeasonNum
                         val epNumber = parsedNumbers?.second ?: fallbackEpNum
 
-                        // Resolve official Episode Title and Episode Thumbnail from TVMaze
                         val epMeta = OnlineMetadataResolver.resolveEpisode(
                             seriesName = seriesMeta.officialTitle,
                             tvMazeSeriesId = seriesMeta.tvMazeId,
@@ -511,21 +763,56 @@ object DriveCatalogScanner {
                     )
                 }
 
-                discoveredSeriesList.add(
-                    TvSeries(
-                        id = seriesId,
-                        title = seriesMeta.officialTitle,
-                        posterUrl = seriesMeta.posterUrl.ifBlank { drivePoster },
-                        genre = seriesMeta.genres,
-                        seasons = finalSeasons,
-                        totalEpisodes = episodesFound.size
-                    )
+                val cleanTitle = seriesMeta.officialTitle.ifBlank { cleanSeriesTitle(rawShowName) }
+                val cachedRecord = MetadataDiskCache.get("series:${cleanTitle.trim().lowercase()}")
+                val officialPoster = listOfNotNull(
+                    seriesMeta.posterUrl.takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) },
+                    cachedRecord?.posterUrl?.takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) },
+                    cachedRecord?.backdropUrl?.takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
+                ).firstOrNull().orEmpty()
+
+                val show = TvSeries(
+                    id = seriesId,
+                    title = cleanTitle,
+                    posterUrl = officialPoster,
+                    backdropUrl = officialPoster.ifBlank { null },
+                    thumbnailUrl = officialPoster,
+                    genre = seriesMeta.genres.ifBlank { cachedRecord?.genre ?: "TV Series" },
+                    seasons = finalSeasons,
+                    totalEpisodes = episodesFound.size
                 )
+                seriesPacket.add(show)
                 Log.d(TAG, "Cataloged Series: ${seriesMeta.officialTitle} (${finalSeasons.size} seasons, ${episodesFound.size} episodes)")
+                if (seriesPacket.size == INDEX_PACKET_SIZE) {
+                    emitSeriesPacketIfFull()
+                }
             }
         }
 
-        discoveredSeriesList.sortedBy { it.title }
+        // Flush remaining partial packet (1..3 series)
+        if (seriesPacket.isNotEmpty()) {
+            val batch = seriesPacket.toList()
+            seriesPacket.clear()
+            val enrichedPacket = coroutineScope {
+                batch.map { show ->
+                    async(Dispatchers.IO) {
+                        enrichSingleSeries(show)
+                    }
+                }.awaitAll()
+            }
+            emit(enrichedPacket)
+        }
+    }.flowOn(Dispatchers.IO)
+
+    suspend fun scanSeriesRecursively(
+        driveService: Drive,
+        rootSeriesFolderId: String
+    ): List<TvSeries> = withContext(Dispatchers.IO) {
+        val series = mutableListOf<TvSeries>()
+        streamSeriesChunked(driveService, rootSeriesFolderId).collect { packet ->
+            series.addAll(packet)
+        }
+        series.distinctBy { it.id }.sortedBy { it.title }
     }
 
     /**
@@ -609,11 +896,18 @@ object DriveCatalogScanner {
     internal fun cleanMovieTitle(fileName: String, parentFolderName: String = ""): String {
         val baseName = fileName.substringBeforeLast(".")
         val genericNames = setOf("movie", "video", "film", "cd1", "cd2", "stream", "play")
-        return if (genericNames.contains(baseName.lowercase(Locale.ROOT)) && parentFolderName.isNotBlank() && parentFolderName != "Movies") {
+        val raw = if (genericNames.contains(baseName.lowercase(Locale.ROOT)) && parentFolderName.isNotBlank() && parentFolderName != "Movies") {
             parentFolderName
         } else {
-            baseName.replace(".", " ").replace("_", " ").trim()
+            baseName
         }
+        var cleaned = raw.replace(".", " ").replace("_", " ").trim()
+        // Strip trailing parenthesized or bracketed release year e.g. (2015), [2015], (2026), [2026]
+        cleaned = cleaned.replace(Regex("""(?i)\s*[\(\[]\s*(19\d{2}|20\d{2})\s*[\)\]]\s*$"""), "")
+        // Strip bare trailing 4-digit release year e.g. "The Visit 2015" -> "The Visit", "Crime 101 2026" -> "Crime 101"
+        cleaned = cleaned.replace(Regex("""(?i)\s+\b(19\d{2}|20\d{2})\b\s*$"""), "")
+        cleaned = cleaned.replace(Regex("""\s+"""), " ").trim(' ', '-', '•', ':')
+        return if (cleaned.isBlank()) baseName else cleaned
     }
 
     internal fun cleanSeriesTitle(folderName: String): String {
@@ -704,6 +998,177 @@ object DriveCatalogScanner {
         driveService: Drive,
         rootSeriesFolderId: String
     ): List<TvSeries> = scanSeriesRecursively(driveService, rootSeriesFolderId)
+
+    /**
+     * Stage-1 Priority Fast-Start Fetcher:
+     * Fetches only the top [limit] (default 2) latest movies from Google Drive, resolving all
+     * metadata (official poster, backdrop, genres, and clean filtered title) in parallel BEFORE returning.
+     */
+    suspend fun fetchTopLatestMoviesEnriched(
+        driveService: Drive,
+        moviesFolderId: String,
+        limit: Int = 2
+    ): List<Movie> = withContext(Dispatchers.IO) {
+        if (moviesFolderId.isBlank() || moviesFolderId == "root") return@withContext emptyList()
+        try {
+            val query = "'$moviesFolderId' in parents and (mimeType contains 'video/' or mimeType = '$FOLDER_MIME') and trashed = false"
+            val request = driveService.files().list()
+                .setQ(query)
+                .setOrderBy("createdTime desc")
+                .setPageSize(6)
+                .setFields("files(id, name, size, mimeType, thumbnailLink, videoMediaMetadata, shortcutDetails)")
+                .setSupportsAllDrives(true)
+                .setIncludeItemsFromAllDrives(true)
+
+            val result = request.execute()
+            val files = result.files.orEmpty()
+            val candidateMovies = mutableListOf<Movie>()
+
+            for (file in files) {
+                if (candidateMovies.size >= limit) break
+                val mime = file.mimeType.orEmpty()
+                val isFolder = mime == FOLDER_MIME ||
+                        (mime == SHORTCUT_MIME && file.shortcutDetails?.targetMimeType == FOLDER_MIME)
+
+                if (isFolder) {
+                    val targetId = resolveTargetId(file)
+                    val folderMovies = scanMoviesFolder(driveService, targetId)
+                    for (m in folderMovies) {
+                        if (candidateMovies.size >= limit) break
+                        if (m.id.isNotBlank() && candidateMovies.none { it.id == m.id }) {
+                            candidateMovies.add(m)
+                        }
+                    }
+                } else if (isVideoFile(file)) {
+                    val fileId = file.id ?: continue
+                    if (candidateMovies.none { it.id == fileId }) {
+                        val rawName = file.name.orEmpty()
+                        val cleanTitle = cleanMovieTitle(rawName)
+                        val rawDurationMs = file.videoMediaMetadata?.durationMillis ?: 0L
+                        val fileLangHint = MovieIndustryResolver.extractLanguageFromFileName(rawName)
+                        val industryInfo = MovieIndustryResolver.toIndustryInfo(fileLangHint)
+                        candidateMovies.add(
+                            Movie(
+                                id = fileId,
+                                title = cleanTitle,
+                                durationMs = rawDurationMs,
+                                formattedDuration = formatDuration(rawDurationMs),
+                                resolution = "1080p FHD",
+                                thumbnailUrl = file.thumbnailLink.orEmpty(),
+                                language = industryInfo.language,
+                                industry = industryInfo.sectionLabel,
+                                sourceFolder = "",
+                                isFolderClassified = false
+                            )
+                        )
+                    }
+                }
+            }
+
+            candidateMovies.take(limit).map { movie ->
+                async(Dispatchers.IO) {
+                    try {
+                        val cleanTitle = cleanMovieTitle(movie.title.ifBlank { movie.fileName })
+                        val meta = OnlineMetadataResolver.resolveMovie(cleanTitle)
+                        val artwork = MediaArtworkResolver.resolveMovieArtwork(cleanTitle, movie.thumbnailUrl)
+                        val finalTitle = meta.officialTitle.ifBlank { cleanTitle }
+                        val finalPoster = meta.posterUrl.takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
+                            ?: artwork.posterUrl?.takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
+                            ?: movie.thumbnailUrl?.takeIf { !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
+                            ?: movie.fallbackThumbnailUrl
+                        val finalBackdrop = artwork.backdropUrl?.takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
+                            ?: finalPoster
+                        val industryInfo = MovieIndustryResolver.toIndustryInfo(
+                            movie.language.ifBlank { meta.originalLanguage }
+                        )
+                        movie.copy(
+                            title = finalTitle,
+                            thumbnailUrl = finalPoster,
+                            fallbackThumbnailUrl = movie.fallbackThumbnailUrl.ifBlank {
+                                if (OnlineMetadataResolver.isDriveVideoFrameUrl(movie.thumbnailUrl)) movie.thumbnailUrl.orEmpty() else ""
+                            },
+                            genre = meta.genre.ifBlank { movie.genre },
+                            language = industryInfo.language,
+                            industry = industryInfo.sectionLabel
+                        )
+                    } catch (e: Exception) {
+                        movie
+                    }
+                }
+            }.awaitAll()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error in fetchTopLatestMoviesEnriched: ${e.message}", e)
+            emptyList()
+        }
+    }
+
+    /**
+     * Stage-1 Priority Fast-Start Fetcher:
+     * Fetches only the top [limit] (default 2) latest series folders from Google Drive.
+     * Shallow discovery (zero scanning of seasons or episodes), resolving official show poster/backdrop
+     * and genres via OnlineMetadataResolver BEFORE returning.
+     */
+    suspend fun fetchTopLatestSeriesEnriched(
+        driveService: Drive,
+        seriesFolderId: String,
+        limit: Int = 2
+    ): List<TvSeries> = withContext(Dispatchers.IO) {
+        if (seriesFolderId.isBlank() || seriesFolderId == "root") return@withContext emptyList()
+        try {
+            val query = "'$seriesFolderId' in parents and mimeType = '$FOLDER_MIME' and trashed = false"
+            val request = driveService.files().list()
+                .setQ(query)
+                .setOrderBy("createdTime desc")
+                .setPageSize(limit)
+                .setFields("files(id, name, thumbnailLink)")
+                .setSupportsAllDrives(true)
+                .setIncludeItemsFromAllDrives(true)
+
+            val result = request.execute()
+            val showFolders = result.files.orEmpty().take(limit)
+
+            showFolders.map { folder ->
+                async(Dispatchers.IO) {
+                    try {
+                        val folderId = folder.id.orEmpty()
+                        val folderName = folder.name.orEmpty()
+                        val cleanTitle = cleanSeriesTitle(folderName)
+
+                        val seriesMeta = OnlineMetadataResolver.resolveSeries(cleanTitle)
+                        val officialTitle = seriesMeta.officialTitle.ifBlank { cleanTitle }
+                        val posterUrl = seriesMeta.posterUrl.takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) } ?: ""
+                        val genre = seriesMeta.genres.ifBlank { "TV Series • Drama" }
+
+                        TvSeries(
+                            id = folderId,
+                            title = officialTitle,
+                            genreFormatted = genre,
+                            totalSeasonsFormatted = "TV Series",
+                            seasons = emptyList(),
+                            thumbnailUrl = posterUrl,
+                            backdropUrl = posterUrl.ifBlank { null },
+                            posterUrl = posterUrl
+                        )
+                    } catch (e: Exception) {
+                        val cleanTitle = cleanSeriesTitle(folder.name.orEmpty())
+                        TvSeries(
+                            id = folder.id.orEmpty(),
+                            title = cleanTitle,
+                            genreFormatted = "TV Series • Drama",
+                            totalSeasonsFormatted = "TV Series",
+                            seasons = emptyList(),
+                            thumbnailUrl = "",
+                            backdropUrl = null,
+                            posterUrl = ""
+                        )
+                    }
+                }
+            }.awaitAll()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error in fetchTopLatestSeriesEnriched: ${e.message}", e)
+            emptyList()
+        }
+    }
 
     /**
      * Refreshes a single series by its folder ID, retrieving all subfolders, episodes,

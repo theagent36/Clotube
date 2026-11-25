@@ -24,10 +24,17 @@ data class Movie(
     @SerializedName("resolutionBadge") val resolutionBadge: String = "HD",
     @SerializedName("genre") val genre: String = "Movie • Cinema",
     @SerializedName("streamUri") val streamUri: String = DriveMediaSourceFactory.buildDriveStreamUri(id).toString(),
-    @SerializedName("sizeBytes") val sizeBytes: Long = 0L
+    @SerializedName("sizeBytes") val sizeBytes: Long = 0L,
+    @SerializedName("fallbackThumbnailUrl") val fallbackThumbnailUrl: String = "",
+    @SerializedName("language") val language: String = "",
+    @SerializedName("industry") val industry: String = "",
+    @SerializedName("sourceFolder") val sourceFolder: String = "",
+    @SerializedName("isFolderClassified") val isFolderClassified: Boolean = false
 ) : Serializable {
     val formattedDuration: String get() = durationFormatted
     val resolution: String get() = resolutionBadge
+    val posterUrl: String get() = thumbnailUrl.orEmpty()
+    val backdropUrl: String get() = thumbnailUrl.orEmpty()
     val durationMs: Long
         get() {
             return try {
@@ -56,7 +63,12 @@ data class Movie(
         parentFolder: String = "",
         genre: String = "Movie • Cinema",
         streamUri: String = DriveMediaSourceFactory.buildDriveStreamUri(id).toString(),
-        sizeBytes: Long = 0L
+        sizeBytes: Long = 0L,
+        fallbackThumbnailUrl: String = "",
+        language: String = "",
+        industry: String = "",
+        sourceFolder: String = "",
+        isFolderClassified: Boolean = false
     ) : this(
         id = id,
         title = title,
@@ -69,7 +81,12 @@ data class Movie(
         resolutionBadge = resolution,
         genre = genre,
         streamUri = streamUri,
-        sizeBytes = sizeBytes
+        sizeBytes = sizeBytes,
+        fallbackThumbnailUrl = fallbackThumbnailUrl,
+        language = language,
+        industry = industry,
+        sourceFolder = sourceFolder,
+        isFolderClassified = isFolderClassified
     )
 
     /**
@@ -86,7 +103,12 @@ data class Movie(
             thumbnailUrl = thumbnailUrl,
             genre = genre,
             streamUri = streamUri,
-            sizeBytes = sizeBytes
+            sizeBytes = sizeBytes,
+            fallbackThumbnailUrl = fallbackThumbnailUrl,
+            language = language,
+            industry = industry,
+            sourceFolder = sourceFolder.ifBlank { parentFolder },
+            isFolderClassified = isFolderClassified
         )
     }
 }
