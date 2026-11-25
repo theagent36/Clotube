@@ -89,7 +89,7 @@ class ClotubeApp : Application(), ImageLoaderFactory {
                     .build()
             }
             .allowHardware(true)
-            .crossfade(200)
+            .crossfade(false)
             .respectCacheHeaders(false)
             .build()
     }

@@ -127,7 +127,6 @@ import coil.request.CachePolicy
 import com.clotube.app.model.DriveVideoFile
 import com.clotube.app.model.TvSeries
 import com.clotube.app.model.VideoItem
-import com.clotube.app.model.ContinueWatchingItem
 import com.clotube.app.player.DriveMediaSourceFactory
 import com.clotube.app.ui.components.BottomNavBar
 import com.clotube.app.ui.components.ClassyBottomBar
@@ -170,8 +169,8 @@ import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.ui.graphics.vector.ImageVector
-import com.clotube.app.viewmodel.ContinueWatchingData
 import com.clotube.app.viewmodel.ContinueWatchingDisplayData
+import com.clotube.app.viewmodel.HeroSlotState
 import com.clotube.app.model.Episode
 import com.clotube.app.model.Movie
 import com.clotube.app.model.Series
@@ -281,14 +280,9 @@ fun HomeScreen(
     onPlayMovie: ((fileId: String) -> Unit)? = null
 ) {
     val uiState by viewModel.uiState.collectAsState()
-    val resolvedCwItem by viewModel.resolvedContinueWatching.collectAsState()
-    val continueWatchingDisplayData by viewModel.continueWatchingDisplayState.collectAsState()
-    val continueWatchingData by viewModel.continueWatchingState.collectAsState()
-    val continueWatchingItem by viewModel.continueWatchingItem.collectAsState()
+    val heroState by viewModel.heroSlotState.collectAsState()
     val driveMovies by viewModel.moviesList.collectAsState()
     val driveSeries by viewModel.seriesList.collectAsState()
-    val lastWatchedDirect by viewModel.playbackHistoryManager.getLastWatchedMedia().collectAsState(initial = null)
-    val isHistoryLoaded by viewModel.isHistoryLoaded.collectAsState()
     var showAccountDialog by remember { mutableStateOf(false) }
     val currentUser by viewModel.currentUserAccount.collectAsState()
     val coroutineScope = androidx.compose.runtime.rememberCoroutineScope()
@@ -610,13 +604,15 @@ fun HomeScreen(
                         viewModel.refreshAppFreshBoot()
                     },
                     indicator = {
-                        PullToRefreshDefaults.Indicator(
-                            state = pullRefreshState,
-                            isRefreshing = isRefreshing,
-                            color = AccentBlue,
-                            containerColor = SurfaceElevated,
-                            modifier = Modifier.align(Alignment.TopCenter)
-                        )
+                        if (isRefreshing || pullRefreshState.distanceFraction > 0.05f) {
+                            PullToRefreshDefaults.Indicator(
+                                state = pullRefreshState,
+                                isRefreshing = isRefreshing,
+                                color = AccentBlue,
+                                containerColor = SurfaceElevated,
+                                modifier = Modifier.align(Alignment.TopCenter)
+                            )
+                        }
                     },
                     modifier = Modifier
                         .fillMaxWidth()
@@ -860,13 +856,12 @@ fun HomeScreen(
                                 contentPadding = PaddingValues(bottom = 110.dp)
                             ) {
                                 item(key = "home_hero_billboard") {
-                                    val heroMovie = uiState.heroItem
-                                    val heroSeries = uiState.heroSeries
-                                    val lastWatched = lastWatchedDirect ?: uiState.lastWatchedMedia
-
-                                    when {
-                                        continueWatchingDisplayData != null -> {
-                                            val item = continueWatchingDisplayData!!
+                                    when (val state = heroState) {
+                                        is HeroSlotState.Resolving -> {
+                                            ShimmerHeroBillboard()
+                                        }
+                                        is HeroSlotState.ContinueWatching -> {
+                                            val item = state.item
                                             ContinueWatchingCard(
                                                 data = item,
                                                 onResumeClick = {
@@ -912,32 +907,22 @@ fun HomeScreen(
                                                 }
                                             )
                                         }
-                                        !isHistoryLoaded -> {
-                                            ShimmerHeroBillboard()
-                                        }
-                                        heroMovie != null || heroSeries != null -> {
-                                            HeroBillboardSection(
-                                                movie = heroMovie,
-                                                series = heroSeries,
-                                                continueWatching = null,
-                                                lastWatched = null,
+                                        is HeroSlotState.FeaturedFallback -> {
+                                            val featuredMovie = state.movie
+                                            val videoItem = remember(featuredMovie, uiState.moviesList) {
+                                                uiState.moviesList.firstOrNull { it.id == featuredMovie.id } ?: featuredMovie.toVideoItem()
+                                            }
+                                            FeaturedHeroBanner(
+                                                movie = featuredMovie,
                                                 onWatchMovie = {
-                                                    heroMovie?.let {
-                                                        if (onPlayMovie != null) onPlayMovie(it.id) else onVideoSelected(it)
-                                                    }
+                                                    if (onPlayMovie != null) onPlayMovie(featuredMovie.id) else onVideoSelected(videoItem)
                                                 },
-                                                onWatchSeries = { heroSeries?.let { onSeriesSelected(it) } },
-                                                onResume = { },
-                                                onResumeContinueWatching = null,
                                                 onInspect = {
-                                                    heroMovie?.let {
-                                                        if (onPlayMovie != null) onPlayMovie(it.id) else onVideoSelected(it)
-                                                    } ?: heroSeries?.let { onSeriesSelected(it) }
+                                                    if (onPlayMovie != null) onPlayMovie(featuredMovie.id) else onVideoSelected(videoItem)
                                                 },
-                                                onRemoveResume = null,
-                                                downloadStatus = heroMovie?.let { allDownloadRecords[it.id]?.status },
-                                                downloadProgress = heroMovie?.let { allDownloadRecords[it.id]?.progressFraction } ?: 0f,
-                                                onDownloadClick = heroMovie?.let { movie -> { handleMovieDownloadAction(movie) } }
+                                                downloadStatus = allDownloadRecords[featuredMovie.id]?.status,
+                                                downloadProgress = allDownloadRecords[featuredMovie.id]?.progressFraction ?: 0f,
+                                                onDownloadClick = { handleMovieDownloadAction(videoItem) }
                                             )
                                         }
                                     }
@@ -1383,62 +1368,60 @@ fun MovieDownloadButton(
 }
 
 /**
- * Top 16:9 OTT Hero Billboard Banner with high-res backdrop, dynamic Continue Watching status,
- * progress bar, and Resume or Watch Now actions.
+ * Builds an anti-poison Coil [ImageRequest] using stable canonical cache keys.
+ * Official/TMDB/Fanart artwork writes to `"${prefix}_${mediaId}"`.
+ * If a Drive video-frame URL is supplied for movies, it isolates under `"${drivePrefix}_${mediaId}"`
+ * while still reading `"${prefix}_${mediaId}"` as its in-place placeholder bitmap so upgrades
+ * swap cleanly without cache poisoning or crossfade flicker.
+ */
+private fun buildAntiPoisonImageRequest(
+    context: android.content.Context,
+    url: String,
+    mediaId: String,
+    canonicalPrefix: String,
+    drivePrefix: String = "drive_frame",
+    widthPx: Int? = null,
+    heightPx: Int? = null
+): ImageRequest {
+    val cleanId = mediaId.trim()
+    val cleanUrl = url.trim()
+    val isDriveFrame = cleanUrl.isNotBlank() && OnlineMetadataResolver.isDriveVideoFrameUrl(cleanUrl)
+    val builder = ImageRequest.Builder(context)
+        .data(cleanUrl)
+        .crossfade(false)
+        .bitmapConfig(Bitmap.Config.HARDWARE)
+
+    if (widthPx != null && heightPx != null) {
+        builder.size(width = widthPx, height = heightPx)
+    }
+
+    if (cleanId.isNotBlank()) {
+        val officialKey = "${canonicalPrefix}_${cleanId}"
+        val activeKey = if (isDriveFrame) "${drivePrefix}_${cleanId}" else officialKey
+        builder
+            .memoryCacheKey(activeKey)
+            .diskCacheKey(activeKey)
+            .placeholderMemoryCacheKey(officialKey)
+    }
+
+    return builder.build()
+}
+
+/**
+ * Top 16:9 OTT Featured Fallback Banner shown only when Continue Watching is confirmed empty.
  */
 @Composable
-private fun HeroBillboardSection(
-    movie: VideoItem?,
-    series: TvSeries?,
-    continueWatching: ContinueWatchingItem? = null,
-    lastWatched: com.clotube.app.data.WatchProgress? = null,
+private fun FeaturedHeroBanner(
+    movie: Movie,
     onWatchMovie: () -> Unit,
-    onWatchSeries: () -> Unit,
-    onResume: (com.clotube.app.data.WatchProgress) -> Unit = {},
-    onResumeContinueWatching: ((ContinueWatchingItem) -> Unit)? = null,
     onInspect: () -> Unit,
-    onRemoveResume: (() -> Unit)? = null,
     downloadStatus: com.clotube.app.data.DownloadStatus? = null,
     downloadProgress: Float = 0f,
     onDownloadClick: (() -> Unit)? = null
 ) {
-    val isResumeMode = continueWatching != null || (lastWatched != null && (lastWatched.positionMs >= 1000L || lastWatched.progressFraction > 0f))
-
-    val title = when {
-        continueWatching != null -> continueWatching.title
-        isResumeMode && lastWatched != null -> lastWatched.formattedDisplayTitle
-        else -> movie?.title ?: series?.title ?: "Clotube Featured"
-    }
-
-    val subtitle = when {
-        continueWatching != null -> continueWatching.subtitle
-        isResumeMode && lastWatched != null -> {
-            val watchedPercent = (lastWatched.progressFraction * 100).toInt()
-            val current = formatTimestamp(lastWatched.positionMs)
-            val total = formatTimestamp(lastWatched.durationMs)
-            if (lastWatched.isSeries) {
-                val sNum = lastWatched.seasonNumber
-                val eNum = lastWatched.episodeNumber
-                val epCode = "S${String.format(java.util.Locale.US, "%02d", sNum)}:E${String.format(java.util.Locale.US, "%02d", eNum)}"
-                "$epCode • $watchedPercent% watched • $current / $total"
-            } else {
-                "$watchedPercent% watched • $current / $total"
-            }
-        }
-        else -> null
-    }
-
-    val progressFraction = when {
-        continueWatching != null -> continueWatching.progressFraction
-        lastWatched != null -> lastWatched.progressFraction
-        else -> 0f
-    }
-
-    val backdrop = when {
-        continueWatching != null -> continueWatching.backdropUrl ?: continueWatching.thumbnailUrl ?: movie?.thumbnailUrl ?: series?.backdropUrl ?: series?.posterUrl
-        isResumeMode && lastWatched != null -> lastWatched.backdropUrl ?: lastWatched.thumbnailUrl ?: movie?.thumbnailUrl ?: series?.backdropUrl ?: series?.posterUrl
-        else -> movie?.thumbnailUrl ?: series?.backdropUrl ?: series?.posterUrl
-    }
+    val context = LocalContext.current
+    val backdropUrl = movie.thumbnailUrl?.trim().orEmpty()
+    val title = movie.title.ifBlank { "Clotube Featured" }
 
     Surface(
         modifier = Modifier
@@ -1453,33 +1436,19 @@ private fun HeroBillboardSection(
                 .fillMaxWidth()
                 .aspectRatio(16f / 9f)
         ) {
-            // Backdrop Image
-            AsyncImage(
-                model = ImageRequest.Builder(LocalContext.current)
-                    .data(backdrop)
-                    .crossfade(150)
-                    .bitmapConfig(Bitmap.Config.HARDWARE)
-                    .build(),
-                contentDescription = title,
-                modifier = Modifier.fillMaxSize(),
-                contentScale = ContentScale.Crop
-            )
-
-            // Top Badge
-            if (isResumeMode) {
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.TopStart)
-                        .padding(12.dp)
-                ) {
-                    Text(
-                        text = "CONTINUE WATCHING",
-                        color = Color(0xFF94A3B8),
-                        fontSize = 9.sp,
-                        fontWeight = FontWeight.Bold,
-                        letterSpacing = 1.sp
-                    )
-                }
+            if (backdropUrl.isNotBlank()) {
+                AsyncImage(
+                    model = buildAntiPoisonImageRequest(
+                        context = context,
+                        url = backdropUrl,
+                        mediaId = movie.id,
+                        canonicalPrefix = "movie_poster",
+                        drivePrefix = "movie_drive"
+                    ),
+                    contentDescription = title,
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Crop
+                )
             }
 
             // Cinematic Gradient Overlay (Dark bottom to transparent top)
@@ -1504,7 +1473,6 @@ private fun HeroBillboardSection(
                     .padding(16.dp),
                 verticalArrangement = Arrangement.Bottom
             ) {
-                // Title
                 Text(
                     text = title,
                     color = Color.White,
@@ -1515,93 +1483,30 @@ private fun HeroBillboardSection(
                     modifier = Modifier.fillMaxWidth()
                 )
 
-                if (isResumeMode && subtitle != null) {
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = subtitle,
-                        color = Color(0xFF94A3B8),
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Normal,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-
-                    Spacer(modifier = Modifier.height(6.dp))
-                    // Sleek 2.5.dp progress track using AccentBlue over track
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(2.5.dp)
-                            .background(Color(0x26FFFFFF), RoundedCornerShape(1.5.dp))
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth(progressFraction.coerceIn(0f, 1f))
-                                .fillMaxHeight()
-                                .background(AccentBlue, RoundedCornerShape(1.5.dp))
-                        )
-                    }
-                }
-
                 Spacer(modifier = Modifier.height(10.dp))
 
-                // Action Buttons
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    if (isResumeMode) {
-                        Button(
-                            onClick = {
-                                if (continueWatching != null && onResumeContinueWatching != null) {
-                                    onResumeContinueWatching(continueWatching)
-                                } else if (lastWatched != null) {
-                                    onResume(lastWatched)
-                                }
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = AccentBlue),
-                            shape = PillShape,
-                            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.PlayArrow,
-                                contentDescription = null,
-                                tint = Color.White,
-                                modifier = Modifier.size(18.dp)
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            val buttonText = if (progressFraction >= 0.95f) "Watch Again" else if (progressFraction <= 0.01f) "Watch Now" else "Resume"
-                            Text(buttonText, fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color.White)
-                        }
-                    } else {
-                        Button(
-                            onClick = {
-                                if (movie != null) onWatchMovie() else onWatchSeries()
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = AccentBlue),
-                            shape = PillShape,
-                            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.PlayArrow,
-                                contentDescription = null,
-                                tint = Color.White,
-                                modifier = Modifier.size(18.dp)
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Watch Now", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color.White)
-                        }
+                    Button(
+                        onClick = onWatchMovie,
+                        colors = ButtonDefaults.buttonColors(containerColor = AccentBlue),
+                        shape = PillShape,
+                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.PlayArrow,
+                            contentDescription = null,
+                            tint = Color.White,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Watch Now", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color.White)
                     }
 
                     OutlinedButton(
-                        onClick = {
-                            if (isResumeMode) {
-                                val isSeries = continueWatching?.isSeries ?: lastWatched?.isSeries ?: false
-                                if (isSeries) onWatchSeries() else onInspect()
-                            } else {
-                                if (movie != null) onInspect() else onWatchSeries()
-                            }
-                        },
+                        onClick = onInspect,
                         shape = PillShape,
                         border = BorderStroke(1.dp, SurfaceBorder),
                         colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
@@ -1617,26 +1522,13 @@ private fun HeroBillboardSection(
                         Text("Details", fontSize = 12.sp, color = Color.White)
                     }
 
-                    if (movie != null && onDownloadClick != null) {
+                    if (onDownloadClick != null) {
                         MovieDownloadButton(
                             status = downloadStatus,
                             progressFraction = downloadProgress,
                             onClick = onDownloadClick,
                             size = 38.dp
                         )
-                    }
-
-                    if (isResumeMode && onRemoveResume != null) {
-                        IconButton(
-                            onClick = onRemoveResume,
-                            modifier = Modifier.size(36.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Close,
-                                contentDescription = "Remove from history",
-                                tint = Color(0xFF6B7A90)
-                            )
-                        }
                     }
                 }
             }
@@ -1712,24 +1604,27 @@ fun MovieCard(
     var fallbackPoster by remember(movie.id) { mutableStateOf("") }
     var imageLoadFailed by remember(movie.thumbnailUrl) { mutableStateOf(false) }
 
+    val rawMovieThumb = movie.thumbnailUrl?.trim().orEmpty()
+    val movieHasDriveFrame = rawMovieThumb.isNotBlank() && OnlineMetadataResolver.isDriveVideoFrameUrl(rawMovieThumb)
+
     val effectiveThumb = when {
         fallbackPoster.isNotBlank() -> fallbackPoster
-        !imageLoadFailed && !movie.thumbnailUrl.isNullOrBlank() -> movie.thumbnailUrl
+        !imageLoadFailed && rawMovieThumb.isNotBlank() -> rawMovieThumb
         else -> ""
     }
 
-    LaunchedEffect(movie.id, movie.displayTitle, imageLoadFailed, movie.thumbnailUrl) {
-        if ((movie.thumbnailUrl.isNullOrBlank() || imageLoadFailed) && fallbackPoster.isBlank()) {
+    LaunchedEffect(movie.id, movie.displayTitle, imageLoadFailed, rawMovieThumb) {
+        if ((rawMovieThumb.isBlank() || movieHasDriveFrame || imageLoadFailed) && fallbackPoster.isBlank()) {
             withContext(Dispatchers.IO) {
                 try {
                     val searchResults = GlobalCatalogSearchEngine.searchOnlineCatalog(movie.displayTitle)
-                    val best = searchResults.firstOrNull { it.posterUrl.isNotBlank() }?.posterUrl
-                        ?: searchResults.firstOrNull { it.backdropUrl.isNotBlank() }?.backdropUrl
+                    val best = searchResults.firstOrNull { it.posterUrl.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it.posterUrl) }?.posterUrl
+                        ?: searchResults.firstOrNull { it.backdropUrl.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it.backdropUrl) }?.backdropUrl
                     if (!best.isNullOrBlank()) {
                         fallbackPoster = best
                     } else {
                         val resolved = OnlineMetadataResolver.resolveMovie(movie.displayTitle).posterUrl
-                        if (!resolved.isNullOrBlank()) {
+                        if (!resolved.isNullOrBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(resolved)) {
                             fallbackPoster = resolved
                         }
                     }
@@ -1757,14 +1652,15 @@ fun MovieCard(
             if (effectiveThumb.isNotBlank()) {
                 // Layer 1 (Base): Coil AsyncImage with downsampling & HARDWARE bitmap
                 AsyncImage(
-                    model = ImageRequest.Builder(LocalContext.current)
-                        .data(effectiveThumb)
-                        .crossfade(150)
-                        .size(width = 440, height = 248) // Exact 2x pixel density for 220dp x 124dp card
-                        .bitmapConfig(Bitmap.Config.HARDWARE) // Direct GPU texture
-                        .memoryCacheKey("movie_thumb_${movie.id}_${effectiveThumb.hashCode()}")
-                        .diskCacheKey("movie_thumb_${movie.id}_${effectiveThumb.hashCode()}")
-                        .build(),
+                    model = buildAntiPoisonImageRequest(
+                        context = LocalContext.current,
+                        url = effectiveThumb,
+                        mediaId = movie.id,
+                        canonicalPrefix = "movie_poster",
+                        drivePrefix = "movie_drive",
+                        widthPx = 440,
+                        heightPx = 248
+                    ),
                     contentDescription = movie.displayTitle,
                     contentScale = ContentScale.Crop,
                     onError = { imageLoadFailed = true },
@@ -1981,24 +1877,27 @@ fun MoviePosterCard(
     var fallbackPoster by remember(movie.id) { mutableStateOf("") }
     var imageLoadFailed by remember(movie.thumbnailUrl) { mutableStateOf(false) }
 
+    val rawMovieThumb = movie.thumbnailUrl?.trim().orEmpty()
+    val movieHasDriveFrame = rawMovieThumb.isNotBlank() && OnlineMetadataResolver.isDriveVideoFrameUrl(rawMovieThumb)
+
     val effectiveThumb = when {
         fallbackPoster.isNotBlank() -> fallbackPoster
-        !imageLoadFailed && !movie.thumbnailUrl.isNullOrBlank() -> movie.thumbnailUrl
+        !imageLoadFailed && rawMovieThumb.isNotBlank() -> rawMovieThumb
         else -> ""
     }
 
-    LaunchedEffect(movie.id, movie.displayTitle, imageLoadFailed, movie.thumbnailUrl) {
-        if ((movie.thumbnailUrl.isNullOrBlank() || imageLoadFailed) && fallbackPoster.isBlank()) {
+    LaunchedEffect(movie.id, movie.displayTitle, imageLoadFailed, rawMovieThumb) {
+        if ((rawMovieThumb.isBlank() || movieHasDriveFrame || imageLoadFailed) && fallbackPoster.isBlank()) {
             withContext(Dispatchers.IO) {
                 try {
                     val searchResults = GlobalCatalogSearchEngine.searchOnlineCatalog(movie.displayTitle)
-                    val best = searchResults.firstOrNull { it.posterUrl.isNotBlank() }?.posterUrl
-                        ?: searchResults.firstOrNull { it.backdropUrl.isNotBlank() }?.backdropUrl
+                    val best = searchResults.firstOrNull { it.posterUrl.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it.posterUrl) }?.posterUrl
+                        ?: searchResults.firstOrNull { it.backdropUrl.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it.backdropUrl) }?.backdropUrl
                     if (!best.isNullOrBlank()) {
                         fallbackPoster = best
                     } else {
                         val resolved = OnlineMetadataResolver.resolveMovie(movie.displayTitle).posterUrl
-                        if (!resolved.isNullOrBlank()) {
+                        if (!resolved.isNullOrBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(resolved)) {
                             fallbackPoster = resolved
                         }
                     }
@@ -2031,14 +1930,15 @@ fun MoviePosterCard(
                 if (effectiveThumb.isNotBlank()) {
                     // Full bleed AsyncImage with ContentScale.Crop
                     AsyncImage(
-                        model = ImageRequest.Builder(LocalContext.current)
-                            .data(effectiveThumb)
-                            .crossfade(150)
-                            .size(width = 300, height = 450)
-                            .bitmapConfig(Bitmap.Config.HARDWARE)
-                            .memoryCacheKey("movie_thumb_${movie.id}_${effectiveThumb.hashCode()}")
-                            .diskCacheKey("movie_thumb_${movie.id}_${effectiveThumb.hashCode()}")
-                            .build(),
+                        model = buildAntiPoisonImageRequest(
+                            context = LocalContext.current,
+                            url = effectiveThumb,
+                            mediaId = movie.id,
+                            canonicalPrefix = "movie_poster",
+                            drivePrefix = "movie_drive",
+                            widthPx = 300,
+                            heightPx = 450
+                        ),
                         contentDescription = movie.displayTitle,
                         contentScale = ContentScale.Crop,
                         onError = { imageLoadFailed = true },
@@ -2249,7 +2149,9 @@ fun SeriesCard(
         if ((officialSeriesArt.isBlank() || imageLoadFailed) && (fallbackPoster.isBlank() || OnlineMetadataResolver.isDriveVideoFrameUrl(fallbackPoster))) {
             withContext(Dispatchers.IO) {
                 try {
-                    val cachedRecord = MetadataDiskCache.get("series:${series.title.trim().lowercase()}")
+                    val normTitle = WatchlistManager.normalizeTitle(series.title).lowercase()
+                    val cachedRecord = MetadataDiskCache.get("series_$normTitle")
+                        ?: MetadataDiskCache.get("series:${series.title.trim().lowercase()}")
                     val cachedArt = cachedRecord?.posterUrl?.takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
                         ?: cachedRecord?.backdropUrl?.takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
                     if (!cachedArt.isNullOrBlank()) {
@@ -2292,14 +2194,14 @@ fun SeriesCard(
             if (effectiveThumb.isNotBlank()) {
                 val thumbUrl = effectiveThumb
                 AsyncImage(
-                    model = ImageRequest.Builder(LocalContext.current)
-                        .data(thumbUrl)
-                        .crossfade(150)
-                        .size(width = 440, height = 248) // Exact 2x pixel density for 220dp x 124dp card
-                        .bitmapConfig(Bitmap.Config.HARDWARE) // Direct GPU texture
-                        .memoryCacheKey("series_official_poster_${series.id}")
-                        .diskCacheKey("series_official_poster_${series.id}")
-                        .build(),
+                    model = buildAntiPoisonImageRequest(
+                        context = LocalContext.current,
+                        url = thumbUrl,
+                        mediaId = series.id,
+                        canonicalPrefix = "series_poster",
+                        widthPx = 440,
+                        heightPx = 248
+                    ),
                     contentDescription = series.title,
                     modifier = Modifier.fillMaxSize(),
                     contentScale = ContentScale.Crop,
@@ -2511,7 +2413,15 @@ fun MovieOverlayCard(
             // Background Artwork
             if (!movie.thumbnailUrl.isNullOrBlank()) {
                 AsyncImage(
-                    model = movie.thumbnailUrl,
+                    model = buildAntiPoisonImageRequest(
+                        context = LocalContext.current,
+                        url = movie.thumbnailUrl,
+                        mediaId = movie.id,
+                        canonicalPrefix = "movie_poster",
+                        drivePrefix = "movie_drive",
+                        widthPx = 440,
+                        heightPx = 248
+                    ),
                     contentDescription = movie.title,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize()
@@ -2612,11 +2522,21 @@ fun SeriesOverlayCard(
         border = BorderStroke(1.dp, SurfaceBorder)
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
-            // Background Artwork
-            val poster = series.posterUrl ?: series.thumbnailUrl
+            // Background Artwork (reject Drive video frame URLs to prevent cache poisoning)
+            val poster = listOfNotNull(series.posterUrl, series.thumbnailUrl)
+                .map { it.trim() }
+                .firstOrNull { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
+                .orEmpty()
             if (poster.isNotBlank()) {
                 AsyncImage(
-                    model = poster,
+                    model = buildAntiPoisonImageRequest(
+                        context = LocalContext.current,
+                        url = poster,
+                        mediaId = series.id,
+                        canonicalPrefix = "series_poster",
+                        widthPx = 440,
+                        heightPx = 248
+                    ),
                     contentDescription = series.title,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize()
@@ -2743,14 +2663,15 @@ fun MoviePosterCard(
                 if (!movie.thumbnailUrl.isNullOrBlank()) {
                     val effectiveThumb = movie.thumbnailUrl
                     AsyncImage(
-                        model = ImageRequest.Builder(LocalContext.current)
-                            .data(effectiveThumb)
-                            .crossfade(150)
-                            .size(width = 300, height = 450)
-                            .bitmapConfig(Bitmap.Config.HARDWARE)
-                            .memoryCacheKey("movie_thumb_${movie.id}_${effectiveThumb.hashCode()}")
-                            .diskCacheKey("movie_thumb_${movie.id}_${effectiveThumb.hashCode()}")
-                            .build(),
+                        model = buildAntiPoisonImageRequest(
+                            context = LocalContext.current,
+                            url = effectiveThumb,
+                            mediaId = movie.id,
+                            canonicalPrefix = "movie_poster",
+                            drivePrefix = "movie_drive",
+                            widthPx = 300,
+                            heightPx = 450
+                        ),
                         contentDescription = movie.title,
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize()
@@ -2854,7 +2775,9 @@ fun SeriesRowCard(
         if ((officialSeriesArt.isBlank() || imageLoadFailed) && (fallbackPoster.isBlank() || OnlineMetadataResolver.isDriveVideoFrameUrl(fallbackPoster))) {
             withContext(Dispatchers.IO) {
                 try {
-                    val cachedRecord = MetadataDiskCache.get("series:${series.title.trim().lowercase()}")
+                    val normTitle = WatchlistManager.normalizeTitle(series.title).lowercase()
+                    val cachedRecord = MetadataDiskCache.get("series_$normTitle")
+                        ?: MetadataDiskCache.get("series:${series.title.trim().lowercase()}")
                     val cachedArt = cachedRecord?.posterUrl?.takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
                         ?: cachedRecord?.backdropUrl?.takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
                     if (!cachedArt.isNullOrBlank()) {
@@ -2903,14 +2826,14 @@ fun SeriesRowCard(
             ) {
                 if (effectiveThumb.isNotBlank()) {
                     AsyncImage(
-                        model = ImageRequest.Builder(LocalContext.current)
-                            .data(effectiveThumb)
-                            .crossfade(150)
-                            .size(width = 440, height = 248)
-                            .bitmapConfig(Bitmap.Config.HARDWARE)
-                            .memoryCacheKey("series_official_poster_${series.id}")
-                            .diskCacheKey("series_official_poster_${series.id}")
-                            .build(),
+                        model = buildAntiPoisonImageRequest(
+                            context = LocalContext.current,
+                            url = effectiveThumb,
+                            mediaId = series.id,
+                            canonicalPrefix = "series_poster",
+                            widthPx = 440,
+                            heightPx = 248
+                        ),
                         contentDescription = series.title,
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize(),
@@ -3223,20 +3146,35 @@ fun ContinueWatchingCard(
         border = BorderStroke(1.dp, SurfaceBorder)
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
-            val isOfficial = !OnlineMetadataResolver.isDriveVideoFrameUrl(data.displayThumbnailUrl)
-            val cacheKey = if (isOfficial) "official_poster_${data.mediaId}" else "drive_frame_${data.mediaId}"
-            // 1. High-Resolution Episode / Movie Artwork
-            AsyncImage(
-                model = ImageRequest.Builder(LocalContext.current)
-                    .data(data.displayThumbnailUrl)
-                    .crossfade(300)
-                    .memoryCacheKey(cacheKey)
-                    .diskCacheKey(cacheKey)
-                    .build(),
-                contentDescription = data.episodeTitle,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize()
-            )
+            val safeArtworkUrl = remember(data.mediaId, data.displayThumbnailUrl) {
+                data.displayThumbnailUrl.trim()
+                    .takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
+                    .orEmpty()
+            }
+            if (safeArtworkUrl.isNotBlank()) {
+                // 1. High-Resolution Official Episode / Movie Artwork with canonical anti-poison cache key
+                AsyncImage(
+                    model = buildAntiPoisonImageRequest(
+                        context = LocalContext.current,
+                        url = safeArtworkUrl,
+                        mediaId = data.mediaId,
+                        canonicalPrefix = "cw_hero"
+                    ),
+                    contentDescription = data.episodeTitle,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
+            } else {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(
+                            Brush.verticalGradient(
+                                colors = listOf(Color(0xFF1A2233), Color(0xFF0B0F17))
+                            )
+                        )
+                )
+            }
 
             // 2. High-Contrast Gradient Scrim
             Box(
@@ -3416,47 +3354,6 @@ fun ContinueWatchingCard(
 
 @Composable
 fun ContinueWatchingCard(
-    item: ContinueWatchingItem,
-    onResumeClick: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val displayData = ContinueWatchingDisplayData(
-        mediaId = item.mediaId,
-        seriesId = item.seriesId,
-        isSeries = item.isSeries,
-        displayHeader = item.seriesTitle,
-        displayTitle = item.displaySubtitle.ifBlank { item.episodeTitle },
-        displayThumbnailUrl = item.thumbnailUrl,
-        progressFraction = item.progressFraction,
-        currentPositionMs = item.currentPositionMs,
-        durationMs = item.durationMs,
-        seriesTitle = item.seriesTitle,
-        seasonNumber = item.seasonNumber,
-        episodeNumber = item.episodeNumber,
-        episodeTitle = item.episodeTitle
-    )
-    ContinueWatchingCard(
-        data = displayData,
-        onResumeClick = onResumeClick,
-        modifier = modifier
-    )
-}
-
-@Composable
-fun ContinueWatchingCard(
-    data: ContinueWatchingData,
-    onResumeClick: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    ContinueWatchingCard(
-        data = data.toContinueWatchingDisplayData(),
-        onResumeClick = onResumeClick,
-        modifier = modifier
-    )
-}
-
-@Composable
-fun ContinueWatchingCard(
     episode: Episode,
     onPlayClick: () -> Unit,
     modifier: Modifier = Modifier,
@@ -3507,11 +3404,7 @@ fun HomeScreen(
 
     val movies by viewModel.moviesList.collectAsState()
     val series by viewModel.seriesList.collectAsState()
-    val continueWatchingEpisode by viewModel.lastWatchedEpisodeState.collectAsState()
-    val continueWatchingData by viewModel.continueWatchingState.collectAsState()
-    val continueWatchingItem by viewModel.continueWatchingItem.collectAsState()
-    val resolvedCwItem by viewModel.resolvedContinueWatching.collectAsState()
-    val continueWatchingDisplayItem by viewModel.continueWatchingDisplayState.collectAsState()
+    val heroState by viewModel.heroSlotState.collectAsState()
 
     var selectedMovieLanguage by remember { mutableStateOf("All") }
     val displayMovies = remember(movies) {
@@ -3672,13 +3565,15 @@ fun HomeScreen(
                     viewModel.refreshAppFreshBoot()
                 },
                 indicator = {
-                    PullToRefreshDefaults.Indicator(
-                        state = secondPullRefreshState,
-                        isRefreshing = isSecondOverloadRefreshing,
-                        color = AccentBlue,
-                        containerColor = SurfaceElevated,
-                        modifier = Modifier.align(Alignment.TopCenter)
-                    )
+                    if (isSecondOverloadRefreshing || secondPullRefreshState.distanceFraction > 0.05f) {
+                        PullToRefreshDefaults.Indicator(
+                            state = secondPullRefreshState,
+                            isRefreshing = isSecondOverloadRefreshing,
+                            color = AccentBlue,
+                            containerColor = SurfaceElevated,
+                            modifier = Modifier.align(Alignment.TopCenter)
+                        )
+                    }
                 },
                 modifier = Modifier
                     .fillMaxWidth()
@@ -3702,11 +3597,14 @@ fun HomeScreen(
                             modifier = Modifier.fillMaxSize(),
                             contentPadding = PaddingValues(bottom = 110.dp)
                         ) {
-                            if (continueWatchingDisplayItem != null) {
-                                val item = continueWatchingDisplayItem!!
-                                val safeCwId = item.mediaId.trim()
-                                if (safeCwId.isNotEmpty()) {
-                                    item(key = "continue_watching_card") {
+                            item(key = "home_hero_billboard") {
+                                when (val state = heroState) {
+                                    is HeroSlotState.Resolving -> {
+                                        ShimmerHeroBillboard()
+                                    }
+                                    is HeroSlotState.ContinueWatching -> {
+                                        val item = state.item
+                                        val safeCwId = item.mediaId.trim()
                                         ContinueWatchingCard(
                                             data = item,
                                             onResumeClick = {
@@ -3725,7 +3623,7 @@ fun HomeScreen(
                                                         val matchedSeries = series.find { it.id == sId }
                                                         if (matchedSeries != null) onSeriesClick(matchedSeries)
                                                     }
-                                                } else {
+                                                } else if (safeCwId.isNotBlank()) {
                                                     val matched = movies.find { it.id == safeCwId }
                                                     if (matched != null) {
                                                         onMovieClick(matched)
@@ -3744,6 +3642,13 @@ fun HomeScreen(
                                                     }
                                                 }
                                             }
+                                        )
+                                    }
+                                    is HeroSlotState.FeaturedFallback -> {
+                                        FeaturedHeroBanner(
+                                            movie = state.movie,
+                                            onWatchMovie = { onMovieClick(state.movie) },
+                                            onInspect = { onMovieClick(state.movie) }
                                         )
                                     }
                                 }

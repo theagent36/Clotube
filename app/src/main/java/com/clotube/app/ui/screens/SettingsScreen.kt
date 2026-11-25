@@ -1,7 +1,9 @@
 package com.clotube.app.ui.screens
 
 import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
+import android.net.Uri
 import android.widget.Toast
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -25,6 +27,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -74,6 +77,7 @@ fun SettingsScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val uriHandler = LocalUriHandler.current
     val uiState by viewModel.uiState.collectAsState()
     val isOnline by ClotubeNetworkMonitor.isOnline.collectAsState()
     val isNetworkChecking by ClotubeNetworkMonitor.isChecking.collectAsState()
@@ -890,6 +894,29 @@ fun SettingsScreen(
                             subtitle = "View feature highlights & release notes",
                             onClick = {
                                 showReleaseNotesDialog = true
+                            }
+                        )
+
+                        SettingsRowDivider()
+
+                        // Developer Credit & GitHub Link
+                        SettingsRow(
+                            icon = Icons.Rounded.Code,
+                            title = "Made by Angshuman Mondal",
+                            subtitle = "https://github.com/theagent36",
+                            trailingText = "GitHub",
+                            onClick = {
+                                val githubUrl = "https://github.com/theagent36"
+                                runCatching {
+                                    uriHandler.openUri(githubUrl)
+                                }.onFailure {
+                                    runCatching {
+                                        context.startActivity(
+                                            Intent(Intent.ACTION_VIEW, Uri.parse(githubUrl))
+                                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                        )
+                                    }
+                                }
                             }
                         )
                     }

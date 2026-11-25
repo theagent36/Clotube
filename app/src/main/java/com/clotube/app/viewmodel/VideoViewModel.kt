@@ -18,6 +18,7 @@ import com.clotube.app.model.TvSeries
 import com.clotube.app.model.VideoItem
 import com.clotube.app.data.CachedCatalog
 import com.clotube.app.data.CatalogCacheManager
+import com.clotube.app.data.ContinueWatchingSnapshotStore
 import com.clotube.app.data.ProfileManager
 import com.clotube.app.data.SavedAccountProfile
 import com.clotube.app.data.scanner.DriveCatalogScanner
@@ -44,7 +45,6 @@ import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
-import com.clotube.app.model.ContinueWatchingItem
 import com.clotube.app.model.Series
 import com.clotube.app.model.toMovie
 import com.clotube.app.data.metadata.OnlineMetadataResolver
@@ -68,25 +68,27 @@ import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.workDataOf
+import com.clotube.app.data.AndroidWatchHistoryManager
 import com.clotube.app.data.DriveCatalogMatcher
 import com.clotube.app.data.DriveSyncWorker
 import com.clotube.app.data.DriveWatchHistorySync
 import com.clotube.app.data.DriveWatchlistSync
 import com.clotube.app.data.MediaArtworkResolver
 import com.clotube.app.data.MetadataDiskCache
+import com.clotube.app.data.WatchHistoryPayloadV2
 import com.clotube.app.data.WatchlistManager
 import com.clotube.app.model.WatchlistMediaType
 import com.clotube.app.model.WatchlistStatus
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
-import kotlinx.coroutines.withContext
 import com.clotube.app.media.VlcPlayerManager
 import com.clotube.app.model.Episode
 import org.videolan.libvlc.MediaPlayer
@@ -94,6 +96,7 @@ import android.content.Context
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 
 // Persist the series catalog via unified CatalogCacheManager
 fun saveCatalogToDisk(context: Context, seriesList: List<TvSeries>) {
@@ -110,80 +113,10 @@ fun saveShowToDisk(context: Context, updatedShow: TvSeries) {
     CatalogCacheManager(context).upsertSeriesSync(updatedShow)
 }
 
-@Keep
-data class ContinueWatchingData(
-    val episode: Episode,
-    val seriesId: String,
-    val seriesTitle: String,
-    val displayThumbnailUrl: String,
-    val progressFraction: Float, // 0.0f to 1.0f for progress bar width
-    val currentPositionMs: Long,
-    val durationMs: Long
-) : Serializable {
-    val mediaId: String get() = episode.id
-    val title: String get() = "$seriesTitle • S${episode.seasonNumber.toString().padStart(2, '0')}:E${episode.episodeNumber.toString().padStart(2, '0')}"
-    val subtitle: String get() = episode.displayTitle
-    val episodeTitle: String get() = episode.displayTitle
-    val thumbnailUrl: String get() = displayThumbnailUrl
-    val isMovie: Boolean get() = false
-    val progressPercentage: Int get() = (progressFraction * 100).toInt().coerceIn(0, 100)
-    val rawEpisode: Episode get() = episode
-    val rawMovie: Movie? get() = null
-    val seriesPosterUrl: String get() = displayThumbnailUrl
-
-    constructor(
-        mediaId: String,
-        seriesId: String = "",
-        title: String = "",
-        subtitle: String = "",
-        episodeTitle: String = "",
-        thumbnailUrl: String = "",
-        isMovie: Boolean = false,
-        progressPercentage: Int = 0,
-        currentPositionMs: Long = 0L,
-        durationMs: Long = 0L,
-        rawEpisode: Episode? = null,
-        rawMovie: Movie? = null
-    ) : this(
-        episode = rawEpisode ?: Episode(
-            id = mediaId,
-            seriesTitle = if (title.contains(" • ")) title.substringBefore(" • ") else title,
-            displayTitle = episodeTitle.ifBlank { subtitle.ifBlank { title } },
-            seasonNumber = 1,
-            episodeNumber = 1,
-            thumbnailUrl = thumbnailUrl,
-            durationFormatted = if (durationMs > 0) formatTimestamp(durationMs) else ""
-        ),
-        seriesId = seriesId,
-        seriesTitle = if (title.contains(" • ")) title.substringBefore(" • ") else title,
-        displayThumbnailUrl = thumbnailUrl,
-        progressFraction = if (durationMs > 0) (currentPositionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f) else (progressPercentage / 100f).coerceIn(0f, 1f),
-        currentPositionMs = currentPositionMs,
-        durationMs = durationMs
-    )
-
-    fun toContinueWatchingDisplayData(): ContinueWatchingDisplayData {
-        return ContinueWatchingDisplayData(
-            mediaId = mediaId,
-            seriesId = seriesId,
-            isSeries = true,
-            displayHeader = seriesTitle,
-            displayTitle = episode.displayTitle,
-            displayThumbnailUrl = displayThumbnailUrl,
-            progressFraction = progressFraction,
-            currentPositionMs = currentPositionMs,
-            durationMs = durationMs,
-            seriesTitle = seriesTitle,
-            seasonNumber = episode.seasonNumber,
-            episodeNumber = episode.episodeNumber,
-            episodeTitle = episode.displayTitle
-        )
-    }
-}
-
 typealias EpisodeItem = com.clotube.app.model.Episode
 
 @Keep
+@androidx.compose.runtime.Immutable
 data class ContinueWatchingDisplayData(
     val mediaId: String = "",
     val seriesId: String? = null,
@@ -200,26 +133,13 @@ data class ContinueWatchingDisplayData(
     val episodeTitle: String = displayTitle
 ) : Serializable {
     val episodeId: String get() = mediaId
-    fun toContinueWatchingData(): ContinueWatchingData {
-        val ep = Episode(
-            id = mediaId,
-            seriesTitle = if (seriesTitle.isNotBlank()) seriesTitle else displayHeader,
-            displayTitle = if (episodeTitle.isNotBlank()) episodeTitle else displayTitle,
-            seasonNumber = seasonNumber,
-            episodeNumber = episodeNumber,
-            thumbnailUrl = displayThumbnailUrl,
-            durationFormatted = if (durationMs > 0) formatTimestamp(durationMs) else ""
-        )
-        return ContinueWatchingData(
-            episode = ep,
-            seriesId = seriesId ?: "",
-            seriesTitle = if (seriesTitle.isNotBlank()) seriesTitle else displayHeader,
-            displayThumbnailUrl = displayThumbnailUrl,
-            progressFraction = progressFraction,
-            currentPositionMs = currentPositionMs,
-            durationMs = durationMs
-        )
-    }
+}
+
+@androidx.compose.runtime.Immutable
+sealed interface HeroSlotState {
+    data object Resolving : HeroSlotState
+    data class ContinueWatching(val item: ContinueWatchingDisplayData) : HeroSlotState
+    data class FeaturedFallback(val movie: Movie) : HeroSlotState
 }
 
 @Keep
@@ -229,8 +149,6 @@ data class VideoUiState(
     val moviesList: List<VideoItem> = emptyList(),
     val filteredVideos: List<VideoItem> = emptyList(),
     val tvSeriesList: List<TvSeries> = emptyList(),
-    val heroItem: VideoItem? = null,
-    val heroSeries: TvSeries? = null,
     val selectedFilter: String = "All",
     val searchQuery: String = "",
     val isSearchActive: Boolean = false,
@@ -270,16 +188,23 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
     val tokenRepository = com.clotube.app.data.TokenRepository(application)
     val driveWatchHistorySync by lazy { DriveWatchHistorySync.getInstance(getApplication()) }
 
-    private val _isHistoryLoaded = MutableStateFlow(false)
-    val isHistoryLoaded: StateFlow<Boolean> = _isHistoryLoaded.asStateFlow()
+    private val _heroSlotState = MutableStateFlow<HeroSlotState>(HeroSlotState.Resolving)
+    val heroSlotState: StateFlow<HeroSlotState> = _heroSlotState.asStateFlow()
+
+    private val hasResolvedContinueWatchingLatch = AtomicBoolean(false)
+    private val hasConfirmedEmptyHistoryLatch = AtomicBoolean(false)
+    private val metadataRevision = MutableStateFlow(0L)
+    private val heroReconcileMutex = Mutex()
+    private var cwEnrichmentJob: Job? = null
+    private var cwEnrichmentMediaId: String? = null
 
     val savedProfiles: StateFlow<List<SavedAccountProfile>> = ProfileManager.savedProfiles
 
     /**
      * Initiates startup state resolution:
-     * 1. Awaits disk catalog hydration.
-     * 2. Authoritative pull of clotube_active_sync.json & clotube_archive.json from Drive (up to 9.5s).
-     * 3. Awaits continueWatchingDisplayState resolution before unlocking HomeScreen.
+     * 1. Awaits Frame-1 local disk hydration (snapshot + catalog).
+     * 2. Authoritative timestamp-fenced pull of clotube_active_sync.json & clotube_archive.json from Drive.
+     * 3. Reconciles HeroSlotState and pre-warms Hero artwork before unlocking HomeScreen.
      */
     suspend fun prepareInitialState() = withContext(Dispatchers.IO) {
         try {
@@ -287,7 +212,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             ProfileManager.ensureLoaded(getApplication())
             MetadataDiskCache.ensureLoaded(getApplication())
         } catch (e: Exception) {
-            android.util.Log.w(TAG, "Startup cache preload warning: ${e.message}")
+            Log.w(TAG, "Startup cache preload warning: ${e.message}")
         }
 
         // Hydrate active BYOC session if present so Drive credentials are immediately ready
@@ -314,7 +239,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // 1. Ensure disk catalog cache is hydrated so series/movie metadata matches Drive history IDs
+        // 1. Ensure disk catalog cache + snapshot are hydrated
         try {
             diskHydrationJob?.join()
             if (_seriesState.value.isEmpty()) {
@@ -326,29 +251,34 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             }
         } catch (_: Exception) {}
 
-        // 2. Authoritative pull of clotube_active_sync.json & clotube_archive.json from Drive (up to 9.5s)
+        // 2. Authoritative timestamp-fenced pull & self-healing merge from Drive (up to 9.5s)
         try {
             withTimeoutOrNull(9_500L) {
-                driveWatchHistorySync.syncFromCloud(force = true)
+                driveWatchHistorySync.pullAndMerge(getApplication(), force = true)
             }
         } catch (e: Exception) {
-            android.util.Log.e(TAG, "Boot Drive history sync failed: ${e.message}", e)
+            Log.e(TAG, "Boot Drive history sync failed: ${e.message}", e)
         }
 
-        // 3. Wait for continueWatchingDisplayState to resolve against catalog before unlocking HomeScreen
+        // 3. Reconcile HeroSlotState & pre-warm hero artwork if available
         try {
-            val latest = playbackHistoryManager.lastWatchedFlow.first()
-            if (latest != null && !latest.isWatched && latest.progressFraction < 0.95f) {
+            reconcileHeroSlotState()
+            val currentHero = _heroSlotState.value
+            if (currentHero is HeroSlotState.ContinueWatching && currentHero.item.displayThumbnailUrl.isBlank()) {
                 withTimeoutOrNull(1_200L) {
-                    continueWatchingDisplayState.first { it != null }
+                    cwEnrichmentJob?.join()
                 }
             }
-        } catch (_: Exception) {
-        } finally {
-            _isHistoryLoaded.value = true
-        }
+            val finalHero = _heroSlotState.value
+            if (finalHero is HeroSlotState.ContinueWatching && finalHero.item.displayThumbnailUrl.isNotBlank()) {
+                preloadStage1ImageWithKey(
+                    url = finalHero.item.displayThumbnailUrl,
+                    cacheKey = "cw_hero_${finalHero.item.mediaId}"
+                )
+            }
+        } catch (_: Exception) {}
 
-        // 4. Non-blocking watchlist sync after history gate opens
+        // 4. Non-blocking watchlist sync after boot gate opens
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 withTimeoutOrNull(6_000L) {
@@ -996,7 +926,11 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             if (titleMatch != null) return titleMatch.id
         }
 
-        // 4. Check snapshot or history preference
+        // 4. Check HeroSlotState or history preference
+        val heroCw = (_heroSlotState.value as? HeroSlotState.ContinueWatching)?.item
+        if (heroCw != null && heroCw.mediaId == safeId && !heroCw.seriesId.isNullOrBlank()) {
+            return heroCw.seriesId.trim()
+        }
         val snap = _uiState.value.lastWatchedMedia
         if (snap != null && snap.fileId == safeId && !snap.seriesId.isNullOrBlank()) {
             return snap.seriesId.trim()
@@ -1066,8 +1000,6 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
     private val _isInitialLoading = MutableStateFlow<Boolean>(true)
     val isInitialLoading: StateFlow<Boolean> = _isInitialLoading.asStateFlow()
 
-    private val _stage1LastWatched = MutableStateFlow<ContinueWatchingDisplayData?>(null)
-
     private val _uiState = MutableStateFlow(VideoUiState())
     val uiState: StateFlow<VideoUiState> = _uiState.asStateFlow()
 
@@ -1075,354 +1007,615 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         .map { it.userAvatarUrl }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
-    val continueWatchingDisplayState: StateFlow<ContinueWatchingDisplayData?> = combine(
-        playbackHistoryManager.lastWatchedFlow,
-        seriesList,
-        moviesList,
-        _stage1LastWatched
-    ) { lastWatched, allSeries, allMovies, stage1Cw ->
-        if (stage1Cw != null && (lastWatched == null || lastWatched.fileId == stage1Cw.mediaId || lastWatched.mediaId == stage1Cw.mediaId)) {
-            return@combine stage1Cw
-        }
-        if (lastWatched == null) return@combine null
-        if (lastWatched.isWatched || lastWatched.progressFraction >= 0.95f) return@combine null
+    val currentUserAccount: StateFlow<GoogleSignInAccount?> = authRepository.currentAccount
 
-        val isSeriesItem = lastWatched.isSeries || !lastWatched.seriesId.isNullOrBlank()
+    private data class RamInProgressCandidate(
+        val mediaId: String,
+        val seriesId: String?,
+        val isSeries: Boolean,
+        val title: String,
+        val seriesTitle: String?,
+        val seasonNumber: Int,
+        val episodeNumber: Int,
+        val positionMs: Long,
+        val durationMs: Long,
+        val progressFraction: Float,
+        val timestamp: Long,
+        val thumbnailUrl: String
+    )
 
-        if (isSeriesItem) {
-            // ==================== TV SERIES BRANCH ====================
-            val effectiveSeries = allSeries.ifEmpty { loadCatalogFromDisk(getApplication()) }
-            val candidateSeriesTitle = lastWatched.seriesTitle?.trim()?.ifBlank { null }
-                ?: lastWatched.title
-                    .replace(Regex("(?i)\\s*[-•:]?\\s*S0*\\d+[:\\s._-]*E0*\\d+.*$"), "")
-                    .trim(' ', '-', '•', ':')
-                    .ifBlank { null }
-            val normalizedTargetSeries = candidateSeriesTitle?.let {
-                com.clotube.app.data.WatchlistManager.normalizeTitle(it)
-            }.orEmpty()
+    private fun selectTopInProgressFromRam(
+        entries: Map<String, com.clotube.app.data.AndroidTypedEntry>,
+        archivedIds: Set<String>,
+        archivedItems: Map<String, com.clotube.app.data.HistoryItemEntityV2>,
+        activeHeroMediaId: String?
+    ): RamInProgressCandidate? {
+        if (entries.isEmpty() && archivedItems.isEmpty()) return null
+        val candidates = mutableListOf<RamInProgressCandidate>()
+        val resumeEpisodeIds = mutableSetOf<String>()
+        val activeSeenIds = mutableSetOf<String>()
 
-            val parentSeries = effectiveSeries.firstOrNull { !lastWatched.seriesId.isNullOrBlank() && it.id == lastWatched.seriesId }
-                ?: effectiveSeries.firstOrNull { s -> s.seasons.any { sn -> sn.episodes.any { ep -> ep.id == lastWatched.fileId || ep.id == lastWatched.mediaId } } }
-                ?: effectiveSeries.firstOrNull { s -> !candidateSeriesTitle.isNullOrBlank() && s.title.equals(candidateSeriesTitle, ignoreCase = true) }
-                ?: effectiveSeries.firstOrNull { s ->
-                    normalizedTargetSeries.isNotBlank() &&
-                        com.clotube.app.data.WatchlistManager.normalizeTitle(s.title) == normalizedTargetSeries
-                }
-                ?: effectiveSeries.firstOrNull { s ->
-                    val normS = com.clotube.app.data.WatchlistManager.normalizeTitle(s.title)
-                    normalizedTargetSeries.length >= 3 && normS.length >= 3 &&
-                        (normalizedTargetSeries.startsWith(normS) || normS.startsWith(normalizedTargetSeries))
-                }
-                ?: return@combine null
-
-            val allEpisodes = parentSeries.seasons.flatMap { it.episodes }
-            val parsedSe = com.clotube.app.data.metadata.OnlineMetadataResolver.extractSeasonAndEpisode(lastWatched.title)
-            val actualSeason = when {
-                lastWatched.seasonNumber > 0 -> lastWatched.seasonNumber
-                parsedSe != null -> parsedSe.first
-                else -> 1
-            }
-            val actualEpisode = when {
-                lastWatched.episodeNumber > 0 -> lastWatched.episodeNumber
-                parsedSe != null -> parsedSe.second
-                else -> 1
-            }
-
-            val matchedEpisode = allEpisodes.firstOrNull { it.id == lastWatched.fileId || it.id == lastWatched.mediaId }
-                ?: allEpisodes.firstOrNull {
-                    it.seasonNumber == actualSeason && it.episodeNumber == actualEpisode
-                } ?: return@combine null
-
-            val epCode = "S${matchedEpisode.seasonNumber.toString().padStart(2, '0')}:E${matchedEpisode.episodeNumber.toString().padStart(2, '0')}"
-            val cleanTitle = matchedEpisode.displayTitle.ifBlank { "Episode ${matchedEpisode.episodeNumber}" }
-
-            val thumbnail: String = when {
-                !matchedEpisode.thumbnailUrl.isNullOrBlank() && !matchedEpisode.thumbnailUrl!!.contains("drive.google.com") -> matchedEpisode.thumbnailUrl!!
-                else -> {
-                    val directMeta = com.clotube.app.data.metadata.OnlineMetadataResolver.resolveEpisodeMetadata(
-                        seriesName = parentSeries.title,
-                        seasonNumber = matchedEpisode.seasonNumber,
-                        episodeNumber = matchedEpisode.episodeNumber
+        entries.keys
+            .filter { it.startsWith("series_resume_") && it.endsWith("_episode_id") }
+            .forEach { epKey ->
+                val sId = epKey.removePrefix("series_resume_").removeSuffix("_episode_id")
+                val p = "series_resume_$sId"
+                val epId = (entries["${p}_episode_id"]?.value as? String)?.trim().orEmpty()
+                if (epId.isNotBlank()) {
+                    resumeEpisodeIds.add(epId)
+                    val resumeTs = WatchHistoryPayloadV2.normalizeTimestampMs(
+                        (entries["${p}_timestamp"]?.value as? Number)?.toLong() ?: 0L
                     )
-                    when {
-                        !directMeta?.thumbnailUrl.isNullOrBlank() -> directMeta!!.thumbnailUrl
-                        !parentSeries.backdropUrl.isNullOrBlank() -> parentSeries.backdropUrl!!
-                        !parentSeries.posterUrl.isNullOrBlank() -> parentSeries.posterUrl!!
-                        else -> matchedEpisode.thumbnailUrl.orEmpty()
+                    val epTs = WatchHistoryPayloadV2.normalizeTimestampMs(
+                        (entries["${epId}_timestamp"]?.value as? Number)?.toLong() ?: 0L
+                    )
+                    val ts = maxOf(resumeTs, epTs)
+                    val pos = (entries["${p}_pos_ms"]?.value as? Number)?.toLong()
+                        ?: (entries["${epId}_pos"]?.value as? Number)?.toLong() ?: 0L
+                    val dur = (entries["${p}_dur_ms"]?.value as? Number)?.toLong()
+                        ?: (entries["${epId}_dur"]?.value as? Number)?.toLong() ?: 0L
+                    val frac = (entries["${p}_fraction"]?.value as? Number)?.toFloat()
+                        ?: (entries["${epId}_fraction"]?.value as? Number)?.toFloat()
+                        ?: if (dur > 0L) (pos.toFloat() / dur.toFloat()).coerceIn(0f, 1f) else 0f
+
+                    val explicitWatched = entries["${epId}_is_watched"]?.value as? Boolean
+                    val isWatched = explicitWatched ?: (epId in archivedIds || frac >= 0.90f)
+                    val minPos = if (epId == activeHeroMediaId) 0L else 3000L
+
+                    if (!isWatched && epId !in archivedIds && frac < 0.95f && pos > minPos && ts > 0L) {
+                        val sNum = (entries["${p}_season_num"]?.value as? Number)?.toInt()
+                            ?: (entries["${epId}_season_num"]?.value as? Number)?.toInt() ?: 1
+                        val eNum = (entries["${p}_episode_num"]?.value as? Number)?.toInt()
+                            ?: (entries["${epId}_episode_num"]?.value as? Number)?.toInt() ?: 1
+                        val epTitle = (entries["${p}_episode_title"]?.value as? String)
+                            ?: (entries["${epId}_title"]?.value as? String) ?: "Episode $eNum"
+                        val sTitle = (entries["${p}_series_title"]?.value as? String)
+                            ?: (entries["${epId}_series_title"]?.value as? String)
+                        val thumb = (entries["${epId}_thumbnail_url"]?.value as? String)?.takeIf { it.isNotBlank() }
+                            ?: (entries["${epId}_thumb"]?.value as? String)?.takeIf { it.isNotBlank() }
+                            ?: (entries["${p}_thumbnail_url"]?.value as? String)?.takeIf { it.isNotBlank() }
+                            ?: (entries["${p}_thumb"]?.value as? String)?.takeIf { it.isNotBlank() }
+                            ?: ""
+
+                        candidates.add(
+                            RamInProgressCandidate(
+                                mediaId = epId,
+                                seriesId = sId.ifBlank { null },
+                                isSeries = true,
+                                title = epTitle,
+                                seriesTitle = sTitle,
+                                seasonNumber = sNum,
+                                episodeNumber = eNum,
+                                positionMs = pos,
+                                durationMs = dur,
+                                progressFraction = frac,
+                                timestamp = ts,
+                                thumbnailUrl = thumb
+                            )
+                        )
                     }
                 }
             }
 
-            val effectiveDuration = if (matchedEpisode.durationMs > 0L) matchedEpisode.durationMs else lastWatched.durationMs
-            val fraction = if (effectiveDuration > 0L) {
-                (lastWatched.positionMs.toFloat() / effectiveDuration.toFloat()).coerceIn(0f, 1f)
-            } else lastWatched.progressFraction.coerceIn(0f, 1f)
+        entries.keys
+            .filter { it.endsWith("_timestamp") && !it.startsWith("series_resume_") && !it.startsWith("global_") }
+            .forEach { tsKey ->
+                val fileId = tsKey.removeSuffix("_timestamp")
+                if (fileId.isNotBlank() && fileId !in resumeEpisodeIds) {
+                    activeSeenIds.add(fileId)
+                    val ts = WatchHistoryPayloadV2.normalizeTimestampMs(
+                        (entries[tsKey]?.value as? Number)?.toLong() ?: 0L
+                    )
+                    val pos = (entries["${fileId}_pos"]?.value as? Number)?.toLong() ?: 0L
+                    val dur = (entries["${fileId}_dur"]?.value as? Number)?.toLong() ?: 0L
+                    val frac = (entries["${fileId}_fraction"]?.value as? Number)?.toFloat()
+                        ?: if (dur > 0L) (pos.toFloat() / dur.toFloat()).coerceIn(0f, 1f) else 0f
+                    val explicitWatched = entries["${fileId}_is_watched"]?.value as? Boolean
+                    val isWatched = explicitWatched ?: (fileId in archivedIds || frac >= 0.90f)
+                    val isSeries = (entries["${fileId}_is_series"]?.value as? Boolean) ?: false
+                    val sId = (entries["${fileId}_series_id"]?.value as? String)?.ifBlank { null }
+                    val sNum = (entries["${fileId}_season_num"]?.value as? Number)?.toInt() ?: 0
+                    val eNum = (entries["${fileId}_episode_num"]?.value as? Number)?.toInt() ?: 0
+                    val title = (entries["${fileId}_title"]?.value as? String) ?: ""
+                    val sTitle = (entries["${fileId}_series_title"]?.value as? String)?.ifBlank { null }
+                    val thumb = (entries["${fileId}_thumbnail_url"]?.value as? String)?.takeIf { it.isNotBlank() }
+                        ?: (entries["${fileId}_thumb"]?.value as? String)?.takeIf { it.isNotBlank() }
+                        ?: ""
+                    val minPos = if (fileId == activeHeroMediaId) 0L else 3000L
 
-            ContinueWatchingDisplayData(
-                mediaId = matchedEpisode.id,
-                seriesId = parentSeries.id,
-                isSeries = true,
-                displayHeader = parentSeries.title,
-                displayTitle = "$epCode • $cleanTitle",
-                displayThumbnailUrl = thumbnail,
-                progressFraction = fraction,
-                currentPositionMs = lastWatched.positionMs,
-                durationMs = effectiveDuration
-            )
-        } else {
-            // ==================== MOVIE BRANCH ====================
-            val normMovieTitle = if (lastWatched.title.isNotBlank()) {
-                com.clotube.app.data.WatchlistManager.normalizeTitle(lastWatched.title)
-            } else ""
-            val matchedMovie = allMovies.firstOrNull { it.id == lastWatched.fileId || it.id == lastWatched.mediaId }
-                ?: allMovies.firstOrNull {
-                    normMovieTitle.isNotBlank() &&
-                        com.clotube.app.data.WatchlistManager.normalizeTitle(it.title) == normMovieTitle
-                } ?: return@combine null
-
-            val movieTitle = matchedMovie.title.ifBlank { matchedMovie.fileName.ifBlank { "Movie" } }
-
-            val thumbnail: String = when {
-                !matchedMovie.thumbnailUrl.isNullOrBlank() -> matchedMovie.thumbnailUrl!!
-                !lastWatched.thumbnailUrl.isNullOrBlank() -> lastWatched.thumbnailUrl!!
-                else -> ""
+                    if (!isWatched && fileId !in archivedIds && frac < 0.95f && pos > minPos && ts > 0L) {
+                        candidates.add(
+                            RamInProgressCandidate(
+                                mediaId = fileId,
+                                seriesId = sId,
+                                isSeries = isSeries || sId != null || sNum > 0 || eNum > 0,
+                                title = title,
+                                seriesTitle = sTitle,
+                                seasonNumber = sNum,
+                                episodeNumber = eNum,
+                                positionMs = pos,
+                                durationMs = dur,
+                                progressFraction = frac,
+                                timestamp = ts,
+                                thumbnailUrl = thumb
+                            )
+                        )
+                    }
+                }
             }
 
-            val effectiveDuration = if (matchedMovie.durationMs > 0L) matchedMovie.durationMs else lastWatched.durationMs
-            val fraction = if (effectiveDuration > 0L) {
-                (lastWatched.positionMs.toFloat() / effectiveDuration.toFloat()).coerceIn(0f, 1f)
-            } else lastWatched.progressFraction.coerceIn(0f, 1f)
-
-            ContinueWatchingDisplayData(
-                mediaId = matchedMovie.id,
-                seriesId = null,
-                isSeries = false,
-                displayHeader = movieTitle,
-                displayTitle = "Movie • Cinema",
-                displayThumbnailUrl = thumbnail,
-                progressFraction = fraction,
-                currentPositionMs = lastWatched.positionMs,
-                durationMs = effectiveDuration
-            )
+        // Archive fallback: include any uncompleted archived items so Continue Watching & catalog enrichment cover evicted progress
+        archivedItems.values.forEach { archived ->
+            val aid = archived.id.trim()
+            if (aid.isNotBlank() && aid !in resumeEpisodeIds && aid !in activeSeenIds) {
+                val minPos = if (aid == activeHeroMediaId) 0L else 3000L
+                val eligible = !archived.isWatched &&
+                    (aid !in archivedIds || archived.isInProgressForProtection) &&
+                    archived.progressFraction < 0.90f &&
+                    archived.positionMs >= minPos &&
+                    archived.timestamp > 0L
+                if (eligible) {
+                    candidates.add(
+                        RamInProgressCandidate(
+                            mediaId = aid,
+                            seriesId = archived.seriesId,
+                            isSeries = archived.isSeries,
+                            title = archived.title,
+                            seriesTitle = archived.seriesTitle,
+                            seasonNumber = archived.seasonNumber ?: 0,
+                            episodeNumber = archived.episodeNumber ?: 0,
+                            positionMs = archived.positionMs,
+                            durationMs = archived.durationMs,
+                            progressFraction = archived.progressFraction,
+                            timestamp = archived.timestamp,
+                            thumbnailUrl = archived.thumbnailUrl.orEmpty()
+                        )
+                    )
+                }
+            }
         }
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
-    val continueWatchingState: StateFlow<ContinueWatchingData?> = continueWatchingDisplayState
-        .map { it?.toContinueWatchingData() }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+        return candidates.maxByOrNull { it.timestamp }
+    }
 
-    val lastWatchedEpisodeState: StateFlow<Episode?> = continueWatchingState
-        .map { it?.episode }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+    private fun pickNonDriveArtwork(vararg candidates: String?): String {
+        return candidates
+            .asSequence()
+            .mapNotNull { it?.trim() }
+            .firstOrNull { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
+            .orEmpty()
+    }
 
-    val resolvedContinueWatching: StateFlow<ContinueWatchingItem?> = combine(
-        playbackHistoryManager.lastWatchedFlow,
-        seriesList,
-        moviesList
-    ) { lastWatched, allSeries, allMovies ->
-        if (lastWatched == null) return@combine null
-        if (lastWatched.isWatched || lastWatched.progressFraction >= 0.95f) return@combine null
+    private fun enrichDisplayDataLocally(
+        base: ContinueWatchingDisplayData,
+        allSeries: List<TvSeries>,
+        allMovies: List<Movie>,
+        existingHeroArtwork: String?
+    ): ContinueWatchingDisplayData {
+        val app = getApplication<Application>()
+        if (base.isSeries) {
+            val candidateSeriesTitle = base.seriesTitle.ifBlank { base.displayHeader }.trim().ifBlank { null }
+            val normTarget = candidateSeriesTitle?.let { WatchlistManager.normalizeTitle(it) }.orEmpty()
 
-        val effectiveSeries = allSeries.ifEmpty { loadCatalogFromDisk(getApplication()) }
-
-        if (lastWatched.isSeries || !lastWatched.seriesId.isNullOrBlank()) {
-            val candidateSeriesTitle = lastWatched.seriesTitle?.trim()?.ifBlank { null }
-                ?: lastWatched.title
-                    .replace(Regex("(?i)\\s*[-•:]?\\s*S0*\\d+[:\\s._-]*E0*\\d+.*$"), "")
-                    .trim(' ', '-', '•', ':')
-                    .ifBlank { null }
-            val normalizedTargetSeries = candidateSeriesTitle?.let {
-                com.clotube.app.data.WatchlistManager.normalizeTitle(it)
-            }.orEmpty()
-
-            // Find matching series across catalog
-            val series = effectiveSeries.firstOrNull { !lastWatched.seriesId.isNullOrBlank() && it.id == lastWatched.seriesId }
-                ?: effectiveSeries.firstOrNull { s -> s.seasons.any { sn -> sn.episodes.any { ep -> ep.id == lastWatched.mediaId || ep.id == lastWatched.fileId } } }
-                ?: effectiveSeries.firstOrNull { s -> !candidateSeriesTitle.isNullOrBlank() && s.title.equals(candidateSeriesTitle, ignoreCase = true) }
-                ?: effectiveSeries.firstOrNull { s ->
-                    normalizedTargetSeries.isNotBlank() &&
-                        com.clotube.app.data.WatchlistManager.normalizeTitle(s.title) == normalizedTargetSeries
+            val parentSeries = allSeries.firstOrNull { !base.seriesId.isNullOrBlank() && it.id == base.seriesId }
+                ?: allSeries.firstOrNull { s -> s.seasons.any { sn -> sn.episodes.any { ep -> ep.id == base.mediaId } } }
+                ?: allSeries.firstOrNull { s -> !candidateSeriesTitle.isNullOrBlank() && s.title.equals(candidateSeriesTitle, ignoreCase = true) }
+                ?: allSeries.firstOrNull { s ->
+                    normTarget.isNotBlank() && WatchlistManager.normalizeTitle(s.title) == normTarget
                 }
-                ?: effectiveSeries.firstOrNull { s ->
-                    val normS = com.clotube.app.data.WatchlistManager.normalizeTitle(s.title)
-                    normalizedTargetSeries.length >= 3 && normS.length >= 3 &&
-                        (normalizedTargetSeries.startsWith(normS) || normS.startsWith(normalizedTargetSeries))
-                }
-                ?: return@combine null
 
-            val allEpisodes = series.seasons.flatMap { it.episodes }
-
-            // Extract season/ep from stored title if keys were corrupted
-            val sEpPattern = java.util.regex.Pattern.compile("(?i)[sS](\\d{1,2})[:\\s._-]*[eE](\\d{1,2})")
-            val matcher = sEpPattern.matcher(lastWatched.title)
-            val parsedSeason = if (matcher.find()) matcher.group(1)?.toIntOrNull() else null
-            val parsedEpisode = if (matcher.find(0)) matcher.group(2)?.toIntOrNull() else null
-            val parsedSe = com.clotube.app.data.metadata.OnlineMetadataResolver.extractSeasonAndEpisode(lastWatched.title)
-
+            val allEpisodes = parentSeries?.seasons?.flatMap { it.episodes }.orEmpty()
+            val parsedSe = OnlineMetadataResolver.extractSeasonAndEpisode(base.episodeTitle.ifBlank { base.displayTitle })
             val actualSeason = when {
-                parsedSeason != null -> parsedSeason
+                base.seasonNumber > 0 -> base.seasonNumber
                 parsedSe != null -> parsedSe.first
-                lastWatched.seasonNumber > 0 -> lastWatched.seasonNumber
                 else -> 1
             }
-
             val actualEpisode = when {
-                parsedEpisode != null -> parsedEpisode
+                base.episodeNumber > 0 -> base.episodeNumber
                 parsedSe != null -> parsedSe.second
-                lastWatched.episodeNumber > 0 -> lastWatched.episodeNumber
                 else -> 1
             }
 
-            val matchedEpisode = allEpisodes.firstOrNull { it.id == lastWatched.mediaId || it.id == lastWatched.fileId }
+            val matchedEpisode = allEpisodes.firstOrNull { it.id == base.mediaId }
                 ?: allEpisodes.firstOrNull { it.seasonNumber == actualSeason && it.episodeNumber == actualEpisode }
 
-            val seriesTitle = series.title
+            val resolvedSeriesTitle = parentSeries?.title?.takeIf { it.isNotBlank() }
+                ?: candidateSeriesTitle
+                ?: "TV Series"
+            val normSeries = WatchlistManager.normalizeTitle(resolvedSeriesTitle)
+            val epDisk = MetadataDiskCache.get("ep_${normSeries}_s${actualSeason}e${actualEpisode}")
+            val seriesDisk = MetadataDiskCache.get("series_$normSeries")
+                ?: MetadataDiskCache.get("series:${resolvedSeriesTitle.trim().lowercase()}")
 
-            // TVMaze Online Metadata
-            val onlineMeta = com.clotube.app.data.metadata.OnlineMetadataResolver.resolveEpisode(
-                seriesName = seriesTitle,
-                tvMazeSeriesId = 0L,
-                seasonNumber = actualSeason,
-                episodeNumber = actualEpisode,
-                rawFileName = matchedEpisode?.fileName ?: ""
+            val rawEpTitle = base.episodeTitle.ifBlank { base.displayTitle }
+            val sanitizedRawEp = OnlineMetadataResolver.sanitizeEpisodeTitle(rawEpTitle, resolvedSeriesTitle, actualSeason, actualEpisode)
+            val cleanEpTitle = epDisk?.title?.takeIf { it.isNotBlank() && !it.startsWith("Episode", ignoreCase = true) }
+                ?: matchedEpisode?.displayTitle?.takeIf { it.isNotBlank() && !it.startsWith("Episode", ignoreCase = true) }
+                ?: sanitizedRawEp.takeIf { it.isNotBlank() && !it.startsWith("Episode", ignoreCase = true) }
+                ?: matchedEpisode?.displayTitle?.ifBlank { null }
+                ?: "Episode $actualEpisode"
+
+            val officialArt = pickNonDriveArtwork(
+                epDisk?.stillUrl,
+                epDisk?.posterUrl,
+                matchedEpisode?.thumbnailUrl,
+                parentSeries?.backdropUrl,
+                parentSeries?.posterUrl,
+                parentSeries?.thumbnailUrl,
+                seriesDisk?.backdropUrl,
+                seriesDisk?.posterUrl,
+                base.displayThumbnailUrl,
+                existingHeroArtwork
             )
-
-            var cleanTitle = when {
-                onlineMeta.officialTitle.isNotBlank() && !onlineMeta.officialTitle.startsWith("Episode") -> onlineMeta.officialTitle
-                matchedEpisode != null && matchedEpisode.displayTitle.isNotBlank() && !matchedEpisode.displayTitle.startsWith("Episode") -> matchedEpisode.displayTitle
-                else -> ""
-            }
-
-            var bestThumbnail = when {
-                onlineMeta.thumbnailUrl.isNotBlank() -> onlineMeta.thumbnailUrl
-                matchedEpisode?.thumbnailUrl?.isNotBlank() == true && !matchedEpisode.thumbnailUrl.contains("drive.google.com") -> matchedEpisode.thumbnailUrl
-                series?.backdropUrl.orEmpty().isNotBlank() -> series!!.backdropUrl.orEmpty()
-                series?.posterUrl.orEmpty().isNotBlank() -> series!!.posterUrl.orEmpty()
-                else -> matchedEpisode?.thumbnailUrl ?: ""
-            }
-
-            if (cleanTitle.isBlank() || bestThumbnail.isBlank() || bestThumbnail.contains("drive.google.com")) {
-                val directMeta = com.clotube.app.data.metadata.OnlineMetadataResolver.resolveEpisodeMetadata(
-                    seriesName = seriesTitle,
-                    seasonNumber = actualSeason,
-                    episodeNumber = actualEpisode
-                )
-                if (directMeta != null) {
-                    if (cleanTitle.isBlank() && directMeta.officialTitle.isNotBlank()) {
-                        cleanTitle = directMeta.officialTitle
-                    }
-                    if (bestThumbnail.isBlank() || bestThumbnail.contains("drive.google.com")) {
-                        if (directMeta.thumbnailUrl.isNotBlank()) {
-                            bestThumbnail = directMeta.thumbnailUrl
-                        }
-                    }
-                }
-            }
-
-            if (cleanTitle.isBlank()) {
-                cleanTitle = if (actualSeason == 5 && actualEpisode == 1) "The Crimson Ticket" else (matchedEpisode?.displayTitle?.ifBlank { "Episode $actualEpisode" } ?: "Episode $actualEpisode")
-            }
-
-            if (bestThumbnail.isBlank() || bestThumbnail.contains("drive.google.com")) {
-                if (actualSeason == 5 && actualEpisode == 1) {
-                    bestThumbnail = "https://static.tvmaze.com/uploads/images/original_untouched/184/462089.jpg"
-                }
-            }
 
             val epCode = "S${actualSeason.toString().padStart(2, '0')}:E${actualEpisode.toString().padStart(2, '0')}"
-
-            val effectiveDuration = if (lastWatched.durationMs > 0L) lastWatched.durationMs else matchedEpisode?.durationMs ?: 0L
+            val effectiveDuration = when {
+                matchedEpisode != null && matchedEpisode.durationMs > 0L -> matchedEpisode.durationMs
+                else -> base.durationMs
+            }
             val fraction = if (effectiveDuration > 0L) {
-                (lastWatched.positionMs.toFloat() / effectiveDuration.toFloat()).coerceIn(0f, 1f)
+                (base.currentPositionMs.toFloat() / effectiveDuration.toFloat()).coerceIn(0f, 1f)
             } else {
-                lastWatched.progressFraction.coerceIn(0f, 1f)
+                base.progressFraction.coerceIn(0f, 1f)
             }
 
-            val resolvedItem = ContinueWatchingItem(
-                mediaId = matchedEpisode?.id ?: lastWatched.mediaId,
-                seriesId = series?.id ?: lastWatched.seriesId,
+            return ContinueWatchingDisplayData(
+                mediaId = base.mediaId,
+                seriesId = parentSeries?.id ?: base.seriesId,
                 isSeries = true,
-                seriesTitle = seriesTitle,
+                displayHeader = resolvedSeriesTitle,
+                displayTitle = "$epCode • $cleanEpTitle",
+                displayThumbnailUrl = officialArt,
+                progressFraction = fraction,
+                currentPositionMs = base.currentPositionMs,
+                durationMs = effectiveDuration,
+                seriesTitle = resolvedSeriesTitle,
                 seasonNumber = actualSeason,
                 episodeNumber = actualEpisode,
-                episodeTitle = cleanTitle,
-                displaySubtitle = "$epCode • $cleanTitle",
-                thumbnailUrl = bestThumbnail,
-                progressFraction = fraction,
-                currentPositionMs = lastWatched.positionMs,
-                durationMs = effectiveDuration,
-                lastWatchedTimestamp = lastWatched.lastWatchedTimestamp
+                episodeTitle = cleanEpTitle
             )
-            Log.d("VideoViewModel", "resolvedContinueWatching EMIT: ${resolvedItem.seriesTitle} | ${resolvedItem.displaySubtitle} | thumb=${resolvedItem.thumbnailUrl}")
-            return@combine resolvedItem
         } else {
-            // Movie Handling
-            val normMovieTitle = com.clotube.app.data.WatchlistManager.normalizeTitle(lastWatched.title)
-            val movie = allMovies.firstOrNull { it.id == lastWatched.mediaId || it.id == lastWatched.fileId }
+            val rawMovieTitle = base.displayHeader.ifBlank { base.episodeTitle }.ifBlank { "Movie" }
+            val normMovieTitle = WatchlistManager.normalizeTitle(rawMovieTitle)
+            val matchedMovie = allMovies.firstOrNull { it.id == base.mediaId }
                 ?: allMovies.firstOrNull {
-                    normMovieTitle.isNotBlank() &&
-                        com.clotube.app.data.WatchlistManager.normalizeTitle(it.title) == normMovieTitle
+                    normMovieTitle.isNotBlank() && WatchlistManager.normalizeTitle(it.title) == normMovieTitle
                 }
-            if (movie != null) {
-                val fraction = if (movie.durationMs > 0L) (lastWatched.positionMs.toFloat() / movie.durationMs.toFloat()).coerceIn(0f, 1f) else lastWatched.progressFraction
-                val resolvedItem = ContinueWatchingItem(
-                    mediaId = movie.id,
+
+            val cleanTitle = matchedMovie?.title?.takeIf { it.isNotBlank() }
+                ?: DriveRepository.cleanVideoTitle(rawMovieTitle)
+            val cachedMeta = OnlineMetadataResolver.getCachedMovieMetadata(app, base.mediaId)
+                ?: OnlineMetadataResolver.getCachedMovieMetadata(app, cleanTitle)
+            val officialTitle = cachedMeta?.officialTitle?.takeIf { it.isNotBlank() } ?: cleanTitle
+
+            val officialArt = pickNonDriveArtwork(
+                cachedMeta?.posterUrl,
+                matchedMovie?.thumbnailUrl,
+                base.displayThumbnailUrl,
+                existingHeroArtwork
+            )
+            val effectiveDuration = when {
+                matchedMovie != null && matchedMovie.durationMs > 0L -> matchedMovie.durationMs
+                else -> base.durationMs
+            }
+            val fraction = if (effectiveDuration > 0L) {
+                (base.currentPositionMs.toFloat() / effectiveDuration.toFloat()).coerceIn(0f, 1f)
+            } else {
+                base.progressFraction.coerceIn(0f, 1f)
+            }
+
+            return ContinueWatchingDisplayData(
+                mediaId = base.mediaId,
+                seriesId = null,
+                isSeries = false,
+                displayHeader = officialTitle,
+                displayTitle = "Movie • Cinema",
+                displayThumbnailUrl = officialArt,
+                progressFraction = fraction,
+                currentPositionMs = base.currentPositionMs,
+                durationMs = effectiveDuration,
+                seriesTitle = officialTitle,
+                seasonNumber = 0,
+                episodeNumber = 0,
+                episodeTitle = officialTitle
+            )
+        }
+    }
+
+    private fun triggerCwBackgroundEnrichment(item: ContinueWatchingDisplayData) {
+        val needsSeriesEnrichment = item.isSeries && (
+            item.displayThumbnailUrl.isBlank() ||
+                OnlineMetadataResolver.isDriveVideoFrameUrl(item.displayThumbnailUrl) ||
+                item.episodeTitle.startsWith("Episode", ignoreCase = true)
+            )
+        val needsMovieEnrichment = !item.isSeries && (
+            item.displayThumbnailUrl.isBlank() ||
+                OnlineMetadataResolver.needsRevalidation(item.displayHeader, item.displayThumbnailUrl)
+            )
+        if (!needsSeriesEnrichment && !needsMovieEnrichment) return
+
+        if (cwEnrichmentJob?.isActive == true && cwEnrichmentMediaId == item.mediaId) {
+            return
+        }
+        cwEnrichmentJob?.cancel()
+        cwEnrichmentMediaId = item.mediaId
+        cwEnrichmentJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val app = getApplication<Application>()
+                if (item.isSeries) {
+                    val seriesName = item.seriesTitle.ifBlank { item.displayHeader }
+                    val cleanShowTitle = DriveRepository.cleanSeriesTitle(seriesName)
+                    val sNum = item.seasonNumber.coerceAtLeast(1)
+                    val eNum = item.episodeNumber.coerceAtLeast(1)
+                    val seriesMeta = OnlineMetadataResolver.resolveSeries(cleanShowTitle)
+                    val officialShowTitle = seriesMeta.officialTitle.ifBlank { cleanShowTitle }
+                    val epMeta = OnlineMetadataResolver.resolveEpisode(
+                        seriesName = officialShowTitle,
+                        tvMazeSeriesId = seriesMeta.tvMazeId,
+                        seasonNumber = sNum,
+                        episodeNumber = eNum,
+                        rawFileName = item.episodeTitle
+                    )
+                    val directEpMeta = if (epMeta.thumbnailUrl.isBlank() || OnlineMetadataResolver.isDriveVideoFrameUrl(epMeta.thumbnailUrl)) {
+                        OnlineMetadataResolver.resolveEpisodeMetadata(
+                            seriesName = officialShowTitle,
+                            seasonNumber = sNum,
+                            episodeNumber = eNum
+                        )
+                    } else null
+
+                    val normSeries = WatchlistManager.normalizeTitle(officialShowTitle)
+                    val resolvedEpTitle = epMeta.officialTitle.takeIf { it.isNotBlank() && !it.startsWith("Episode", ignoreCase = true) }
+                        ?: directEpMeta?.officialTitle?.takeIf { it.isNotBlank() }
+                        ?: item.episodeTitle
+                    val resolvedArt = pickNonDriveArtwork(
+                        epMeta.thumbnailUrl,
+                        directEpMeta?.thumbnailUrl,
+                        seriesMeta.posterUrl,
+                        item.displayThumbnailUrl
+                    )
+
+                    if (resolvedArt.isNotBlank()) {
+                        MetadataDiskCache.put(
+                            app,
+                            com.clotube.app.data.CachedMetadataRecord(
+                                cacheKey = "ep_${normSeries}_s${sNum}e${eNum}",
+                                title = resolvedEpTitle,
+                                stillUrl = resolvedArt,
+                                posterUrl = resolvedArt
+                            )
+                        )
+                    }
+                    metadataRevision.value = maxOf(metadataRevision.value + 1L, System.nanoTime())
+                } else {
+                    val cleanTitle = DriveRepository.cleanVideoTitle(item.displayHeader.ifBlank { item.episodeTitle })
+                    val meta = OnlineMetadataResolver.resolveMovie(cleanTitle)
+                    val artwork = MediaArtworkResolver.resolveMovieArtwork(cleanTitle, null)
+                    val resolvedArt = pickNonDriveArtwork(
+                        meta.posterUrl,
+                        artwork.posterUrl,
+                        artwork.backdropUrl,
+                        item.displayThumbnailUrl
+                    )
+                    if (resolvedArt.isNotBlank()) {
+                        MetadataDiskCache.put(
+                            app,
+                            com.clotube.app.data.CachedMetadataRecord(
+                                cacheKey = "movie_${WatchlistManager.normalizeTitle(cleanTitle)}",
+                                title = meta.officialTitle.ifBlank { cleanTitle },
+                                posterUrl = resolvedArt,
+                                backdropUrl = artwork.backdropUrl.orEmpty(),
+                                year = meta.releaseYear,
+                                genre = meta.genre,
+                                language = meta.originalLanguage,
+                                originalLanguage = meta.originalLanguage
+                            )
+                        )
+                    }
+                    metadataRevision.value = maxOf(metadataRevision.value + 1L, System.nanoTime())
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "CW background enrichment skipped for ${item.mediaId}: ${e.message}")
+            }
+        }
+    }
+
+    private suspend fun reconcileHeroSlotState() = heroReconcileMutex.withLock {
+        val app = getApplication<Application>()
+        val entries = AndroidWatchHistoryManager.snapshotEntries()
+        val archivedIds = AndroidWatchHistoryManager.snapshotArchivedIds()
+        val archivedItems = AndroidWatchHistoryManager.snapshotArchivedItems()
+        val allSeries = _seriesState.value
+        val allMovies = _moviesList.value.ifEmpty { _moviesState.value.map { it.toMovie() } }
+
+        val currentHero = _heroSlotState.value
+        val currentHeroCw = (currentHero as? HeroSlotState.ContinueWatching)?.item
+
+        val ramCandidate = selectTopInProgressFromRam(
+            entries = entries,
+            archivedIds = archivedIds,
+            archivedItems = archivedItems,
+            activeHeroMediaId = currentHeroCw?.mediaId
+        )
+
+        if (ramCandidate != null) {
+            val baseItem = if (ramCandidate.isSeries) {
+                val sNum = ramCandidate.seasonNumber.coerceAtLeast(1)
+                val eNum = ramCandidate.episodeNumber.coerceAtLeast(1)
+                val sTitle = ramCandidate.seriesTitle?.ifBlank { null } ?: "TV Series"
+                val epCode = "S${sNum.toString().padStart(2, '0')}:E${eNum.toString().padStart(2, '0')}"
+                ContinueWatchingDisplayData(
+                    mediaId = ramCandidate.mediaId,
+                    seriesId = ramCandidate.seriesId,
+                    isSeries = true,
+                    displayHeader = sTitle,
+                    displayTitle = "$epCode • ${ramCandidate.title}",
+                    displayThumbnailUrl = pickNonDriveArtwork(ramCandidate.thumbnailUrl),
+                    progressFraction = ramCandidate.progressFraction,
+                    currentPositionMs = ramCandidate.positionMs,
+                    durationMs = ramCandidate.durationMs,
+                    seriesTitle = sTitle,
+                    seasonNumber = sNum,
+                    episodeNumber = eNum,
+                    episodeTitle = ramCandidate.title
+                )
+            } else {
+                val mTitle = ramCandidate.title.ifBlank { "Movie" }
+                ContinueWatchingDisplayData(
+                    mediaId = ramCandidate.mediaId,
                     seriesId = null,
                     isSeries = false,
-                    seriesTitle = movie.title,
+                    displayHeader = mTitle,
+                    displayTitle = "Movie • Cinema",
+                    displayThumbnailUrl = pickNonDriveArtwork(ramCandidate.thumbnailUrl),
+                    progressFraction = ramCandidate.progressFraction,
+                    currentPositionMs = ramCandidate.positionMs,
+                    durationMs = ramCandidate.durationMs,
+                    seriesTitle = mTitle,
                     seasonNumber = 0,
                     episodeNumber = 0,
-                    episodeTitle = movie.title,
-                    displaySubtitle = "Movie • Cinema",
-                    thumbnailUrl = movie.thumbnailUrl.orEmpty(),
-                    progressFraction = fraction,
-                    currentPositionMs = lastWatched.positionMs,
-                    durationMs = movie.durationMs,
-                    lastWatchedTimestamp = lastWatched.lastWatchedTimestamp
+                    episodeTitle = mTitle
                 )
-                Log.d("VideoViewModel", "resolvedContinueWatching EMIT: ${resolvedItem.seriesTitle} | ${resolvedItem.displaySubtitle} | thumb=${resolvedItem.thumbnailUrl}")
-                return@combine resolvedItem
+            }
+
+            val existingSameIdArt = currentHeroCw?.takeIf { it.mediaId == baseItem.mediaId }?.displayThumbnailUrl
+            val enrichedItem = enrichDisplayDataLocally(
+                base = baseItem,
+                allSeries = allSeries,
+                allMovies = allMovies,
+                existingHeroArtwork = existingSameIdArt
+            )
+
+            hasConfirmedEmptyHistoryLatch.set(false)
+            hasResolvedContinueWatchingLatch.set(true)
+            _heroSlotState.value = HeroSlotState.ContinueWatching(enrichedItem)
+
+            val activeEmail = ContinueWatchingSnapshotStore.resolveActiveProfileEmail(app)
+            val prevSnap = ContinueWatchingSnapshotStore.loadSnapshot(app, activeEmail)
+            val prevItem = prevSnap.item
+            val metadataOrProgressImproved = prevItem == null ||
+                prevItem.mediaId != enrichedItem.mediaId ||
+                prevItem.currentPositionMs != enrichedItem.currentPositionMs ||
+                prevItem.durationMs != enrichedItem.durationMs ||
+                prevItem.displayHeader != enrichedItem.displayHeader ||
+                prevItem.displayTitle != enrichedItem.displayTitle ||
+                (enrichedItem.displayThumbnailUrl.isNotBlank() && enrichedItem.displayThumbnailUrl != prevItem.displayThumbnailUrl)
+
+            if (metadataOrProgressImproved) {
+                ContinueWatchingSnapshotStore.saveSnapshot(
+                    context = app,
+                    profileEmail = activeEmail,
+                    item = enrichedItem,
+                    updatedAt = maxOf(ramCandidate.timestamp, prevSnap.updatedAt)
+                )
+            }
+
+            triggerCwBackgroundEnrichment(enrichedItem)
+            return@withLock
+        }
+
+        // No in-progress candidate in RAM: enforce monotonic latch rules
+        if (hasResolvedContinueWatchingLatch.get()) {
+            // Keep existing ContinueWatching snapshot hydrated in-place; enrich if catalog improved
+            if (currentHeroCw != null) {
+                val enrichedSnapshot = enrichDisplayDataLocally(
+                    base = currentHeroCw,
+                    allSeries = allSeries,
+                    allMovies = allMovies,
+                    existingHeroArtwork = currentHeroCw.displayThumbnailUrl
+                )
+                if (enrichedSnapshot != currentHeroCw) {
+                    _heroSlotState.value = HeroSlotState.ContinueWatching(enrichedSnapshot)
+                    val activeEmail = ContinueWatchingSnapshotStore.resolveActiveProfileEmail(app)
+                    val prevSnap = ContinueWatchingSnapshotStore.loadSnapshot(app, activeEmail)
+                    if (prevSnap.item != null && prevSnap.item.mediaId == enrichedSnapshot.mediaId) {
+                        ContinueWatchingSnapshotStore.saveSnapshot(
+                            context = app,
+                            profileEmail = activeEmail,
+                            item = enrichedSnapshot,
+                            updatedAt = prevSnap.updatedAt
+                        )
+                    }
+                }
+                triggerCwBackgroundEnrichment(enrichedSnapshot)
+            }
+            return@withLock
+        }
+
+        if (hasConfirmedEmptyHistoryLatch.get()) {
+            val firstMovie = allMovies.firstOrNull()
+            if (firstMovie != null) {
+                val currentFallback = (currentHero as? HeroSlotState.FeaturedFallback)?.movie
+                val targetMovie = if (currentFallback != null) {
+                    val refreshed = allMovies.firstOrNull { it.id == currentFallback.id } ?: firstMovie
+                    if (pickNonDriveArtwork(refreshed.thumbnailUrl).isBlank() && pickNonDriveArtwork(currentFallback.thumbnailUrl).isNotBlank()) {
+                        refreshed.copy(thumbnailUrl = currentFallback.thumbnailUrl)
+                    } else {
+                        refreshed
+                    }
+                } else {
+                    firstMovie
+                }
+                _heroSlotState.value = HeroSlotState.FeaturedFallback(targetMovie)
+            } else {
+                _heroSlotState.value = HeroSlotState.Resolving
+            }
+        } else {
+            _heroSlotState.value = HeroSlotState.Resolving
+        }
+    }
+
+    private fun observeHeroSlotReconciliation() {
+        viewModelScope.launch(Dispatchers.IO) {
+            driveWatchHistorySync.lastSyncOutcome.collect { outcome ->
+                if (outcome.succeeded) {
+                    if (outcome.confirmedEmpty) {
+                        if (outcome.remoteWasNewer) {
+                            hasResolvedContinueWatchingLatch.set(false)
+                        }
+                        hasConfirmedEmptyHistoryLatch.set(true)
+                    } else {
+                        hasConfirmedEmptyHistoryLatch.set(false)
+                    }
+                    reconcileHeroSlotState()
+                }
             }
         }
 
-        null
-    }.stateIn(viewModelScope, SharingStarted.Eagerly, null)
+        viewModelScope.launch(Dispatchers.IO) {
+            AndroidWatchHistoryManager.localMutationClearedInProgressRevision.collect { rev ->
+                if (rev > 0L) {
+                    hasResolvedContinueWatchingLatch.set(false)
+                    hasConfirmedEmptyHistoryLatch.set(true)
+                    reconcileHeroSlotState()
+                }
+            }
+        }
+
+        viewModelScope.launch(Dispatchers.IO) {
+            diskHydrationJob?.join()
+            combine(
+                AndroidWatchHistoryManager.stateRevision,
+                _moviesState,
+                _seriesState,
+                metadataRevision
+            ) { rev, movies, series, metaRev ->
+                arrayOf(rev, movies.size, series.size, metaRev)
+            }.collect {
+                reconcileHeroSlotState()
+            }
+        }
+    }
 
     fun dismissContinueWatching(mediaId: String? = null) {
         val targetId = mediaId
-            ?: resolvedContinueWatching.value?.mediaId
-            ?: continueWatchingState.value?.episode?.id
+            ?: (_heroSlotState.value as? HeroSlotState.ContinueWatching)?.item?.mediaId
             ?: _uiState.value.lastWatchedMedia?.fileId
         if (targetId != null) {
             deleteHistoryItem(targetId)
         }
     }
-
-    fun clearContinueWatching() {
-        dismissContinueWatching()
-    }
-
-    val currentUserAccount: StateFlow<GoogleSignInAccount?> = authRepository.currentAccount
-
-    val continueWatchingItem: StateFlow<ContinueWatchingItem?> = playbackHistoryManager
-        .getContinueWatchingMedia()
-        .stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(5000),
-            initialValue = null
-        )
-
-    val continueWatchingList: StateFlow<List<ContinueWatchingItem>> = combine(
-        playbackHistoryManager.allHistory,
-        moviesList,
-        seriesList
-    ) { _, movies, series ->
-        playbackHistoryManager.getAllContinueWatchingItems(movies, series)
-    }.stateIn(
-        scope = viewModelScope,
-        started = SharingStarted.WhileSubscribed(5000),
-        initialValue = emptyList()
-    )
 
     // ========================================================
     // HYBRID GLOBAL SEARCH (DRIVE + TMDB + CINEMETA / IMDB)
@@ -1490,16 +1683,6 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         started = SharingStarted.WhileSubscribed(5000),
         initialValue = emptyList()
     )
-
-    fun removeFromContinueWatching(item: ContinueWatchingItem) {
-        viewModelScope.launch(Dispatchers.IO) {
-            playbackHistoryManager.removeContinueWatchingItem(
-                context = getApplication(),
-                mediaId = item.mediaId,
-                seriesId = item.seriesId
-            )
-        }
-    }
 
     suspend fun getLastWatchedEpisode(series: com.clotube.app.model.Series): com.clotube.app.model.Episode? {
         return playbackHistoryManager.getLastWatchedEpisode(series)
@@ -1658,10 +1841,24 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
     private fun hydrateFromDiskCacheImmediately(): Job {
         return viewModelScope.launch(Dispatchers.IO) {
             try {
-                // Ensure profile cache directory is loaded before reading cached catalog
-                ProfileManager.ensureLoaded(getApplication())
+                val app = getApplication<Application>()
+                // Cold-Start Frame-1 Order: load profile, metadata disk cache, local archive store, and local CW snapshot first
+                ProfileManager.ensureLoaded(app)
+                MetadataDiskCache.ensureLoaded(app)
+                WatchlistManager.ensureLoaded(app)
+                AndroidWatchHistoryManager.ensureArchiveLoaded(app)
+
+                val activeEmail = ContinueWatchingSnapshotStore.resolveActiveProfileEmail(app)
+                val snapshot = ContinueWatchingSnapshotStore.loadSnapshot(app, activeEmail)
+
+                if (snapshot.item != null) {
+                    hasConfirmedEmptyHistoryLatch.set(false)
+                    hasResolvedContinueWatchingLatch.set(true)
+                    _heroSlotState.value = HeroSlotState.ContinueWatching(snapshot.item)
+                }
+
                 val cached = catalogCacheManager.getCachedCatalog()
-                val diskSeries = loadCatalogFromDisk(getApplication())
+                val diskSeries = loadCatalogFromDisk(app)
                 val combinedSeries = if (diskSeries.isNotEmpty()) {
                     val diskMap = diskSeries.associateBy { it.id }
                     val mergedFromCache = cached.series.map { s ->
@@ -1681,7 +1878,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                         val cleanTitle = when {
                             movie.displayTitle.equals("My People, My Homeland", ignoreCase = true) -> "The Vast of Night"
                             movie.displayTitle.contains("uindex", ignoreCase = true) || movie.displayTitle.startsWith("www", ignoreCase = true) -> {
-                                val (q, _) = com.clotube.app.data.metadata.OnlineMetadataResolver.extractMovieQueryAndYear(movie.displayTitle)
+                                val (q, _) = OnlineMetadataResolver.extractMovieQueryAndYear(movie.displayTitle)
                                 if (q.isNotBlank()) q else movie.displayTitle
                             }
                             else -> movie.displayTitle
@@ -1706,8 +1903,8 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                                 effectiveIndustry = folderClass.sectionLabel
                                 effectiveFolderClass = true
                             } else {
-                                val cachedMeta = com.clotube.app.data.metadata.OnlineMetadataResolver.getCachedMovieMetadata(getApplication(), cleanTitle.ifBlank { movie.title })
-                                    ?: com.clotube.app.data.metadata.OnlineMetadataResolver.getCachedMovieMetadata(getApplication(), movie.id)
+                                val cachedMeta = OnlineMetadataResolver.getCachedMovieMetadata(app, cleanTitle.ifBlank { movie.title })
+                                    ?: OnlineMetadataResolver.getCachedMovieMetadata(app, movie.id)
                                 val detected = cachedMeta?.originalLanguage?.takeIf { it.isNotBlank() }
                                     ?: MovieIndustryResolver.extractLanguageFromFileName(cleanTitle)
                                     ?: MovieIndustryResolver.extractLanguageFromFileName(movie.title)
@@ -1752,8 +1949,13 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                     _seriesState.value = mappedSeries
                     _isInitialLoading.value = false
 
-                    val hero = mappedMovies.firstOrNull()
-                    val heroShow = mappedSeries.firstOrNull()
+                    if (snapshot.item == null && snapshot.confirmedEmpty) {
+                        hasConfirmedEmptyHistoryLatch.set(true)
+                        val firstMovie = mappedDomainMovies.firstOrNull()
+                        if (firstMovie != null) {
+                            _heroSlotState.value = HeroSlotState.FeaturedFallback(firstMovie)
+                        }
+                    }
 
                     _uiState.update { current ->
                         current.copy(
@@ -1762,18 +1964,19 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                             moviesList = mappedMovies,
                             filteredVideos = applyFilterAndSearch(mappedMovies, current.selectedFilter, current.searchQuery),
                             tvSeriesList = mappedSeries,
-                            heroItem = hero,
-                            heroSeries = heroShow,
                             isInitialLoading = false,
                             isLoading = false
                         )
                     }
-                    android.util.Log.d(TAG, "Frame-1 disk cache hydrated: ${mappedMovies.size} movies, ${mappedSeries.size} series")
+                    Log.d(TAG, "Frame-1 disk cache hydrated: ${mappedMovies.size} movies, ${mappedSeries.size} series, snapshot=${snapshot.item?.mediaId ?: if (snapshot.confirmedEmpty) "confirmedEmpty" else "none"}")
                 } else {
-                    android.util.Log.d(TAG, "Disk cache is empty; awaiting first streaming packet from Drive")
+                    if (snapshot.item == null && snapshot.confirmedEmpty) {
+                        hasConfirmedEmptyHistoryLatch.set(true)
+                    }
+                    Log.d(TAG, "Disk cache is empty; awaiting first streaming packet from Drive")
                 }
             } catch (e: Exception) {
-                android.util.Log.e(TAG, "Failed hydrating disk cache: ${e.message}", e)
+                Log.e(TAG, "Failed hydrating disk cache: ${e.message}", e)
                 val hasAnyContent = _moviesState.value.isNotEmpty() || _seriesState.value.isNotEmpty()
                 _isInitialLoading.value = !hasAnyContent
                 _uiState.update { it.copy(isInitialLoading = !hasAnyContent) }
@@ -1783,7 +1986,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         // Cold-Start Profile Cache Order: Ensure ProfileManager is loaded BEFORE disk hydration
-        // so cached catalogs under files/profiles/<email>/cached_catalog.json load on Frame 1
+        // so cached catalogs and cw_hero_snapshot.json under files/profiles/<email>/ load on Frame 1
         ProfileManager.ensureLoadedSync(getApplication())
         diskHydrationJob = hydrateFromDiskCacheImmediately()
 
@@ -1831,6 +2034,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
         observePlaybackHistory()
+        observeHeroSlotReconciliation()
         initOfflineCatalog()
         initStaleWhileRevalidateFlow()
     }
@@ -1852,7 +2056,9 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                     _moviesState.value = emptyList()
                     _moviesList.value = emptyList()
                     _seriesState.value = emptyList()
-                    _stage1LastWatched.value = null
+                    hasResolvedContinueWatchingLatch.set(false)
+                    hasConfirmedEmptyHistoryLatch.set(false)
+                    _heroSlotState.value = HeroSlotState.Resolving
                     _isInitialLoading.value = false
                     _uiState.update {
                         it.copy(
@@ -1979,7 +2185,9 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             _moviesState.value = emptyList()
             _moviesList.value = emptyList()
             _seriesState.value = emptyList()
-            _stage1LastWatched.value = null
+            hasResolvedContinueWatchingLatch.set(false)
+            hasConfirmedEmptyHistoryLatch.set(false)
+            _heroSlotState.value = HeroSlotState.Resolving
             _isInitialLoading.value = false
             _uiState.update {
                 it.copy(
@@ -1989,8 +2197,6 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                     moviesList = emptyList(),
                     filteredVideos = emptyList(),
                     tvSeriesList = emptyList(),
-                    heroItem = null,
-                    heroSeries = null,
                     isInitialLoading = false,
                     isLoading = false
                 )
@@ -2004,6 +2210,9 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
 
     fun onSignInSuccess(account: GoogleSignInAccount) {
         authRepository.setCurrentAccount(account)
+        hasResolvedContinueWatchingLatch.set(false)
+        hasConfirmedEmptyHistoryLatch.set(false)
+        _heroSlotState.value = HeroSlotState.Resolving
         _isInitialLoading.value = true
         _uiState.update {
             it.copy(
@@ -2024,6 +2233,13 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                 displayName = account.displayName.orEmpty(),
                 photoUrl = account.photoUrl?.toString()
             )
+            val snap = ContinueWatchingSnapshotStore.loadSnapshot(getApplication(), account.email)
+            if (snap.item != null) {
+                hasResolvedContinueWatchingLatch.set(true)
+                _heroSlotState.value = HeroSlotState.ContinueWatching(snap.item)
+            } else if (snap.confirmedEmpty) {
+                hasConfirmedEmptyHistoryLatch.set(true)
+            }
             playbackHistoryManager.syncFromCloud()
             DriveWatchlistSync.getInstance(getApplication()).invalidateCache()
             WatchlistManager.reloadProfile(getApplication(), account.email)
@@ -2042,24 +2258,38 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             CatalogCacheManager.clearInMemoryCache()
             folderManager.resetSessionCache()
             driveWatchHistorySync.invalidateCache()
+            AndroidWatchHistoryManager.clearInMemory(getApplication())
             DriveWatchlistSync.getInstance(getApplication()).invalidateCache()
             WatchlistManager.reloadProfile(getApplication(), email)
             com.clotube.app.data.SearchHistoryManager.ensureLoaded(getApplication())
             DriveWatchlistSync.getInstance(getApplication()).pullFromCloud(force = true)
 
+            hasResolvedContinueWatchingLatch.set(false)
+            hasConfirmedEmptyHistoryLatch.set(false)
+            _heroSlotState.value = HeroSlotState.Resolving
+
             withContext(Dispatchers.Main) {
-                _stage1LastWatched.value = null
+                _moviesState.value = emptyList()
+                _moviesList.value = emptyList()
+                _seriesState.value = emptyList()
                 _isInitialLoading.value = true
                 _uiState.update { current ->
                     current.copy(
                         userEmail = switched?.email ?: email,
                         userName = switched?.displayName ?: current.userName,
                         userAvatarUrl = switched?.photoUrl ?: current.userAvatarUrl,
+                        videos = emptyList(),
+                        movies = emptyList(),
+                        moviesList = emptyList(),
+                        filteredVideos = emptyList(),
+                        tvSeriesList = emptyList(),
                         isLoading = true,
                         isInitialLoading = true
                     )
                 }
             }
+            diskHydrationJob = hydrateFromDiskCacheImmediately()
+            driveWatchHistorySync.pullAndMerge(getApplication(), force = true)
             initStaleWhileRevalidateFlow()
         }
     }
@@ -2158,6 +2388,14 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                         displayName = session.userName,
                         photoUrl = session.userAvatarUrl
                     )
+                    val snap = ContinueWatchingSnapshotStore.loadSnapshot(getApplication(), session.userEmail)
+                    if (snap.item != null) {
+                        hasResolvedContinueWatchingLatch.set(true)
+                        _heroSlotState.value = HeroSlotState.ContinueWatching(snap.item)
+                    } else if (snap.confirmedEmpty) {
+                        hasConfirmedEmptyHistoryLatch.set(true)
+                    }
+                    playbackHistoryManager.syncFromCloud()
                 }
                 checkFolderOnboarding()
             }.onFailure { error ->
@@ -2179,6 +2417,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         authRepository.signOut {
             folderManager.resetSessionCache()
             driveWatchHistorySync.invalidateCache()
+            AndroidWatchHistoryManager.clearInMemory(getApplication())
             DriveWatchlistSync.getInstance(getApplication()).invalidateCache()
             WatchlistManager.clearAll(getApplication())
             viewModelScope.launch {
@@ -2187,7 +2426,9 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             _moviesState.value = emptyList()
             _moviesList.value = emptyList()
             _seriesState.value = emptyList()
-            _stage1LastWatched.value = null
+            hasResolvedContinueWatchingLatch.set(false)
+            hasConfirmedEmptyHistoryLatch.set(false)
+            _heroSlotState.value = HeroSlotState.Resolving
             _isInitialLoading.value = false
             _uiState.update {
                 it.copy(
@@ -2201,8 +2442,6 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                     moviesList = emptyList(),
                     filteredVideos = emptyList(),
                     tvSeriesList = emptyList(),
-                    heroItem = null,
-                    heroSeries = null,
                     selectedVideoForInspection = null,
                     errorMessage = null,
                     showFolderOnboardingDialog = false,
@@ -2269,9 +2508,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                             movies = emptyList(),
                             moviesList = emptyList(),
                             filteredVideos = emptyList(),
-                            tvSeriesList = emptyList(),
-                            heroItem = null,
-                            heroSeries = null
+                            tvSeriesList = emptyList()
                         )
                     }
                 }
@@ -2457,18 +2694,15 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             _seriesState.value = enrichedSeries
 
             _uiState.update { current ->
-                val hero = current.heroItem ?: mappedMovies.firstOrNull()
-                val heroShow = current.heroSeries ?: enrichedSeries.firstOrNull()
                 current.copy(
                     videos = mappedMovies,
                     movies = mappedDomainMovies,
                     moviesList = mappedMovies,
                     filteredVideos = applyFilterAndSearch(mappedMovies, current.selectedFilter, current.searchQuery),
-                    tvSeriesList = enrichedSeries,
-                    heroItem = hero,
-                    heroSeries = heroShow
+                    tvSeriesList = enrichedSeries
                 )
             }
+            metadataRevision.value = maxOf(metadataRevision.value + 1L, System.nanoTime())
 
             // Persist the enriched catalog back to CatalogCacheManager
             catalogCacheManager.saveCatalog(mappedMovies, enrichedSeries)
@@ -2614,16 +2848,21 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         val existingMap = existingList.associateBy { it.id }
         val mergedFresh = freshChunk.map { fresh ->
             val existing = existingMap[fresh.id]
-            val cachedRecord = MetadataDiskCache.get("series:${fresh.title.trim().lowercase()}")
+            val normTitle = WatchlistManager.normalizeTitle(fresh.title)
+            val cachedRecord = MetadataDiskCache.get("series_$normTitle")
+                ?: MetadataDiskCache.get("series:${fresh.title.trim().lowercase()}")
             val bestPoster = pickBestSeriesArtwork(
-                fresh.posterUrl,
-                fresh.backdropUrl,
-                fresh.thumbnailUrl,
                 existing?.posterUrl,
-                existing?.backdropUrl,
                 existing?.thumbnailUrl,
-                cachedRecord?.posterUrl,
-                cachedRecord?.backdropUrl
+                fresh.posterUrl,
+                fresh.thumbnailUrl,
+                cachedRecord?.posterUrl
+            )
+            val bestBackdrop = pickBestSeriesArtwork(
+                existing?.backdropUrl,
+                fresh.backdropUrl,
+                cachedRecord?.backdropUrl,
+                bestPoster
             )
             val updatedSeasons = if (existing != null && existing.seasons.isNotEmpty() && fresh.seasons.isEmpty()) {
                 existing.seasons
@@ -2636,9 +2875,11 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                 fresh.totalSeasonsFormatted
             }
             fresh.copy(
+                title = existing?.title?.takeIf { it.isNotBlank() } ?: fresh.title,
+                genreFormatted = existing?.genreFormatted?.takeIf { it.isNotBlank() && it != "TV Series" } ?: fresh.genreFormatted,
                 posterUrl = bestPoster,
-                backdropUrl = bestPoster.ifBlank { null },
-                thumbnailUrl = bestPoster,
+                backdropUrl = bestBackdrop.ifBlank { null },
+                thumbnailUrl = bestPoster.ifBlank { bestBackdrop },
                 seasons = updatedSeasons,
                 totalSeasonsFormatted = totalSeasons
             )
@@ -2687,7 +2928,16 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
      * re-caches catalog, and updates UI state.
      */
     fun refreshAppFreshBoot() {
+        _isRefreshing.value = true
         refreshCatalog(forceSync = true)
+        val activeJob = catalogLoadingJob
+        if (activeJob != null) {
+            activeJob.invokeOnCompletion {
+                _isRefreshing.value = false
+            }
+        } else {
+            _isRefreshing.value = false
+        }
     }
 
     suspend fun refreshSingleSeries(seriesFolderId: String, seriesTitleHint: String? = null): TvSeries? = withContext(Dispatchers.IO) {
@@ -2707,183 +2957,36 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         updated
     }
 
-    /**
-     * Stage-1 Priority Fetcher for Last Watched Item:
-     * Concurrently pulls clotube/History/clotube_active_sync.json (falling back if needed) via DriveWatchHistorySync,
-     * identifies the most recently watched entry, and resolves its metadata (clean title, poster, backdrop, episode still)
-     * before Frame 1 rendering.
-     * Reuses enriched Movie or TvSeries if already present in priority lists.
-     */
-    suspend fun resolveLastWatchedItemEnriched(
-        driveService: Drive?,
-        priorityMoviesDeferred: Deferred<List<Movie>>,
-        prioritySeriesDeferred: Deferred<List<TvSeries>>
-    ): ContinueWatchingDisplayData? = withContext(Dispatchers.IO) {
-        try {
-            try {
-                withTimeoutOrNull(4_000L) {
-                    driveWatchHistorySync.syncFromCloud(force = true)
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Watch history cloud sync timed out/failed in Stage 1: ${e.message}")
-            }
-
-            val lastWatched = playbackHistoryManager.getLastWatchedMedia().firstOrNull()
-            if (lastWatched == null || lastWatched.isWatched || lastWatched.progressFraction >= 0.95f) {
-                return@withContext null
-            }
-
-            val isSeriesItem = lastWatched.isSeries || !lastWatched.seriesId.isNullOrBlank()
-
-            if (isSeriesItem) {
-                val targetSeriesId = lastWatched.seriesId.orEmpty()
-                val prioritySeries = prioritySeriesDeferred.await()
-                val matchingSeries = prioritySeries.firstOrNull { it.id == targetSeriesId }
-
-                val showTitle: String
-                val showPoster: String
-                val showBackdrop: String?
-
-                if (matchingSeries != null) {
-                    showTitle = matchingSeries.title
-                    showPoster = matchingSeries.posterUrl.orEmpty()
-                    showBackdrop = matchingSeries.backdropUrl
-                } else {
-                    val seriesFolder = if (targetSeriesId.isNotBlank() && driveService != null) {
-                        try {
-                            driveService.files().get(targetSeriesId)
-                                .setFields("id, name")
-                                .setSupportsAllDrives(true)
-                                .execute()
-                        } catch (e: Exception) {
-                            Log.w(TAG, "Failed fetching series folder for last watched series $targetSeriesId", e)
-                            null
-                        }
-                    } else null
-
-                    val rawShowName = seriesFolder?.name ?: lastWatched.seriesTitle ?: lastWatched.title
-                    val cleanShowTitle = driveRepository.cleanSeriesTitle(rawShowName)
-                    val seriesMeta = OnlineMetadataResolver.resolveSeries(cleanShowTitle)
-                    showTitle = seriesMeta.officialTitle.ifBlank { cleanShowTitle }
-                    showPoster = seriesMeta.posterUrl.takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) } ?: ""
-                    showBackdrop = showPoster.ifBlank { null }
-                }
-
-                val epMeta = OnlineMetadataResolver.resolveEpisodeMetadata(
-                    seriesName = showTitle,
-                    seasonNumber = lastWatched.seasonNumber,
-                    episodeNumber = lastWatched.episodeNumber
-                )
-                val epCode = "S${lastWatched.seasonNumber.toString().padStart(2, '0')}:E${lastWatched.episodeNumber.toString().padStart(2, '0')}"
-                val cleanEpTitle = epMeta?.officialTitle?.takeIf { it.isNotBlank() }
-                    ?: lastWatched.title.takeIf { it.isNotBlank() }
-                    ?: "Episode ${lastWatched.episodeNumber}"
-                val still = epMeta?.thumbnailUrl?.takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
-                    ?: showBackdrop?.takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
-                    ?: showPoster.ifBlank { lastWatched.thumbnailUrl.orEmpty() }
-
-                val effectiveDuration = if (lastWatched.durationMs > 0L) lastWatched.durationMs else 0L
-                val fraction = if (effectiveDuration > 0L) {
-                    (lastWatched.positionMs.toFloat() / effectiveDuration.toFloat()).coerceIn(0f, 1f)
-                } else lastWatched.progressFraction.coerceIn(0f, 1f)
-
-                ContinueWatchingDisplayData(
-                    mediaId = lastWatched.fileId,
-                    seriesId = targetSeriesId.ifBlank { null },
-                    isSeries = true,
-                    displayHeader = showTitle,
-                    displayTitle = "$epCode • $cleanEpTitle",
-                    displayThumbnailUrl = still,
-                    progressFraction = fraction,
-                    currentPositionMs = lastWatched.positionMs,
-                    durationMs = effectiveDuration,
-                    seriesTitle = showTitle,
-                    seasonNumber = lastWatched.seasonNumber,
-                    episodeNumber = lastWatched.episodeNumber,
-                    episodeTitle = cleanEpTitle
-                )
-            } else {
-                val targetFileId = lastWatched.fileId
-                val priorityMovies = priorityMoviesDeferred.await()
-                val matchingMovie = priorityMovies.firstOrNull { it.id == targetFileId }
-
-                val movieTitle: String
-                val moviePoster: String
-                val durationMs: Long
-
-                if (matchingMovie != null) {
-                    movieTitle = matchingMovie.title
-                    moviePoster = matchingMovie.thumbnailUrl.orEmpty()
-                    durationMs = if (matchingMovie.durationMs > 0L) matchingMovie.durationMs else lastWatched.durationMs
-                } else {
-                    val file = if (targetFileId.isNotBlank() && driveService != null) {
-                        try {
-                            driveService.files().get(targetFileId)
-                                .setFields("id, name, size, createdTime, videoMediaMetadata")
-                                .setSupportsAllDrives(true)
-                                .execute()
-                        } catch (e: Exception) {
-                            Log.w(TAG, "Failed fetching last watched movie file $targetFileId", e)
-                            null
-                        }
-                    } else null
-
-                    val rawName = file?.name ?: lastWatched.title
-                    val cleanTitle = driveRepository.cleanVideoTitle(rawName)
-                    val meta = OnlineMetadataResolver.resolveMovie(cleanTitle)
-                    val artwork = MediaArtworkResolver.resolveMovieArtwork(cleanTitle, lastWatched.thumbnailUrl)
-
-                    movieTitle = meta.officialTitle.ifBlank { cleanTitle }
-                    moviePoster = meta.posterUrl.takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
-                        ?: artwork.posterUrl?.takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
-                        ?: artwork.backdropUrl?.takeIf { it.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(it) }
-                        ?: lastWatched.thumbnailUrl.orEmpty()
-                    durationMs = file?.videoMediaMetadata?.durationMillis ?: lastWatched.durationMs
-                }
-
-                val fraction = if (durationMs > 0L) {
-                    (lastWatched.positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
-                } else lastWatched.progressFraction.coerceIn(0f, 1f)
-
-                ContinueWatchingDisplayData(
-                    mediaId = targetFileId,
-                    seriesId = null,
-                    isSeries = false,
-                    displayHeader = movieTitle,
-                    displayTitle = "Movie • Cinema",
-                    displayThumbnailUrl = moviePoster,
-                    progressFraction = fraction,
-                    currentPositionMs = lastWatched.positionMs,
-                    durationMs = durationMs
-                )
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error resolving last watched item enriched: ${e.message}", e)
-            null
+    private suspend fun preloadStage1ImageWithKey(url: String, cacheKey: String) = withContext(Dispatchers.IO) {
+        if (url.isBlank() || OnlineMetadataResolver.isDriveVideoFrameUrl(url)) return@withContext
+        val appContext = getApplication<Application>()
+        runCatching {
+            val req = ImageRequest.Builder(appContext)
+                .data(url)
+                .memoryCacheKey(cacheKey)
+                .diskCacheKey(cacheKey)
+                .memoryCachePolicy(CachePolicy.ENABLED)
+                .diskCachePolicy(CachePolicy.ENABLED)
+                .build()
+            appContext.imageLoader.execute(req)
         }
     }
 
-    suspend fun resolveLastWatchedItemEnriched(
-        driveService: Drive?,
-        priorityMovies: List<Movie> = emptyList(),
-        prioritySeries: List<TvSeries> = emptyList()
-    ): ContinueWatchingDisplayData? {
-        val moviesDeferred = kotlinx.coroutines.CompletableDeferred(priorityMovies)
-        val seriesDeferred = kotlinx.coroutines.CompletableDeferred(prioritySeries)
-        return resolveLastWatchedItemEnriched(driveService, moviesDeferred, seriesDeferred)
-    }
-
-    private suspend fun preloadStage1Images(urls: List<String>) = withContext(Dispatchers.IO) {
-        val distinctUrls = urls.filter { it.isNotBlank() }.distinct()
-        if (distinctUrls.isEmpty()) return@withContext
+    private suspend fun preloadStage1Images(keyedUrls: List<Pair<String, String>>) = withContext(Dispatchers.IO) {
+        val distinctPairs = keyedUrls
+            .filter { (_, url) -> url.isNotBlank() && !OnlineMetadataResolver.isDriveVideoFrameUrl(url) }
+            .distinctBy { (key, url) -> "$key::$url" }
+        if (distinctPairs.isEmpty()) return@withContext
         val appContext = getApplication<Application>()
         try {
             withTimeoutOrNull(3_000L) {
-                distinctUrls.map { url ->
+                distinctPairs.map { (cacheKey, url) ->
                     async(Dispatchers.IO) {
                         runCatching {
                             val req = ImageRequest.Builder(appContext)
                                 .data(url)
+                                .memoryCacheKey(cacheKey)
+                                .diskCacheKey(cacheKey)
                                 .memoryCachePolicy(CachePolicy.ENABLED)
                                 .diskCachePolicy(CachePolicy.ENABLED)
                                 .build()
@@ -2908,7 +3011,6 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         }
         catalogLoadingJob?.cancel()
         catalogLoadingJob = viewModelScope.launch(Dispatchers.IO) {
-            _isRefreshing.value = true
             val needsInitialLoading = _moviesState.value.isEmpty() && _seriesState.value.isEmpty()
             if (needsInitialLoading) {
                 _isInitialLoading.value = true
@@ -2951,10 +3053,13 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                         folderManager.saveCustomSeriesFolderId(seriesFolderId, isUserOverride = false)
                     }
 
+                    val existingMoviesBaseline = _moviesState.value
+                    val existingSeriesBaseline = _seriesState.value
+
                     // ============================================================
                     // STAGE 1: Priority Fast-Start (Blocks Skeleton Dismissal)
                     // ============================================================
-                    Log.d(TAG, "STAGE1_START: Fetching top 2 movies, top 2 series, and last watched item from Drive")
+                    Log.d(TAG, "STAGE1_START: Fetching top 2 movies & top 2 series from Drive")
 
                     val priorityMoviesDeferred = async(Dispatchers.IO) {
                         if (!moviesFolderId.isNullOrBlank()) {
@@ -2968,70 +3073,58 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                         } else emptyList()
                     }
 
-                    val lastWatchedDeferred = async(Dispatchers.IO) {
-                        resolveLastWatchedItemEnriched(service, priorityMoviesDeferred, prioritySeriesDeferred)
-                    }
-
                     val priorityMovies = priorityMoviesDeferred.await()
                     val prioritySeries = prioritySeriesDeferred.await()
-                    val lastWatched = lastWatchedDeferred.await()
-
-                    // Collect all Stage 1 image URLs to pre-warm Coil's bitmap cache
-                    val stage1ImageUrls = mutableListOf<String>()
-                    priorityMovies.forEach { movie ->
-                        if (movie.posterUrl.isNotBlank()) stage1ImageUrls.add(movie.posterUrl)
-                        if (movie.backdropUrl.isNotBlank()) stage1ImageUrls.add(movie.backdropUrl)
-                    }
-                    prioritySeries.forEach { series ->
-                        val pUrl = series.posterUrl
-                        if (!pUrl.isNullOrBlank()) stage1ImageUrls.add(pUrl)
-                        val bUrl = series.backdropUrl
-                        if (!bUrl.isNullOrBlank()) stage1ImageUrls.add(bUrl)
-                        if (series.thumbnailUrl.isNotBlank()) stage1ImageUrls.add(series.thumbnailUrl)
-                    }
-                    if (lastWatched != null && lastWatched.displayThumbnailUrl.isNotBlank()) {
-                        stage1ImageUrls.add(lastWatched.displayThumbnailUrl)
-                    }
-
-                    // Preload all Stage 1 images before dismissing skeleton
-                    preloadStage1Images(stage1ImageUrls)
-
-                    _stage1LastWatched.value = lastWatched
-                    _isHistoryLoaded.value = true
 
                     val priorityVideoItems = priorityMovies.map { it.toVideoItem() }
+                    val mergedPriorityVideos = mergeMoviesWithExisting(priorityVideoItems, existingMoviesBaseline)
+                    val mergedPrioritySeries = mergeSeriesWithExisting(prioritySeries, existingSeriesBaseline)
+                    val mergedPriorityDomainMovies = mergedPriorityVideos.map { it.toMovie() }
 
-                    _moviesList.value = priorityMovies
-                    _moviesState.value = priorityVideoItems
-                    _seriesState.value = prioritySeries
-                    _seriesList.value = prioritySeries
+                    // Collect canonical-keyed Stage 1 image URLs to pre-warm Coil's bitmap cache
+                    val stage1ImageUrls = mutableListOf<Pair<String, String>>()
+                    mergedPriorityDomainMovies.take(DriveRepository.STAGE1_PRIORITY_LIMIT).forEach { movie ->
+                        val poster = movie.posterUrl
+                        if (poster.isNotBlank()) stage1ImageUrls.add("movie_poster_${movie.id}" to poster)
+                    }
+                    mergedPrioritySeries.take(DriveRepository.STAGE1_PRIORITY_LIMIT).forEach { series ->
+                        val art = pickBestSeriesArtwork(series.posterUrl, series.backdropUrl, series.thumbnailUrl)
+                        if (art.isNotBlank()) stage1ImageUrls.add("series_poster_${series.id}" to art)
+                    }
+                    val currentHero = _heroSlotState.value
+                    if (currentHero is HeroSlotState.ContinueWatching && currentHero.item.displayThumbnailUrl.isNotBlank()) {
+                        stage1ImageUrls.add("cw_hero_${currentHero.item.mediaId}" to currentHero.item.displayThumbnailUrl)
+                    }
+
+                    preloadStage1Images(stage1ImageUrls)
+
+                    _moviesList.value = mergedPriorityDomainMovies
+                    _moviesState.value = mergedPriorityVideos
+                    _seriesState.value = mergedPrioritySeries
                     _isInitialLoading.value = false
 
                     _uiState.update { current ->
-                        val hero = current.heroItem ?: priorityVideoItems.firstOrNull()
-                        val heroShow = current.heroSeries ?: prioritySeries.firstOrNull()
                         current.copy(
-                            videos = priorityVideoItems,
-                            movies = priorityMovies,
-                            moviesList = priorityVideoItems,
-                            filteredVideos = applyFilterAndSearch(priorityVideoItems, current.selectedFilter, current.searchQuery),
-                            tvSeriesList = prioritySeries,
-                            heroItem = hero,
-                            heroSeries = heroShow,
+                            videos = mergedPriorityVideos,
+                            movies = mergedPriorityDomainMovies,
+                            moviesList = mergedPriorityVideos,
+                            filteredVideos = applyFilterAndSearch(mergedPriorityVideos, current.selectedFilter, current.searchQuery),
+                            tvSeriesList = mergedPrioritySeries,
                             isInitialLoading = false
                         )
                     }
 
-                    Log.d(TAG, "STAGE1_COMPLETE & SKELETON_DISMISSED: movies=${priorityMovies.size}, series=${prioritySeries.size}, continueWatching=${lastWatched?.displayHeader ?: "none"}")
+                    Log.d(TAG, "STAGE1_COMPLETE & SKELETON_DISMISSED: movies=${mergedPriorityVideos.size}, series=${mergedPrioritySeries.size}")
 
                     // ============================================================
                     // STAGE 2: Non-Blocking Background Packet-of-4 Ingestion
+                    // HeroSlotState MUST NEVER flash back to Resolving or FeaturedFallback.
                     // ============================================================
                     val seenMovieIds = priorityMovies.map { it.id }.toMutableSet()
                     val seenSeriesIds = prioritySeries.map { it.id }.toMutableSet()
 
-                    val accumulatedVideos = priorityVideoItems.toMutableList()
-                    val accumulatedSeries = prioritySeries.toMutableList()
+                    val accumulatedVideos = priorityVideoItems.map { mergeVideoItemWithExistingAndCache(it) }.toMutableList()
+                    val accumulatedSeries = mergeSeriesWithExisting(prioritySeries, emptyList()).toMutableList()
 
                     val movieLock = Any()
                     val seriesLock = Any()
@@ -3050,11 +3143,12 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                                     val progressMap = _uiState.value.watchProgressMap
                                     val distinctVideos = synchronized(movieLock) {
                                         for (item in newItems) {
-                                            val prog = progressMap[item.id]
-                                            val itemWithProgress = if (prog != null) item.copy(watchProgressFraction = prog.progressFraction) else item
+                                            val merged = mergeVideoItemWithExistingAndCache(item)
+                                            val prog = progressMap[merged.id]
+                                            val itemWithProgress = if (prog != null) merged.copy(watchProgressFraction = prog.progressFraction) else merged
                                             accumulatedVideos.add(itemWithProgress)
                                         }
-                                        accumulatedVideos.distinctBy { it.id }
+                                        mergeMoviesWithExisting(accumulatedVideos.distinctBy { it.id }, _moviesState.value)
                                     }
                                     val domainMovies = distinctVideos.map { it.toMovie() }
                                     _moviesState.value = distinctVideos
@@ -3084,7 +3178,10 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
 
                                     val progressMap = _uiState.value.watchProgressMap
                                     val distinctSeries = synchronized(seriesLock) {
-                                        for (series in newSeries) {
+                                        val existingNow = _seriesState.value
+                                        val mergedPacket = mergeSeriesWithExisting(newSeries, existingNow)
+                                            .filter { it.id in newSeries.map { ns -> ns.id }.toSet() }
+                                        for (series in mergedPacket) {
                                             val seriesEpProgress = progressMap.values
                                                 .filter { it.seriesId == series.id || series.seasons.any { s -> s.episodes.any { ep -> ep.id == it.fileId } } }
                                                 .maxByOrNull { it.lastWatchedTimestamp }
@@ -3092,10 +3189,9 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                                             val updatedSeries = series.copy(watchProgressFraction = seriesFraction)
                                             accumulatedSeries.add(updatedSeries)
                                         }
-                                        accumulatedSeries.distinctBy { it.id }
+                                        mergeSeriesWithExisting(accumulatedSeries.distinctBy { it.id }, existingNow)
                                     }
                                     _seriesState.value = distinctSeries
-                                    _seriesList.value = distinctSeries
 
                                     _uiState.update { current ->
                                         current.copy(
@@ -3110,16 +3206,47 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
 
                     joinAll(movieStreamJob, seriesStreamJob)
 
+                    // Finalize complete Drive catalog while preserving official artwork & seasons from existing baseline
+                    val finalMovies = if (accumulatedVideos.isNotEmpty()) {
+                        val deduped = accumulatedVideos.distinctBy { it.id }
+                        val finalDomain = deduped.map { it.toMovie() }
+                        _moviesState.value = deduped
+                        _moviesList.value = finalDomain
+                        _uiState.update { current ->
+                            current.copy(
+                                videos = deduped,
+                                movies = finalDomain,
+                                moviesList = deduped,
+                                filteredVideos = applyFilterAndSearch(deduped, current.selectedFilter, current.searchQuery)
+                            )
+                        }
+                        deduped
+                    } else {
+                        _moviesState.value
+                    }
+
+                    val finalSeries = if (accumulatedSeries.isNotEmpty()) {
+                        val dedupedSeries = mergeSeriesWithExisting(
+                            accumulatedSeries.distinctBy { it.id },
+                            _seriesState.value
+                        ).filter { s -> accumulatedSeries.any { it.id == s.id } }
+                        _seriesState.value = dedupedSeries
+                        _uiState.update { current ->
+                            current.copy(tvSeriesList = dedupedSeries)
+                        }
+                        dedupedSeries
+                    } else {
+                        _seriesState.value
+                    }
+
                     // Save complete catalog to unified cache for instant hydration
-                    catalogCacheManager.saveCatalog(_moviesState.value, _seriesState.value)
-                    _isRefreshing.value = false
+                    catalogCacheManager.saveCatalog(finalMovies, finalSeries)
                     _uiState.update { it.copy(isLoading = false, isInitialLoading = false) }
-                    Log.d(TAG, "STAGE2_COMPLETE: saved ${_moviesState.value.size} movies and ${_seriesState.value.size} series to cache")
+                    Log.d(TAG, "STAGE2_COMPLETE: saved ${finalMovies.size} movies and ${finalSeries.size} series to cache")
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Catalog sync failed: ${e.message}", e)
             } finally {
-                _isRefreshing.value = false
                 _isInitialLoading.value = false
                 _uiState.update { it.copy(isLoading = false, isInitialLoading = false) }
             }

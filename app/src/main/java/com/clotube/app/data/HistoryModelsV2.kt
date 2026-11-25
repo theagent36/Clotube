@@ -3,6 +3,10 @@ package com.clotube.app.data
 import org.json.JSONArray
 import org.json.JSONObject
 
+const val MAX_ACTIVE_WINDOW = 50
+const val MAX_PROTECTED_IN_PROGRESS = 20
+const val MAX_ACTIVE_PAYLOAD_BYTES = 28 * 1024
+
 data class HistoryItemEntityV2(
     val id: String,
     val title: String = "",
@@ -23,6 +27,15 @@ data class HistoryItemEntityV2(
     val timestampMs: Long get() = timestamp
     val isSeries: Boolean get() = !seriesId.isNullOrBlank() || seasonNumber != null || episodeNumber != null
 
+    val isInProgressForProtection: Boolean
+        get() = !isWatched && positionMs >= 3000L && progressFraction < 0.90f
+
+    val isResumeEligibleFromArchive: Boolean
+        get() = !isWatched && positionMs > 1500L && progressFraction < 0.90f
+
+    val isContinueWatchingEligible: Boolean
+        get() = !isWatched && positionMs >= 3000L && progressFraction in 0.01f..0.90f
+
     fun toJsonObject(): JSONObject = JSONObject().apply {
         put("id", id)
         put("t", title)
@@ -38,19 +51,125 @@ data class HistoryItemEntityV2(
     }
 
     companion object {
+        private fun optIntMulti(obj: JSONObject, vararg keys: String): Int? {
+            for (k in keys) {
+                if (obj.has(k) && !obj.isNull(k)) {
+                    return obj.optInt(k)
+                }
+            }
+            return null
+        }
+
+        private fun optStringMulti(obj: JSONObject, vararg keys: String): String {
+            for (k in keys) {
+                if (obj.has(k) && !obj.isNull(k)) {
+                    val v = obj.optString(k, "")
+                    if (v.isNotBlank()) return v
+                }
+            }
+            return ""
+        }
+
+        private fun optLongMulti(obj: JSONObject, vararg keys: String): Long {
+            for (k in keys) {
+                if (obj.has(k) && !obj.isNull(k)) {
+                    return obj.optLong(k, 0L)
+                }
+            }
+            return 0L
+        }
+
         fun fromJsonObject(obj: JSONObject): HistoryItemEntityV2 {
+            val isWatchedVal = when {
+                obj.has("w") && !obj.isNull("w") -> obj.optBoolean("w", false)
+                obj.has("isWatched") && !obj.isNull("isWatched") -> obj.optBoolean("isWatched", false)
+                else -> false
+            }
             return HistoryItemEntityV2(
                 id = obj.getString("id"),
-                title = obj.optString("t", ""),
-                positionMs = obj.optLong("p", 0L),
-                durationMs = obj.optLong("d", 0L),
-                timestamp = WatchHistoryPayloadV2.normalizeTimestampMs(obj.optLong("ts", 0L)),
-                isWatched = obj.optBoolean("w", false),
-                seriesId = if (obj.has("sid")) obj.optString("sid").ifBlank { null } else null,
-                seasonNumber = if (obj.has("s") && !obj.isNull("s")) obj.optInt("s") else null,
-                episodeNumber = if (obj.has("e") && !obj.isNull("e")) obj.optInt("e") else null,
-                seriesTitle = if (obj.has("st")) obj.optString("st").ifBlank { null } else null,
-                thumbnailUrl = if (obj.has("thumb")) obj.optString("thumb").ifBlank { null } else null
+                title = optStringMulti(obj, "t", "title"),
+                positionMs = optLongMulti(obj, "p", "positionMs").coerceAtLeast(0L),
+                durationMs = optLongMulti(obj, "d", "durationMs").coerceAtLeast(0L),
+                timestamp = WatchHistoryPayloadV2.normalizeTimestampMs(optLongMulti(obj, "ts", "timestamp")),
+                isWatched = isWatchedVal,
+                seriesId = optStringMulti(obj, "sid", "seriesId").ifBlank { null },
+                seasonNumber = optIntMulti(obj, "s", "sn", "seasonNumber"),
+                episodeNumber = optIntMulti(obj, "e", "en", "episodeNumber"),
+                seriesTitle = optStringMulti(obj, "st", "seriesTitle").ifBlank { null },
+                thumbnailUrl = optStringMulti(obj, "thumb", "thumbnailUrl").ifBlank { null }
+            )
+        }
+    }
+}
+
+data class ActiveWindowPartitionResult(
+    val activeItems: List<HistoryItemEntityV2>,
+    val overflowItems: List<HistoryItemEntityV2>
+)
+
+data class ArchivePayloadV2(
+    val version: Int = 2,
+    val updatedAt: Long = System.currentTimeMillis(),
+    val watchedIds: List<String> = emptyList(),
+    val items: List<HistoryItemEntityV2> = emptyList()
+) {
+    fun toJsonString(): String {
+        val root = JSONObject()
+        root.put("v", version)
+        root.put("updatedAt", updatedAt)
+        val watchedArr = JSONArray()
+        watchedIds.filter { it.isNotBlank() }.distinct().sorted().forEach { watchedArr.put(it) }
+        root.put("watchedIds", watchedArr)
+        val itemsArr = JSONArray()
+        items.distinctBy { it.id }.sortedByDescending { it.timestamp }.forEach { itemsArr.put(it.toJsonObject()) }
+        root.put("items", itemsArr)
+        return root.toString()
+    }
+
+    companion object {
+        fun fromJsonString(json: String): ArchivePayloadV2 {
+            if (json.isBlank()) return ArchivePayloadV2(updatedAt = 0L)
+            val root = JSONObject(json)
+            val v = root.optInt("v", 2)
+            val rawUpdatedAt = if (root.has("updatedAt") && !root.isNull("updatedAt")) {
+                WatchHistoryPayloadV2.normalizeTimestampMs(root.optLong("updatedAt", 0L))
+            } else {
+                0L
+            }
+            val watchedSet = linkedSetOf<String>()
+            val watchedArr = root.optJSONArray("watchedIds")
+            if (watchedArr != null) {
+                for (i in 0 until watchedArr.length()) {
+                    val id = watchedArr.optString(i, "").trim()
+                    if (id.isNotBlank()) watchedSet.add(id)
+                }
+            }
+            val itemsMap = linkedMapOf<String, HistoryItemEntityV2>()
+            val itemsArr = root.optJSONArray("items") ?: root.optJSONArray("archive")
+            if (itemsArr != null) {
+                for (i in 0 until itemsArr.length()) {
+                    val obj = itemsArr.optJSONObject(i) ?: continue
+                    if (obj.optString("id", "").isNotBlank()) {
+                        val entity = HistoryItemEntityV2.fromJsonObject(obj)
+                        val existing = itemsMap[entity.id]
+                        if (existing == null || entity.timestamp >= existing.timestamp) {
+                            itemsMap[entity.id] = entity
+                        }
+                        if (entity.isWatched || entity.progressFraction >= 0.90f) {
+                            watchedSet.add(entity.id)
+                        } else {
+                            // Keep genuinely uncompleted archive items eligible for promotion
+                            watchedSet.remove(entity.id)
+                        }
+                    }
+                }
+            }
+            val maxItemTs = itemsMap.values.maxOfOrNull { it.timestamp } ?: 0L
+            return ArchivePayloadV2(
+                version = v,
+                updatedAt = maxOf(rawUpdatedAt, maxItemTs),
+                watchedIds = watchedSet.toList(),
+                items = itemsMap.values.sortedByDescending { it.timestamp }
             )
         }
     }
@@ -120,13 +239,21 @@ data class WatchHistoryPayloadV2(
         return root.toString()
     }
 
-    fun prunedToMaxBytes(maxBytes: Int = 28 * 1024): WatchHistoryPayloadV2 {
-        val distinctWatched = watchedIds.filter { it.isNotBlank() }.distinct()
-        var currentActive = active
-            .filter { it.id.isNotBlank() }
-            .distinctBy { it.id }
+    fun prunedToMaxBytes(maxBytes: Int = MAX_ACTIVE_PAYLOAD_BYTES): WatchHistoryPayloadV2 {
+        val partition = partitionActiveWindow(active)
+        var currentActive = partition.activeItems
+        val pinnedIds = currentActive
+            .filter { it.isInProgressForProtection }
             .sortedByDescending { it.timestamp }
-            .take(60)
+            .take(MAX_PROTECTED_IN_PROGRESS)
+            .map { it.id }
+            .toSet()
+
+        val distinctWatched = (
+            watchedIds +
+                currentActive.filter { it.isWatched || it.progressFraction >= 0.90f }.map { it.id }
+            ).filter { it.isNotBlank() }.distinct()
+
         var currentResume = resume.entries
             .filter { it.key.isNotBlank() && it.value.episodeId.isNotBlank() }
             .sortedByDescending { it.value.timestamp }
@@ -143,11 +270,12 @@ data class WatchHistoryPayloadV2(
             return candidate
         }
 
-        // First prune oldest completed active items whose watched status is preserved in watchedIds
+        // First prune oldest completed active items (non-pinned) whose watched status is preserved in watchedIds
         val resumeEpisodeIds = currentResume.values.map { it.episodeId }.toSet()
         val removableCompleted = currentActive
             .filter { item ->
-                item.isWatched &&
+                item.id !in pinnedIds &&
+                    item.isWatched &&
                     (item.positionMs <= 0L || item.progressFraction >= 0.90f) &&
                     item.id !in resumeEpisodeIds
             }
@@ -165,13 +293,24 @@ data class WatchHistoryPayloadV2(
             }
         }
 
-        // Next trim oldest active scrub entries down to budget
-        while (currentActive.size > 1 && candidate.toJsonString().toByteArray(Charsets.UTF_8).size > maxBytes) {
-            currentActive = currentActive.dropLast(1)
-            candidate = build()
+        // Next trim oldest non-pinned active items down to budget while protecting pinned in-progress items
+        val nonPinnedIdsOrder = currentActive
+            .filter { it.id !in pinnedIds }
+            .sortedBy { it.timestamp }
+            .map { it.id }
+        if (nonPinnedIdsOrder.isNotEmpty()) {
+            val activeMutable = currentActive.toMutableList()
+            for (oldId in nonPinnedIdsOrder) {
+                if (activeMutable.size <= 1 || candidate.toJsonString().toByteArray(Charsets.UTF_8).size <= maxBytes) {
+                    break
+                }
+                activeMutable.removeAll { it.id == oldId }
+                currentActive = activeMutable.toList()
+                candidate = build()
+            }
         }
 
-        // Finally trim oldest resume pointers only if still above maxBytes
+        // Trim oldest resume pointers if still above maxBytes (pinned in-progress items stay protected longer)
         if (candidate.toJsonString().toByteArray(Charsets.UTF_8).size > maxBytes && currentResume.size > 1) {
             val resumeList = currentResume.entries.sortedByDescending { it.value.timestamp }.toMutableList()
             while (resumeList.size > 1 && candidate.toJsonString().toByteArray(Charsets.UTF_8).size > maxBytes) {
@@ -181,17 +320,61 @@ data class WatchHistoryPayloadV2(
             }
         }
 
+        // Last resort only if even pinned items alone exceed maxBytes
+        while (currentActive.size > 1 && candidate.toJsonString().toByteArray(Charsets.UTF_8).size > maxBytes) {
+            val oldestPinnedIdx = currentActive.indices.minByOrNull { currentActive[it].timestamp } ?: break
+            val mutable = currentActive.toMutableList()
+            mutable.removeAt(oldestPinnedIdx)
+            currentActive = mutable.toList()
+            candidate = build()
+        }
+
         return candidate
     }
 
     companion object {
+        fun partitionActiveWindow(allItems: List<HistoryItemEntityV2>): ActiveWindowPartitionResult {
+            val dedupedMap = linkedMapOf<String, HistoryItemEntityV2>()
+            for (item in allItems) {
+                if (item.id.isBlank()) continue
+                val existing = dedupedMap[item.id]
+                if (existing == null || item.timestamp >= existing.timestamp) {
+                    dedupedMap[item.id] = item
+                }
+            }
+            val deduped = dedupedMap.values.toList()
+
+            val pinnedInProgress = deduped
+                .filter { it.isInProgressForProtection }
+                .sortedByDescending { it.timestamp }
+                .take(MAX_PROTECTED_IN_PROGRESS)
+            val pinnedIds = pinnedInProgress.map { it.id }.toHashSet()
+
+            val remainingSlots = (MAX_ACTIVE_WINDOW - pinnedInProgress.size).coerceAtLeast(0)
+            val filledNonPinned = deduped
+                .filter { it.id !in pinnedIds }
+                .sortedByDescending { it.timestamp }
+                .take(remainingSlots)
+
+            val activeItems = (pinnedInProgress + filledNonPinned)
+                .sortedByDescending { it.timestamp }
+            val activeIds = activeItems.map { it.id }.toHashSet()
+            val overflowItems = deduped
+                .filter { it.id !in activeIds }
+                .sortedByDescending { it.timestamp }
+
+            return ActiveWindowPartitionResult(
+                activeItems = activeItems,
+                overflowItems = overflowItems
+            )
+        }
         /**
          * Normalizes Unix timestamps to epoch milliseconds.
          * If a remote client (e.g., Desktop/PC) wrote Unix seconds (10-digit epoch),
          * converts it to milliseconds so it compares accurately against Android's System.currentTimeMillis().
          */
         fun normalizeTimestampMs(value: Long): Long {
-            return if (value in 1_000_000_000L..9_999_999_999L) {
+            return if (value in 1L until 10_000_000_000L) {
                 value * 1000L
             } else {
                 value
@@ -201,7 +384,11 @@ data class WatchHistoryPayloadV2(
         fun fromJsonString(json: String): WatchHistoryPayloadV2 {
             val root = JSONObject(json)
             val v = root.optInt("v", 2)
-            val updatedAt = normalizeTimestampMs(root.optLong("updatedAt", System.currentTimeMillis()))
+            val rawUpdatedAt = if (root.has("updatedAt") && !root.isNull("updatedAt")) {
+                normalizeTimestampMs(root.optLong("updatedAt", 0L))
+            } else {
+                0L
+            }
 
             val activeList = mutableListOf<HistoryItemEntityV2>()
             val activeArr = root.optJSONArray("active")
@@ -237,6 +424,12 @@ data class WatchHistoryPayloadV2(
                     }
                 }
             }
+
+            val updatedAt = maxOf(
+                rawUpdatedAt,
+                activeList.maxOfOrNull { it.timestamp } ?: 0L,
+                resumeMap.values.maxOfOrNull { it.timestamp } ?: 0L
+            )
 
             return WatchHistoryPayloadV2(v, updatedAt, activeList, resumeMap, watchedList)
         }

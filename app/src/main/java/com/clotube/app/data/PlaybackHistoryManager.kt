@@ -233,6 +233,7 @@ class PlaybackHistoryManager(
 
     init {
         AndroidWatchHistoryManager.purgeAllLocalDiskCaches(appContext)
+        AndroidWatchHistoryManager.ensureArchiveLoaded(appContext)
     }
 
     fun setTokenProvider(provider: suspend () -> String) {
@@ -241,7 +242,7 @@ class PlaybackHistoryManager(
     }
 
     suspend fun syncFromCloud(force: Boolean = true): Boolean {
-        return watchHistorySync.syncFromCloud(force = force)
+        return watchHistorySync.pullAndMerge(appContext, force = force)
     }
 
     fun backupImmediately() {
@@ -296,15 +297,17 @@ class PlaybackHistoryManager(
                 }
             }
         }
-        resultMap.values.sortedByDescending { it.lastWatchedTimestamp }
+        resultMap.values.sortedByDescending { it.lastWatchedTimestamp }.take(MAX_ACTIVE_WINDOW)
     }
 
     val lastWatchedFlow: Flow<WatchProgress?> get() = getLastWatchedMedia()
 
     fun getLastWatchedMedia(): Flow<WatchProgress?> = AndroidWatchHistoryManager.stateRevision.map {
         val entries = AndroidWatchHistoryManager.snapshotEntries()
+        val archivedItems = AndroidWatchHistoryManager.snapshotArchivedItems()
         val candidates = mutableListOf<WatchProgress>()
         val resumeEpisodeIds = mutableSetOf<String>()
+        val seenIds = mutableSetOf<String>()
 
         // 1. Evaluate series_resume_${seriesId}_* pointers
         entries.keys
@@ -326,9 +329,9 @@ class PlaybackHistoryManager(
                     val fraction = (entries["${p}_fraction"]?.value as? Number)?.toFloat()
                         ?: (entries["${epId}_fraction"]?.value as? Number)?.toFloat()
                         ?: if (dur > 0L) (pos.toFloat() / dur.toFloat()).coerceIn(0f, 1f) else 0f
-                    val isWatched = explicitWatched ?: (fraction >= 0.90f)
+                    val isWatched = explicitWatched ?: (AndroidWatchHistoryManager.isEpisodeWatched(epId) || fraction >= 0.90f)
 
-                    if (!isWatched && fraction < 0.95f && ts > 0L) {
+                    if (!isWatched && !AndroidWatchHistoryManager.isEpisodeWatched(epId) && fraction < 0.95f && pos > 3000L && ts > 0L) {
                         val sNum = (entries["${p}_season_num"]?.value as? Number)?.toInt()
                             ?: (entries["${epId}_season_num"]?.value as? Number)?.toInt() ?: 1
                         val eNum = (entries["${p}_episode_num"]?.value as? Number)?.toInt()
@@ -369,6 +372,7 @@ class PlaybackHistoryManager(
             .filter { it.endsWith("_timestamp") && !it.startsWith("series_resume_") && !it.startsWith("global_") }
             .forEach { tsKey ->
                 val fileId = tsKey.removeSuffix("_timestamp")
+                seenIds.add(fileId)
                 if (fileId !in resumeEpisodeIds) {
                     val ts = (entries[tsKey]?.value as? Number)?.toLong() ?: 0L
                     val pos = (entries["${fileId}_pos"]?.value as? Number)?.toLong() ?: 0L
@@ -376,7 +380,7 @@ class PlaybackHistoryManager(
                     val fraction = (entries["${fileId}_fraction"]?.value as? Number)?.toFloat()
                         ?: if (dur > 0L) (pos.toFloat() / dur.toFloat()).coerceIn(0f, 1f) else 0f
                     val explicitWatched = entries["${fileId}_is_watched"]?.value as? Boolean
-                    val isWatched = explicitWatched ?: (fraction >= 0.90f)
+                    val isWatched = explicitWatched ?: (AndroidWatchHistoryManager.isEpisodeWatched(fileId) || fraction >= 0.90f)
                     val isSeries = (entries["${fileId}_is_series"]?.value as? Boolean) ?: false
                     val sId = entries["${fileId}_series_id"]?.value as? String
                     val sNum = (entries["${fileId}_season_num"]?.value as? Number)?.toInt() ?: 0
@@ -386,7 +390,7 @@ class PlaybackHistoryManager(
                     val thumb = (entries["${fileId}_thumbnail_url"]?.value as? String)?.takeIf { it.isNotBlank() }
                         ?: (entries["${fileId}_thumb"]?.value as? String)?.takeIf { it.isNotBlank() }
 
-                    if (!isWatched && pos >= 1000L && fraction < 0.95f && ts > 0L) {
+                    if (!isWatched && !AndroidWatchHistoryManager.isEpisodeWatched(fileId) && pos > 3000L && fraction < 0.95f && ts > 0L) {
                         candidates.add(
                             WatchProgress(
                                 fileId = fileId,
@@ -409,7 +413,45 @@ class PlaybackHistoryManager(
                 }
             }
 
-        candidates.maxByOrNull { it.lastWatchedTimestamp }
+        // 3. Merge uncompleted archived entries so Continue Watching never loses evicted progress
+        archivedItems.values.forEach { archived ->
+            if (archived.id !in resumeEpisodeIds &&
+                archived.id !in seenIds &&
+                archived.isContinueWatchingEligible &&
+                !AndroidWatchHistoryManager.isEpisodeWatched(archived.id) &&
+                archived.timestamp > 0L
+            ) {
+                seenIds.add(archived.id)
+                candidates.add(
+                    WatchProgress(
+                        fileId = archived.id,
+                        title = archived.title,
+                        positionMs = archived.positionMs,
+                        durationMs = archived.durationMs,
+                        progressFraction = archived.progressFraction,
+                        lastWatchedTimestamp = archived.timestamp,
+                        isSeries = archived.isSeries,
+                        seriesId = archived.seriesId,
+                        seasonNumber = archived.seasonNumber ?: 0,
+                        episodeNumber = archived.episodeNumber ?: 0,
+                        seriesTitle = archived.seriesTitle,
+                        thumbnailUrl = archived.thumbnailUrl,
+                        backdropUrl = archived.thumbnailUrl,
+                        isWatched = false
+                    )
+                )
+            }
+        }
+
+        // Group series candidates by seriesId (highest timestamp wins), keeping standalone items
+        val collapsed = mutableListOf<WatchProgress>()
+        candidates.filter { it.isSeries && !it.seriesId.isNullOrBlank() }
+            .groupBy { it.seriesId }
+            .values
+            .forEach { group -> group.maxByOrNull { it.lastWatchedTimestamp }?.let { collapsed.add(it) } }
+        collapsed.addAll(candidates.filter { !it.isSeries || it.seriesId.isNullOrBlank() })
+
+        collapsed.maxByOrNull { it.lastWatchedTimestamp }
     }
 
     fun getContinueWatchingMedia(): Flow<ContinueWatchingItem?> = lastWatchedFlow.map { progress ->
@@ -553,6 +595,7 @@ class PlaybackHistoryManager(
             .forEach { key ->
                 val fileId = key.removeSuffix("_timestamp")
                 if (!seenMediaIds.contains(fileId)) {
+                    seenMediaIds.add(fileId)
                     val ts = (entries[key]?.value as? Number)?.toLong() ?: 0L
                     val pos = (entries["${fileId}_pos"]?.value as? Number)?.toLong() ?: 0L
                     val dur = (entries["${fileId}_dur"]?.value as? Number)?.toLong() ?: 0L
@@ -662,6 +705,101 @@ class PlaybackHistoryManager(
                 }
             }
 
+        // 3. Merge uncompleted archived entries absent from active window
+        AndroidWatchHistoryManager.snapshotArchivedItems().values
+            .filter { archived ->
+                archived.isContinueWatchingEligible &&
+                    !seenMediaIds.contains(archived.id) &&
+                    !AndroidWatchHistoryManager.isEpisodeWatched(archived.id) &&
+                    archived.timestamp > 0L
+            }
+            .forEach { archived ->
+                val matchedSeries = if (!archived.seriesId.isNullOrBlank()) {
+                    seriesList.firstOrNull { it.id == archived.seriesId }
+                } else {
+                    seriesList.firstOrNull { s -> s.seasons.any { sn -> sn.episodes.any { ep -> ep.id == archived.id } } }
+                }
+                val matchedMovie = movies.firstOrNull { it.id == archived.id }
+                val isSeriesItem = archived.isSeries || matchedSeries != null
+
+                if (isSeriesItem) {
+                    val effectiveSeriesId = archived.seriesId ?: matchedSeries?.id
+                    if (!effectiveSeriesId.isNullOrBlank() && seenSeriesIds.contains(effectiveSeriesId)) {
+                        return@forEach
+                    }
+                    val allEpisodes = matchedSeries?.seasons?.flatMap { it.episodes }.orEmpty()
+                    val matchedEp = allEpisodes.firstOrNull { it.id == archived.id }
+                    val seasonNum = matchedEp?.seasonNumber ?: archived.seasonNumber ?: 1
+                    val episodeNum = matchedEp?.episodeNumber ?: archived.episodeNumber ?: 1
+                    val seriesTitle = (matchedSeries?.title?.ifBlank { null } ?: archived.seriesTitle ?: "TV Series").trim()
+                    val rawEpTitle = matchedEp?.displayTitle?.ifBlank { null } ?: archived.title
+                    val cleanEp = rawEpTitle
+                        .replace(Regex("(?i)\\bcompleted\\b"), "")
+                        .replace(Regex("(?i)\\bcomplete\\b"), "")
+                        .replace(Regex("(?i)^.*?S0*\\d+[:\\s._-]*E0*\\d+[:\\s-]*"), "")
+                        .replace(Regex("(?i)^${Regex.escape(seriesTitle)}[:\\s-]*"), "")
+                        .trim(' ', '-', '•', ':')
+                        .ifBlank { "Episode $episodeNum" }
+                    val epCode = "S${seasonNum.toString().padStart(2, '0')}:E${episodeNum.toString().padStart(2, '0')}"
+                    val displaySubtitle = "$epCode • $cleanEp"
+                    val thumb = matchedEp?.thumbnailUrl?.takeIf { it.isNotBlank() }
+                        ?: archived.thumbnailUrl?.takeIf { it.isNotBlank() }
+                        ?: matchedSeries?.backdropUrl?.takeIf { it.isNotBlank() }
+                        ?: matchedSeries?.posterUrl?.takeIf { it.isNotBlank() }
+                        ?: ""
+
+                    result.add(
+                        ContinueWatchingItem(
+                            mediaId = archived.id,
+                            seriesId = effectiveSeriesId,
+                            isSeries = true,
+                            seriesTitle = seriesTitle,
+                            seasonNumber = seasonNum,
+                            episodeNumber = episodeNum,
+                            episodeTitle = cleanEp,
+                            displaySubtitle = displaySubtitle,
+                            thumbnailUrl = thumb,
+                            progressFraction = archived.progressFraction,
+                            currentPositionMs = archived.positionMs,
+                            durationMs = if (archived.durationMs > 0L) archived.durationMs else matchedEp?.durationMs ?: 0L,
+                            lastWatchedTimestamp = archived.timestamp,
+                            title = seriesTitle,
+                            subtitle = displaySubtitle,
+                            positionMs = archived.positionMs,
+                            timestamp = archived.timestamp,
+                            backdropUrl = thumb
+                        )
+                    )
+                    if (!effectiveSeriesId.isNullOrBlank()) seenSeriesIds.add(effectiveSeriesId)
+                } else {
+                    val title = matchedMovie?.title?.takeIf { it.isNotBlank() } ?: archived.title.ifBlank { "Movie" }
+                    val thumb = matchedMovie?.thumbnailUrl?.takeIf { it.isNotBlank() } ?: archived.thumbnailUrl.orEmpty()
+                    result.add(
+                        ContinueWatchingItem(
+                            mediaId = archived.id,
+                            seriesId = null,
+                            isSeries = false,
+                            seriesTitle = title,
+                            seasonNumber = 0,
+                            episodeNumber = 0,
+                            episodeTitle = title,
+                            displaySubtitle = "Movie • Cinema",
+                            thumbnailUrl = thumb,
+                            progressFraction = archived.progressFraction,
+                            currentPositionMs = archived.positionMs,
+                            durationMs = if (archived.durationMs > 0L) archived.durationMs else matchedMovie?.durationMs ?: 0L,
+                            lastWatchedTimestamp = archived.timestamp,
+                            title = title,
+                            subtitle = "Movie • Cinema",
+                            positionMs = archived.positionMs,
+                            timestamp = archived.timestamp,
+                            backdropUrl = thumb
+                        )
+                    )
+                }
+                seenMediaIds.add(archived.id)
+            }
+
         val finalItems = mutableListOf<ContinueWatchingItem>()
         val groupedBySeries = result.filter { it.isSeries && !it.seriesId.isNullOrBlank() }.groupBy { it.seriesId }
         for ((_, items) in groupedBySeries) {
@@ -713,23 +851,12 @@ class PlaybackHistoryManager(
     fun getEpisodeProgressFraction(episodeId: String): Flow<Float> = AndroidWatchHistoryManager.stateRevision.map {
         val entries = AndroidWatchHistoryManager.snapshotEntries()
         (entries["${episodeId}_fraction"]?.value as? Number)?.toFloat()
+            ?: AndroidWatchHistoryManager.getArchivedItem(episodeId)?.progressFraction
             ?: if (AndroidWatchHistoryManager.isEpisodeWatched(episodeId)) 1.0f else 0f
     }
 
     fun getResumePosition(fileId: String, durationMs: Long = 0L): Long {
-        if (fileId.isBlank()) return 0L
-        val entries = AndroidWatchHistoryManager.snapshotEntries()
-        val pos = (entries["${fileId}_pos"]?.value as? Number)?.toLong() ?: 0L
-        val dur = if (durationMs > 0L) durationMs else (entries["${fileId}_dur"]?.value as? Number)?.toLong() ?: 0L
-        val fraction = (entries["${fileId}_fraction"]?.value as? Number)?.toFloat() ?: 0f
-        val isWatched = AndroidWatchHistoryManager.isEpisodeWatched(fileId) || fraction >= 0.90f
-
-        return when {
-            pos > 5000L && (dur == 0L || pos < dur - 15000L) -> pos
-            isWatched -> 0L
-            pos > 3000L -> pos
-            else -> 0L
-        }
+        return Companion.resolveResumePosition(fileId, durationMs)
     }
 
     fun getResumePosition(
@@ -831,6 +958,28 @@ class PlaybackHistoryManager(
         else episodes.all { AndroidWatchHistoryManager.isEpisodeWatched(it.id) }
     }
 
+    private suspend fun syncSnapshotFromRam(now: Long = System.currentTimeMillis()) {
+        val profileEmail = ContinueWatchingSnapshotStore.resolveActiveProfileEmail(appContext)
+        val topPair = ContinueWatchingSnapshotStore.deriveTopInProgressItem(
+            context = appContext,
+            entries = AndroidWatchHistoryManager.snapshotEntries(),
+            watchedIds = emptySet(),
+            archivedIds = AndroidWatchHistoryManager.snapshotArchivedIds(),
+            minPositionMs = 3000L
+        )
+        if (topPair != null) {
+            ContinueWatchingSnapshotStore.saveSnapshot(
+                context = appContext,
+                profileEmail = profileEmail,
+                item = topPair.first,
+                updatedAt = maxOf(now, topPair.second)
+            )
+        } else {
+            ContinueWatchingSnapshotStore.clearSnapshot(appContext, profileEmail)
+            AndroidWatchHistoryManager.notifyLocalInProgressCleared()
+        }
+    }
+
     suspend fun saveProgress(
         fileId: String,
         title: String,
@@ -857,7 +1006,7 @@ class PlaybackHistoryManager(
         val isCompletedNow = isFinished || wasAlreadyWatched
         val thumb = thumbnailUrl ?: backdropUrl
 
-        AndroidWatchHistoryManager.updateEntries {
+        val overflowed = AndroidWatchHistoryManager.updateEntries(appContext) {
             this["${fileId}_title"] = AndroidTypedEntry("string", title)
             this["${fileId}_pos"] = AndroidTypedEntry("long", finalPos)
             this["${fileId}_dur"] = AndroidTypedEntry("long", durationMs)
@@ -926,8 +1075,18 @@ class PlaybackHistoryManager(
             }
         }
 
-        if (immediateCloudSync || isFinished) {
-            watchHistorySync.executeDirectUpload(SyncPriority.CRITICAL_WATCH_STATE)
+        if (isFinished && isSeries && !seriesId.isNullOrBlank()) {
+            AndroidWatchHistoryManager.cleanupSeriesResumePointerIfNeeded(seriesId, fileId, appContext)
+        }
+
+        syncSnapshotFromRam(now)
+
+        val shouldUpdateArchive = overflowed || AndroidWatchHistoryManager.consumePendingArchiveSync()
+        if (immediateCloudSync || isFinished || shouldUpdateArchive) {
+            watchHistorySync.executeDirectUpload(
+                priority = SyncPriority.CRITICAL_WATCH_STATE,
+                updateArchive = shouldUpdateArchive
+            )
         } else {
             watchHistorySync.enqueueProgressUpdate()
         }
@@ -1052,6 +1211,24 @@ class PlaybackHistoryManager(
     suspend fun persistThumbnailUrl(fileId: String, thumbnailUrl: String) = withContext(NonCancellable + Dispatchers.IO) {
         if (fileId.isBlank() || thumbnailUrl.isBlank()) return@withContext
         AndroidWatchHistoryManager.saveThumbnailUrl(fileId, thumbnailUrl)
+        if (!com.clotube.app.data.metadata.OnlineMetadataResolver.isDriveVideoFrameUrl(thumbnailUrl)) {
+            val profileEmail = ContinueWatchingSnapshotStore.resolveActiveProfileEmail(appContext)
+            val topPair = ContinueWatchingSnapshotStore.deriveTopInProgressItem(
+                context = appContext,
+                entries = AndroidWatchHistoryManager.snapshotEntries(),
+                watchedIds = emptySet(),
+                archivedIds = AndroidWatchHistoryManager.snapshotArchivedIds(),
+                minPositionMs = 3000L
+            )
+            if (topPair != null && topPair.first.mediaId == fileId) {
+                ContinueWatchingSnapshotStore.saveSnapshot(
+                    context = appContext,
+                    profileEmail = profileEmail,
+                    item = topPair.first,
+                    updatedAt = System.currentTimeMillis()
+                )
+            }
+        }
     }
 
     fun getThumbnailUrl(fileId: String): String? {
@@ -1109,7 +1286,7 @@ class PlaybackHistoryManager(
         val effectiveTitle = title.ifBlank { nextEpisodeTitle ?: "" }
         val effectiveThumb = thumbnailUrl ?: nextThumbnailUrl ?: backdropUrl
 
-        AndroidWatchHistoryManager.updateEntries {
+        val overflowed = AndroidWatchHistoryManager.updateEntries(appContext) {
             this["${fileId}_title"] = AndroidTypedEntry("string", effectiveTitle)
             this["${fileId}_pos"] = AndroidTypedEntry("long", safeDur)
             this["${fileId}_dur"] = AndroidTypedEntry("long", safeDur)
@@ -1145,7 +1322,15 @@ class PlaybackHistoryManager(
             }
         }
 
-        watchHistorySync.executeDirectUpload(SyncPriority.CRITICAL_WATCH_STATE)
+        if (isSeries && !seriesId.isNullOrBlank() && nextEpisodeId.isNullOrBlank()) {
+            AndroidWatchHistoryManager.cleanupSeriesResumePointerIfNeeded(seriesId, fileId, appContext)
+        }
+
+        syncSnapshotFromRam(now)
+        watchHistorySync.executeDirectUpload(
+            priority = SyncPriority.CRITICAL_WATCH_STATE,
+            updateArchive = overflowed || AndroidWatchHistoryManager.consumePendingArchiveSync()
+        )
     }
 
     suspend fun completeEpisodeAndAdvance(
@@ -1205,6 +1390,7 @@ class PlaybackHistoryManager(
             seasonNumber = episode.seasonNumber,
             episodeNumber = episode.episodeNumber
         )
+        syncSnapshotFromRam()
     }
 
     suspend fun toggleEpisodeWatched(
@@ -1249,7 +1435,7 @@ class PlaybackHistoryManager(
     ) = withContext(NonCancellable + Dispatchers.IO) {
         if (episodes.isEmpty()) return@withContext
         val now = System.currentTimeMillis()
-        AndroidWatchHistoryManager.updateEntries {
+        val overflowed = AndroidWatchHistoryManager.updateEntries(appContext) {
             episodes.forEach { ep ->
                 val dur = ep.durationMs.coerceAtLeast(1000L)
                 this["${ep.id}_is_watched"] = AndroidTypedEntry("boolean", true)
@@ -1283,7 +1469,14 @@ class PlaybackHistoryManager(
                 }
             }
         }
-        watchHistorySync.executeDirectUpload(SyncPriority.CRITICAL_WATCH_STATE)
+        episodes.lastOrNull()?.let { lastEp ->
+            AndroidWatchHistoryManager.cleanupSeriesResumePointerIfNeeded(seriesId, lastEp.id, appContext)
+        }
+        syncSnapshotFromRam(now)
+        watchHistorySync.executeDirectUpload(
+            priority = SyncPriority.CRITICAL_WATCH_STATE,
+            updateArchive = overflowed || AndroidWatchHistoryManager.consumePendingArchiveSync()
+        )
     }
 
     suspend fun markSeasonAsIncomplete(
@@ -1294,7 +1487,7 @@ class PlaybackHistoryManager(
         if (episodes.isEmpty()) return@withContext
         val now = System.currentTimeMillis()
         val epIdSet = episodes.map { it.id }.toSet()
-        AndroidWatchHistoryManager.updateEntries {
+        val overflowed = AndroidWatchHistoryManager.updateEntries(appContext) {
             episodes.forEach { ep ->
                 this["${ep.id}_is_watched"] = AndroidTypedEntry("boolean", false)
                 this["${ep.id}_pos"] = AndroidTypedEntry("long", 0L)
@@ -1309,7 +1502,11 @@ class PlaybackHistoryManager(
                 this["${p}_timestamp"] = AndroidTypedEntry("long", now)
             }
         }
-        watchHistorySync.executeDirectUpload(SyncPriority.CRITICAL_WATCH_STATE)
+        syncSnapshotFromRam(now)
+        watchHistorySync.executeDirectUpload(
+            priority = SyncPriority.CRITICAL_WATCH_STATE,
+            updateArchive = overflowed || AndroidWatchHistoryManager.consumePendingArchiveSync()
+        )
     }
 
     suspend fun markEpisodeUnwatched(
@@ -1322,12 +1519,13 @@ class PlaybackHistoryManager(
     ) = withContext(NonCancellable + Dispatchers.IO) {
         if (episodeId.isBlank()) return@withContext
         val now = System.currentTimeMillis()
-        val wasArchived = AndroidWatchHistoryManager.snapshotArchivedIds().contains(episodeId)
+        val wasArchived = AndroidWatchHistoryManager.snapshotArchivedIds().contains(episodeId) ||
+            AndroidWatchHistoryManager.getArchivedItem(episodeId) != null
         if (wasArchived) {
-            AndroidWatchHistoryManager.removeEntriesForMedia(episodeId, null)
+            AndroidWatchHistoryManager.removeEntriesForMedia(episodeId, null, appContext)
         }
 
-        AndroidWatchHistoryManager.updateEntries {
+        val overflowed = AndroidWatchHistoryManager.updateEntries(appContext) {
             this["${episodeId}_is_watched"] = AndroidTypedEntry("boolean", false)
             this["${episodeId}_fraction"] = AndroidTypedEntry("float", 0.0f)
             this["${episodeId}_pos"] = AndroidTypedEntry("long", 0L)
@@ -1346,9 +1544,10 @@ class PlaybackHistoryManager(
             }
         }
 
+        syncSnapshotFromRam(now)
         watchHistorySync.executeDirectUpload(
             priority = SyncPriority.CRITICAL_WATCH_STATE,
-            updateArchive = wasArchived
+            updateArchive = wasArchived || overflowed || AndroidWatchHistoryManager.consumePendingArchiveSync()
         )
     }
 
@@ -1382,26 +1581,29 @@ class PlaybackHistoryManager(
     suspend fun markSingleEpisodeIncomplete(episodeId: String) = withContext(NonCancellable + Dispatchers.IO) {
         if (episodeId.isBlank()) return@withContext
         val now = System.currentTimeMillis()
-        val wasArchived = AndroidWatchHistoryManager.snapshotArchivedIds().contains(episodeId)
+        val wasArchived = AndroidWatchHistoryManager.snapshotArchivedIds().contains(episodeId) ||
+            AndroidWatchHistoryManager.getArchivedItem(episodeId) != null
         if (wasArchived) {
-            AndroidWatchHistoryManager.removeEntriesForMedia(episodeId, null)
+            AndroidWatchHistoryManager.removeEntriesForMedia(episodeId, null, appContext)
         }
 
-        AndroidWatchHistoryManager.updateEntries {
+        val overflowed = AndroidWatchHistoryManager.updateEntries(appContext) {
             this["${episodeId}_is_watched"] = AndroidTypedEntry("boolean", false)
             this["${episodeId}_pos"] = AndroidTypedEntry("long", 0L)
             this["${episodeId}_fraction"] = AndroidTypedEntry("float", 0.0f)
             this["${episodeId}_timestamp"] = AndroidTypedEntry("long", now)
         }
 
+        syncSnapshotFromRam(now)
         watchHistorySync.executeDirectUpload(
             priority = SyncPriority.CRITICAL_WATCH_STATE,
-            updateArchive = wasArchived
+            updateArchive = wasArchived || overflowed || AndroidWatchHistoryManager.consumePendingArchiveSync()
         )
     }
 
     suspend fun getLastWatchedEpisode(series: Series): Episode? = withContext(Dispatchers.IO) {
         val entries = AndroidWatchHistoryManager.snapshotEntries()
+        val archivedItems = AndroidWatchHistoryManager.snapshotArchivedItems()
         val allEpisodes = series.seasons.flatMap { it.episodes }
         if (allEpisodes.isEmpty()) return@withContext null
 
@@ -1415,7 +1617,9 @@ class PlaybackHistoryManager(
         var latestEp: Episode? = null
         var latestTs = 0L
         for (ep in allEpisodes) {
-            val ts = (entries["${ep.id}_timestamp"]?.value as? Number)?.toLong() ?: 0L
+            val activeTs = (entries["${ep.id}_timestamp"]?.value as? Number)?.toLong() ?: 0L
+            val archiveTs = archivedItems[ep.id]?.timestamp ?: 0L
+            val ts = maxOf(activeTs, archiveTs)
             if (ts > latestTs) {
                 latestTs = ts
                 latestEp = ep
@@ -1426,10 +1630,11 @@ class PlaybackHistoryManager(
 
     suspend fun deleteItemHistory(contentId: String, seriesId: String? = null) =
         withContext(NonCancellable + Dispatchers.IO) {
-            val removedFromArchive = AndroidWatchHistoryManager.removeEntriesForMedia(contentId, seriesId)
+            val removedFromArchive = AndroidWatchHistoryManager.removeEntriesForMedia(contentId, seriesId, appContext)
+            syncSnapshotFromRam()
             watchHistorySync.executeDirectUpload(
                 priority = SyncPriority.CRITICAL_WATCH_STATE,
-                updateArchive = removedFromArchive
+                updateArchive = removedFromArchive || AndroidWatchHistoryManager.consumePendingArchiveSync()
             )
         }
 
@@ -1438,7 +1643,10 @@ class PlaybackHistoryManager(
     suspend fun deleteHistoryItem(fileId: String) = deleteItemHistory(fileId)
 
     suspend fun clearEntireWatchHistory() = withContext(NonCancellable + Dispatchers.IO) {
-        AndroidWatchHistoryManager.clearInMemory()
+        AndroidWatchHistoryManager.clearInMemory(appContext)
+        val profileEmail = ContinueWatchingSnapshotStore.resolveActiveProfileEmail(appContext)
+        ContinueWatchingSnapshotStore.clearSnapshot(appContext, profileEmail)
+        AndroidWatchHistoryManager.notifyLocalInProgressCleared()
         val deletedFromDrive = watchHistorySync.deleteRemoteHistoryFiles()
         if (deletedFromDrive) {
             Log.i("ClotubeSync", "All watch history wiped in RAM and removed from Drive")
@@ -1450,26 +1658,50 @@ class PlaybackHistoryManager(
     suspend fun clearAllHistory() = clearEntireWatchHistory()
 
     companion object {
+        internal fun resolveResumePosition(fileId: String, durationMs: Long): Long {
+            if (fileId.isBlank()) return 0L
+
+            // Step 1: Check volatile active window first
+            val entries = AndroidWatchHistoryManager.snapshotEntries()
+            val hasActiveEntry = entries.containsKey("${fileId}_pos") ||
+                entries.containsKey("${fileId}_timestamp") ||
+                entries.containsKey("${fileId}_is_watched") ||
+                entries.containsKey("${fileId}_fraction")
+
+            if (hasActiveEntry) {
+                val pos = (entries["${fileId}_pos"]?.value as? Number)?.toLong() ?: 0L
+                val dur = if (durationMs > 0L) durationMs else (entries["${fileId}_dur"]?.value as? Number)?.toLong() ?: 0L
+                val fraction = (entries["${fileId}_fraction"]?.value as? Number)?.toFloat() ?: 0f
+                val isWatched = AndroidWatchHistoryManager.isEpisodeWatched(fileId) || fraction >= 0.90f
+
+                return when {
+                    pos > 5000L && (dur == 0L || pos < dur - 15000L) -> pos
+                    isWatched -> 0L
+                    pos > 3000L -> pos
+                    else -> 0L
+                }
+            }
+
+            // Step 2: Fallback to persistent archive store if evicted from the 50-item active window
+            val archived = AndroidWatchHistoryManager.getArchivedItem(fileId) ?: return 0L
+            val effectiveDur = if (durationMs > 0L) durationMs else archived.durationMs
+            if (archived.isResumeEligibleFromArchive &&
+                (effectiveDur <= 0L || archived.positionMs < effectiveDur - 15000L)
+            ) {
+                return archived.positionMs
+            }
+            return 0L
+        }
+
         @JvmStatic
         fun getResumePosition(
-            @Suppress("UNUSED_PARAMETER") context: Context,
+            context: Context,
             @Suppress("UNUSED_PARAMETER") userEmail: String,
             fileId: String,
             durationMs: Long
         ): Long {
-            if (fileId.isBlank()) return 0L
-            val entries = AndroidWatchHistoryManager.snapshotEntries()
-            val pos = (entries["${fileId}_pos"]?.value as? Number)?.toLong() ?: 0L
-            val dur = if (durationMs > 0L) durationMs else (entries["${fileId}_dur"]?.value as? Number)?.toLong() ?: 0L
-            val fraction = (entries["${fileId}_fraction"]?.value as? Number)?.toFloat() ?: 0f
-            val isWatched = AndroidWatchHistoryManager.isEpisodeWatched(fileId) || fraction >= 0.90f
-
-            return when {
-                pos > 5000L && (dur == 0L || pos < dur - 15000L) -> pos
-                isWatched -> 0L
-                pos > 3000L -> pos
-                else -> 0L
-            }
+            AndroidWatchHistoryManager.ensureArchiveLoaded(context)
+            return resolveResumePosition(fileId, durationMs)
         }
     }
 }

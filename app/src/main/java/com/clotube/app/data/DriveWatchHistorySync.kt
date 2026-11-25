@@ -20,6 +20,9 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
@@ -38,6 +41,14 @@ enum class SyncPriority(val level: Int) {
     BACKGROUND_SYNC(3)
 }
 
+data class CloudHistorySyncOutcome(
+    val revision: Long = 0L,
+    val succeeded: Boolean = false,
+    val confirmedEmpty: Boolean = false,
+    val remoteWasNewer: Boolean = false,
+    val remoteLatestTs: Long = 0L
+)
+
 class DriveWatchHistorySync(private val context: Context) {
 
     private val appContext: Context = context.applicationContext
@@ -50,6 +61,9 @@ class DriveWatchHistorySync(private val context: Context) {
     private val isPullingFromCloud = AtomicBoolean(false)
     private val lastCloudPullTimeMs = AtomicLong(0L)
     private var debouncedProgressJob: Job? = null
+
+    private val _lastSyncOutcome = MutableStateFlow(CloudHistorySyncOutcome())
+    val lastSyncOutcome: StateFlow<CloudHistorySyncOutcome> = _lastSyncOutcome.asStateFlow()
 
     fun invalidateCache() {
         cachedActiveFileId.set(null)
@@ -101,23 +115,56 @@ class DriveWatchHistorySync(private val context: Context) {
         return null
     }
 
-    private fun downloadJsonFile(driveService: Drive, fileId: String): String? {
+    private data class DownloadResult(
+        val content: String?,
+        val notFound: Boolean
+    )
+
+    private fun downloadJsonFile(driveService: Drive, fileId: String): DownloadResult {
         return try {
             val out = ByteArrayOutputStream()
             driveService.files().get(fileId)
                 .setSupportsAllDrives(true)
                 .executeMediaAndDownloadTo(out)
-            out.toString("UTF-8").takeIf { it.isNotBlank() }
+            DownloadResult(out.toString("UTF-8").takeIf { it.isNotBlank() }, notFound = false)
         } catch (e: GoogleJsonResponseException) {
-            if (e.statusCode == 404) null else throw e
+            if (e.statusCode == 404) DownloadResult(null, notFound = true) else throw e
         }
     }
 
+    private fun downloadWithStaleIdRetry(
+        driveService: Drive,
+        historyFolderId: String,
+        fileName: String,
+        cachedIdRef: AtomicReference<String?>
+    ): String? {
+        val currentId = cachedIdRef.get()
+            ?: findFileInHistoryFolder(driveService, historyFolderId, fileName)?.also { cachedIdRef.set(it) }
+            ?: return null
+
+        val firstAttempt = downloadJsonFile(driveService, currentId)
+        if (!firstAttempt.notFound) {
+            return firstAttempt.content
+        }
+
+        // Cached Drive fileId went stale (404); clear and re-discover once
+        cachedIdRef.set(null)
+        val freshId = findFileInHistoryFolder(driveService, historyFolderId, fileName)
+            ?.also { cachedIdRef.set(it) }
+            ?: return null
+        return downloadJsonFile(driveService, freshId).content
+    }
+
     /**
-     * Authoritative pull from clotube/History/clotube_active_sync.json and clotube_archive.json.
-     * Replaces volatile RAM state completely—zero local disk caching or merging.
+     * Authoritative timestamp-fenced pull & self-healing merge from `clotube/History/clotube_active_sync.json`
+     * and `clotube_archive.json`, reconciled against the local archive store and `ContinueWatchingSnapshotStore`.
      */
-    suspend fun syncFromCloud(force: Boolean = false): Boolean = withContext(Dispatchers.IO) {
+    suspend fun syncFromCloud(force: Boolean = false): Boolean = pullAndMerge(appContext, force)
+
+    suspend fun pullAndMerge(
+        context: Context = appContext,
+        force: Boolean = true
+    ): Boolean = withContext(Dispatchers.IO) {
         val now = System.currentTimeMillis()
         if (!force && (now - lastCloudPullTimeMs.get() < CLOUD_PULL_COOLDOWN_MS)) {
             return@withContext true
@@ -126,31 +173,322 @@ class DriveWatchHistorySync(private val context: Context) {
             return@withContext false
         }
 
+        var shouldHealPushToDrive = false
         try {
+            val appCtx = context.applicationContext
+            AndroidWatchHistoryManager.ensureArchiveLoaded(appCtx)
+
             val driveService = getDriveService() ?: return@withContext false
             val historyFolderId = resolveHistoryFolderId(driveService)
 
-            val activeFileId = cachedActiveFileId.get()
-                ?: findFileInHistoryFolder(driveService, historyFolderId, ACTIVE_SYNC_FILE)?.also {
-                    cachedActiveFileId.set(it)
+            val activeJson = downloadWithStaleIdRetry(
+                driveService = driveService,
+                historyFolderId = historyFolderId,
+                fileName = ACTIVE_SYNC_FILE,
+                cachedIdRef = cachedActiveFileId
+            )
+            val archiveJson = downloadWithStaleIdRetry(
+                driveService = driveService,
+                historyFolderId = historyFolderId,
+                fileName = ARCHIVE_SYNC_FILE,
+                cachedIdRef = cachedArchiveFileId
+            )
+
+            val payload = if (activeJson != null) {
+                runCatching { WatchHistoryPayloadV2.fromJsonString(activeJson) }.getOrNull()
+            } else {
+                null
+            }
+            val remoteArchive = if (archiveJson != null) {
+                runCatching { ArchivePayloadV2.fromJsonString(archiveJson) }.getOrNull()
+            } else {
+                null
+            }
+
+            val pendingDeleted = AndroidWatchHistoryManager.snapshotPendingDeletedFromArchiveIds()
+            val mergedArchiveItems = linkedMapOf<String, HistoryItemEntityV2>()
+            AndroidWatchHistoryManager.snapshotArchivedItems().values.forEach { localItem ->
+                if (localItem.id.isNotBlank() && localItem.id !in pendingDeleted) {
+                    val existing = mergedArchiveItems[localItem.id]
+                    if (existing == null || localItem.timestamp >= existing.timestamp) {
+                        mergedArchiveItems[localItem.id] = localItem
+                    }
+                }
+            }
+            remoteArchive?.items.orEmpty().forEach { remoteItem ->
+                if (remoteItem.id.isNotBlank() && remoteItem.id !in pendingDeleted) {
+                    val existing = mergedArchiveItems[remoteItem.id]
+                    if (existing == null || remoteItem.timestamp >= existing.timestamp) {
+                        mergedArchiveItems[remoteItem.id] = remoteItem
+                    }
+                }
+            }
+
+            val mergedWatchedIds = linkedSetOf<String>()
+            AndroidWatchHistoryManager.snapshotArchivedIds()
+                .filter { it.isNotBlank() && it !in pendingDeleted }
+                .forEach { mergedWatchedIds.add(it) }
+            remoteArchive?.watchedIds.orEmpty()
+                .filter { it.isNotBlank() && it !in pendingDeleted }
+                .forEach { mergedWatchedIds.add(it) }
+            payload?.watchedIds.orEmpty()
+                .filter { it.isNotBlank() && it !in pendingDeleted }
+                .forEach { mergedWatchedIds.add(it) }
+            mergedArchiveItems.values.forEach { entity ->
+                if (entity.isWatched || entity.progressFraction >= 0.90f) {
+                    mergedWatchedIds.add(entity.id)
+                }
+            }
+            payload?.active.orEmpty().forEach { entity ->
+                if ((entity.isWatched || entity.progressFraction >= 0.90f) && entity.id !in pendingDeleted) {
+                    mergedWatchedIds.add(entity.id)
+                }
+            }
+
+            // Self-Healing Promotion: move genuinely in-progress archived items back to active window
+            val remoteActiveById = payload?.active.orEmpty().associateBy { it.id }
+            val promotedItems = mutableListOf<HistoryItemEntityV2>()
+            val payloadWatchedSet = payload?.watchedIds?.filter { it.isNotBlank() }?.toSet().orEmpty()
+
+            mergedArchiveItems.values.toList().forEach { item ->
+                val remoteActiveMatch = remoteActiveById[item.id]
+                val completedInRemoteActive = remoteActiveMatch != null &&
+                    (remoteActiveMatch.isWatched || remoteActiveMatch.progressFraction >= 0.90f) &&
+                    remoteActiveMatch.timestamp >= item.timestamp
+                if (item.isInProgressForProtection && !completedInRemoteActive && item.id !in payloadWatchedSet) {
+                    promotedItems.add(item)
+                    mergedArchiveItems.remove(item.id)
+                    mergedWatchedIds.remove(item.id)
+                } else if (remoteActiveMatch != null && (remoteActiveMatch.isWatched || remoteActiveMatch.progressFraction >= 0.90f)) {
+                    if (remoteActiveMatch.timestamp >= item.timestamp) {
+                        mergedArchiveItems[item.id] = remoteActiveMatch
+                        mergedWatchedIds.add(item.id)
+                    }
+                }
+            }
+
+            // Combine remote active items + promoted archive items using LWW, then priority-partition <= 50
+            val combinedActiveMap = linkedMapOf<String, HistoryItemEntityV2>()
+            payload?.active.orEmpty().forEach { entity ->
+                if (entity.id.isNotBlank()) {
+                    val existing = combinedActiveMap[entity.id]
+                    if (existing == null || entity.timestamp >= existing.timestamp) {
+                        combinedActiveMap[entity.id] = entity
+                    }
+                }
+            }
+            promotedItems.forEach { promoted ->
+                val existing = combinedActiveMap[promoted.id]
+                if (existing == null || promoted.timestamp >= existing.timestamp) {
+                    combinedActiveMap[promoted.id] = promoted
+                }
+            }
+
+            val partition = WatchHistoryPayloadV2.partitionActiveWindow(combinedActiveMap.values.toList())
+            partition.overflowItems.forEach { overflow ->
+                val existing = mergedArchiveItems[overflow.id]
+                if (existing == null || overflow.timestamp >= existing.timestamp) {
+                    mergedArchiveItems[overflow.id] = overflow
+                }
+                if (overflow.isWatched || overflow.progressFraction >= 0.90f) {
+                    mergedWatchedIds.add(overflow.id)
+                }
+            }
+
+            val activeIdsAfterPartition = partition.activeItems.map { it.id }.toSet()
+            val promotedIntoActive = promotedItems.any { it.id in activeIdsAfterPartition }
+            shouldHealPushToDrive = promotedIntoActive
+
+            partition.activeItems.filter { it.isInProgressForProtection }.forEach { inProg ->
+                mergedWatchedIds.remove(inProg.id)
+            }
+
+            val effectivePayload = WatchHistoryPayloadV2(
+                version = payload?.version ?: 2,
+                updatedAt = payload?.updatedAt ?: 0L,
+                active = partition.activeItems,
+                resume = payload?.resume.orEmpty(),
+                watchedIds = mergedWatchedIds.toList()
+            )
+
+            val activePayloadTs = WatchHistoryPayloadV2.normalizeTimestampMs(effectivePayload.updatedAt)
+            val activeMaxItemTs = partition.activeItems.maxOfOrNull { WatchHistoryPayloadV2.normalizeTimestampMs(it.timestamp) } ?: 0L
+            val resumeMaxTs = effectivePayload.resume.values.maxOfOrNull { WatchHistoryPayloadV2.normalizeTimestampMs(it.timestamp) } ?: 0L
+            val remoteLatestTs = maxOf(activePayloadTs, activeMaxItemTs, resumeMaxTs, remoteArchive?.updatedAt ?: 0L)
+
+            val activeEntries = parseActiveSyncPayload(effectivePayload, mergedWatchedIds)
+
+            val profileEmail = ContinueWatchingSnapshotStore.resolveActiveProfileEmail(appCtx)
+            val localSnapshot = ContinueWatchingSnapshotStore.loadSnapshot(appCtx, profileEmail)
+            val ramEntries = AndroidWatchHistoryManager.snapshotEntries()
+            val ramLatestTs = AndroidWatchHistoryManager.getLatestTimestampMs()
+
+            val localSnapshotIsNewer = localSnapshot.item != null && localSnapshot.updatedAt > remoteLatestTs
+            val localRamIsNewer = ramEntries.isNotEmpty() && ramLatestTs > remoteLatestTs
+
+            if (localSnapshotIsNewer || localRamIsNewer) {
+                // Case B: Local snapshot / RAM progress is newer than Drive; preserve local progress and push up to Drive.
+                var removedFromArchive = false
+                if (ramEntries.isEmpty() && localSnapshot.item != null) {
+                    AndroidWatchHistoryManager.replaceAllFromDrive(
+                        activeEntries = activeEntries,
+                        archiveIds = mergedWatchedIds,
+                        archivedItemList = mergedArchiveItems.values,
+                        context = appCtx
+                    )
+                    removedFromArchive = AndroidWatchHistoryManager.seedSnapshotEntryIfNewer(
+                        item = localSnapshot.item,
+                        updatedAt = localSnapshot.updatedAt
+                    )
+                } else {
+                    AndroidWatchHistoryManager.replaceArchiveFromCloud(
+                        context = appCtx,
+                        items = mergedArchiveItems.values,
+                        watchedIds = mergedWatchedIds
+                    )
+                    if (localSnapshot.item != null && localSnapshot.updatedAt > ramLatestTs) {
+                        removedFromArchive = AndroidWatchHistoryManager.seedSnapshotEntryIfNewer(
+                            item = localSnapshot.item,
+                            updatedAt = localSnapshot.updatedAt
+                        )
+                    }
                 }
 
-            val archiveFileId = cachedArchiveFileId.get()
-                ?: findFileInHistoryFolder(driveService, historyFolderId, ARCHIVE_SYNC_FILE)?.also {
-                    cachedArchiveFileId.set(it)
+                enqueueImmediateWatchState(updateArchive = removedFromArchive || promotedIntoActive)
+                shouldHealPushToDrive = false
+                lastCloudPullTimeMs.set(System.currentTimeMillis())
+                _lastSyncOutcome.value = CloudHistorySyncOutcome(
+                    revision = maxOf(_lastSyncOutcome.value.revision + 1L, System.nanoTime()),
+                    succeeded = true,
+                    confirmedEmpty = false,
+                    remoteWasNewer = false,
+                    remoteLatestTs = remoteLatestTs
+                )
+                Log.i(
+                    TAG,
+                    "Preserved newer local progress over stale Drive (localTs=${maxOf(localSnapshot.updatedAt, ramLatestTs)}, remoteTs=$remoteLatestTs); enqueued upload"
+                )
+                return@withContext true
+            }
+
+            val watchedSet = effectivePayload.watchedIds.filter { it.isNotBlank() }.toSet()
+
+            if (remoteLatestTs > localSnapshot.updatedAt && remoteLatestTs > 0L) {
+                // Case A: Remote Drive V2 state (or promoted archive recovery) is newer than local snapshot
+                AndroidWatchHistoryManager.replaceAllFromDrive(
+                    activeEntries = activeEntries,
+                    archiveIds = mergedWatchedIds,
+                    archivedItemList = mergedArchiveItems.values,
+                    context = appCtx
+                )
+                val topPair = ContinueWatchingSnapshotStore.deriveTopInProgressItem(
+                    context = appCtx,
+                    entries = AndroidWatchHistoryManager.snapshotEntries(),
+                    watchedIds = watchedSet,
+                    archivedIds = AndroidWatchHistoryManager.snapshotArchivedIds(),
+                    archivedItems = AndroidWatchHistoryManager.snapshotArchivedItems(),
+                    minPositionMs = 0L
+                )
+
+                if (topPair != null) {
+                    ContinueWatchingSnapshotStore.saveSnapshot(
+                        context = appCtx,
+                        profileEmail = profileEmail,
+                        item = topPair.first,
+                        updatedAt = maxOf(remoteLatestTs, topPair.second)
+                    )
+                    _lastSyncOutcome.value = CloudHistorySyncOutcome(
+                        revision = maxOf(_lastSyncOutcome.value.revision + 1L, System.nanoTime()),
+                        succeeded = true,
+                        confirmedEmpty = false,
+                        remoteWasNewer = true,
+                        remoteLatestTs = remoteLatestTs
+                    )
+                } else {
+                    ContinueWatchingSnapshotStore.markConfirmedEmpty(
+                        context = appCtx,
+                        profileEmail = profileEmail,
+                        updatedAt = remoteLatestTs
+                    )
+                    _lastSyncOutcome.value = CloudHistorySyncOutcome(
+                        revision = maxOf(_lastSyncOutcome.value.revision + 1L, System.nanoTime()),
+                        succeeded = true,
+                        confirmedEmpty = true,
+                        remoteWasNewer = true,
+                        remoteLatestTs = remoteLatestTs
+                    )
                 }
+            } else if (remoteLatestTs == 0L && mergedArchiveItems.isEmpty() && mergedWatchedIds.isEmpty()) {
+                // Case C: Remote confirms empty and local snapshot has no newer progress
+                AndroidWatchHistoryManager.replaceAllFromDrive(emptyMap(), emptySet(), emptyList(), appCtx)
+                ContinueWatchingSnapshotStore.markConfirmedEmpty(
+                    context = appCtx,
+                    profileEmail = profileEmail,
+                    updatedAt = System.currentTimeMillis()
+                )
+                _lastSyncOutcome.value = CloudHistorySyncOutcome(
+                    revision = maxOf(_lastSyncOutcome.value.revision + 1L, System.nanoTime()),
+                    succeeded = true,
+                    confirmedEmpty = true,
+                    remoteWasNewer = false,
+                    remoteLatestTs = 0L
+                )
+            } else {
+                // Timestamps match (remoteLatestTs == localSnapshot.updatedAt): hydrate RAM & archive from Drive
+                AndroidWatchHistoryManager.replaceAllFromDrive(
+                    activeEntries = activeEntries,
+                    archiveIds = mergedWatchedIds,
+                    archivedItemList = mergedArchiveItems.values,
+                    context = appCtx
+                )
+                val topPair = ContinueWatchingSnapshotStore.deriveTopInProgressItem(
+                    context = appCtx,
+                    entries = AndroidWatchHistoryManager.snapshotEntries(),
+                    watchedIds = watchedSet,
+                    archivedIds = AndroidWatchHistoryManager.snapshotArchivedIds(),
+                    archivedItems = AndroidWatchHistoryManager.snapshotArchivedItems(),
+                    minPositionMs = 0L
+                )
+                if (topPair == null) {
+                    ContinueWatchingSnapshotStore.markConfirmedEmpty(
+                        context = appCtx,
+                        profileEmail = profileEmail,
+                        updatedAt = remoteLatestTs.takeIf { it > 0L } ?: System.currentTimeMillis()
+                    )
+                    _lastSyncOutcome.value = CloudHistorySyncOutcome(
+                        revision = maxOf(_lastSyncOutcome.value.revision + 1L, System.nanoTime()),
+                        succeeded = true,
+                        confirmedEmpty = true,
+                        remoteWasNewer = false,
+                        remoteLatestTs = remoteLatestTs
+                    )
+                } else {
+                    if (localSnapshot.item == null) {
+                        ContinueWatchingSnapshotStore.saveSnapshot(
+                            context = appCtx,
+                            profileEmail = profileEmail,
+                            item = topPair.first,
+                            updatedAt = maxOf(remoteLatestTs, topPair.second)
+                        )
+                    }
+                    _lastSyncOutcome.value = CloudHistorySyncOutcome(
+                        revision = maxOf(_lastSyncOutcome.value.revision + 1L, System.nanoTime()),
+                        succeeded = true,
+                        confirmedEmpty = false,
+                        remoteWasNewer = false,
+                        remoteLatestTs = remoteLatestTs
+                    )
+                }
+            }
 
-            val activeJson = activeFileId?.let { downloadJsonFile(driveService, it) }
-            val archiveJson = archiveFileId?.let { downloadJsonFile(driveService, it) }
+            if (shouldHealPushToDrive) {
+                executeDirectUpload(SyncPriority.CRITICAL_WATCH_STATE, updateArchive = true)
+            }
 
-            val activeEntries = if (activeJson != null) parseActiveSyncJson(activeJson) else emptyMap()
-            val archivedIds = if (archiveJson != null) parseArchiveJson(archiveJson) else emptySet()
-
-            AndroidWatchHistoryManager.replaceAllFromDrive(activeEntries, archivedIds)
             lastCloudPullTimeMs.set(System.currentTimeMillis())
             Log.i(
                 TAG,
-                "Pulled directly from Drive: activeEntries=${activeEntries.size}, archivedIds=${archivedIds.size}"
+                "Pulled from Drive: activeEntries=${activeEntries.size}, archivedItems=${mergedArchiveItems.size}, archivedIds=${mergedWatchedIds.size}, promotedFromArchive=$promotedIntoActive, remoteLatestTs=$remoteLatestTs"
             )
             true
         } catch (e: Exception) {
@@ -164,28 +502,30 @@ class DriveWatchHistorySync(private val context: Context) {
         }
     }
 
-    private fun parseActiveSyncJson(remoteJson: String): Map<String, AndroidTypedEntry> {
+    private fun parseActiveSyncPayload(
+        payload: WatchHistoryPayloadV2,
+        archivedIds: Set<String>
+    ): Map<String, AndroidTypedEntry> {
         val result = mutableMapOf<String, AndroidTypedEntry>()
-        val payload = WatchHistoryPayloadV2.fromJsonString(remoteJson)
         val updatedAt = WatchHistoryPayloadV2.normalizeTimestampMs(payload.updatedAt)
         if (updatedAt > 0L) {
             result["global_latest_timestamp"] = AndroidTypedEntry("long", updatedAt)
         }
 
         val activeById = payload.active.associateBy { it.id }
+        val watchedSet = payload.watchedIds.filter { it.isNotBlank() }.toSet()
 
-        for (watchedId in payload.watchedIds) {
-            if (watchedId.isNotBlank()) {
-                result["${watchedId}_is_watched"] = AndroidTypedEntry("boolean", true)
-                result["${watchedId}_fraction"] = AndroidTypedEntry("float", 1.0f)
-            }
+        for (watchedId in watchedSet) {
+            result["${watchedId}_is_watched"] = AndroidTypedEntry("boolean", true)
+            result["${watchedId}_fraction"] = AndroidTypedEntry("float", 1.0f)
         }
 
         for (item in payload.active) {
             if (item.id.isBlank()) continue
             val id = item.id
             val itemTs = WatchHistoryPayloadV2.normalizeTimestampMs(item.timestamp)
-            val frac = if (item.isWatched) {
+            val isWatchedEffective = item.isWatched || id in watchedSet || id in archivedIds
+            val frac = if (isWatchedEffective) {
                 1.0f
             } else if (item.durationMs > 0L) {
                 (item.positionMs.toFloat() / item.durationMs.toFloat()).coerceIn(0f, 1f)
@@ -201,7 +541,7 @@ class DriveWatchHistorySync(private val context: Context) {
             result["${id}_dur"] = AndroidTypedEntry("long", item.durationMs)
             result["${id}_fraction"] = AndroidTypedEntry("float", frac)
             result["${id}_timestamp"] = AndroidTypedEntry("long", itemTs)
-            result["${id}_is_watched"] = AndroidTypedEntry("boolean", item.isWatched)
+            result["${id}_is_watched"] = AndroidTypedEntry("boolean", isWatchedEffective)
             result["${id}_is_series"] = AndroidTypedEntry("boolean", isSeries)
             if (!item.seriesId.isNullOrBlank()) {
                 result["${id}_series_id"] = AndroidTypedEntry("string", item.seriesId)
@@ -248,12 +588,13 @@ class DriveWatchHistorySync(private val context: Context) {
             // Ensure the target episodeId entry reflects the latest resume timestamp & series metadata
             val epId = resume.episodeId
             val existingEpTs = (result["${epId}_timestamp"]?.value as? Number)?.toLong() ?: 0L
+            val alreadyWatched = epId in watchedSet || epId in archivedIds || linkedActive?.isWatched == true
             if (resTs >= existingEpTs) {
                 result["${epId}_timestamp"] = AndroidTypedEntry("long", resTs)
                 result["${epId}_pos"] = AndroidTypedEntry("long", resume.positionMs)
                 result["${epId}_dur"] = AndroidTypedEntry("long", resume.durationMs)
-                result["${epId}_fraction"] = AndroidTypedEntry("float", frac)
-                val isCompleted = resume.durationMs > 0L && resume.positionMs >= (resume.durationMs * 0.90f)
+                result["${epId}_fraction"] = AndroidTypedEntry("float", if (alreadyWatched) 1.0f else frac)
+                val isCompleted = alreadyWatched || (resume.durationMs > 0L && resume.positionMs >= (resume.durationMs * 0.90f))
                 result["${epId}_is_watched"] = AndroidTypedEntry("boolean", isCompleted)
             }
             result["${epId}_is_series"] = AndroidTypedEntry("boolean", true)
@@ -268,44 +609,10 @@ class DriveWatchHistorySync(private val context: Context) {
         return result
     }
 
-    private fun parseArchiveJson(archiveJson: String): Set<String> {
-        val ids = mutableSetOf<String>()
-        try {
-            val root = JSONObject(archiveJson)
-            val watchedArr = root.optJSONArray("watchedIds")
-            if (watchedArr != null) {
-                for (i in 0 until watchedArr.length()) {
-                    val id = watchedArr.optString(i).trim()
-                    if (id.isNotBlank()) ids.add(id)
-                }
-            }
-            val itemsArr = root.optJSONArray("items")
-            if (itemsArr != null) {
-                for (i in 0 until itemsArr.length()) {
-                    val obj = itemsArr.optJSONObject(i) ?: continue
-                    val id = obj.optString("id").trim()
-                    if (id.isNotBlank()) ids.add(id)
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Could not parse $ARCHIVE_SYNC_FILE:${e.message}")
-        }
-        return ids
-    }
-
-    private fun buildArchiveJsonString(archiveIds: Set<String>): String {
-        val root = JSONObject()
-        root.put("v", 2)
-        root.put("updatedAt", System.currentTimeMillis())
-        val arr = JSONArray()
-        archiveIds.sorted().forEach { arr.put(it) }
-        root.put("watchedIds", arr)
-        return root.toString()
-    }
-
     /**
      * Pushes current volatile state directly to clotube/History/clotube_active_sync.json
-     * (and updates clotube_archive.json if an archived item was unwatched or deleted).
+     * (and performs an atomic pull-merge-upsert on clotube_archive.json whenever archive state changed
+     * or overflow occurred during priority-protected active window pruning).
      */
     suspend fun executeDirectUpload(
         priority: SyncPriority = SyncPriority.CRITICAL_WATCH_STATE,
@@ -313,11 +620,24 @@ class DriveWatchHistorySync(private val context: Context) {
     ): Boolean = uploadMutex.withLock {
         withContext(NonCancellable + Dispatchers.IO) {
             try {
+                AndroidWatchHistoryManager.ensureArchiveLoaded(appContext)
+                val overflowFromLimit = AndroidWatchHistoryManager.enforceActiveWindowLimit(appContext)
+                val pendingSync = AndroidWatchHistoryManager.consumePendingArchiveSync()
+
                 val driveService = getDriveService() ?: return@withContext false
                 val historyFolderId = resolveHistoryFolderId(driveService)
 
                 val activeSnapshot = AndroidWatchHistoryManager.snapshotEntries()
-                val activePayloadJson = WatchHistoryPayloadV2.fromTypedEntries(activeSnapshot).toJsonString()
+                val rawActivePayload = WatchHistoryPayloadV2.fromTypedEntries(activeSnapshot)
+                val partition = WatchHistoryPayloadV2.partitionActiveWindow(rawActivePayload.active)
+                if (partition.overflowItems.isNotEmpty()) {
+                    AndroidWatchHistoryManager.upsertArchivedItems(appContext, partition.overflowItems)
+                }
+                val activePayload = rawActivePayload
+                    .copy(active = partition.activeItems)
+                    .prunedToMaxBytes(MAX_ACTIVE_PAYLOAD_BYTES)
+
+                val activePayloadJson = activePayload.toJsonString()
                 val activeMedia = ByteArrayContent.fromString("application/json", activePayloadJson)
 
                 val activeOk = upsertHistoryFile(
@@ -329,10 +649,78 @@ class DriveWatchHistorySync(private val context: Context) {
                     priority = priority
                 )
 
-                if (updateArchive) {
-                    val archiveJson = buildArchiveJsonString(AndroidWatchHistoryManager.snapshotArchivedIds())
-                    val archiveMedia = ByteArrayContent.fromString("application/json", archiveJson)
-                    upsertHistoryFile(
+                val shouldUpdateArchive = updateArchive ||
+                    overflowFromLimit ||
+                    pendingSync ||
+                    partition.overflowItems.isNotEmpty()
+
+                if (shouldUpdateArchive) {
+                    val remoteArchiveJson = downloadWithStaleIdRetry(
+                        driveService = driveService,
+                        historyFolderId = historyFolderId,
+                        fileName = ARCHIVE_SYNC_FILE,
+                        cachedIdRef = cachedArchiveFileId
+                    )
+                    val remoteArchive = if (remoteArchiveJson != null) {
+                        runCatching { ArchivePayloadV2.fromJsonString(remoteArchiveJson) }.getOrNull()
+                    } else {
+                        null
+                    }
+
+                    val activeUnwatchedIds = activePayload.active
+                        .filter { !it.isWatched && it.progressFraction < 0.90f }
+                        .map { it.id }
+                        .toSet()
+                    val pendingDeleted = AndroidWatchHistoryManager.snapshotPendingDeletedFromArchiveIds()
+                    val excludedIds = activeUnwatchedIds + pendingDeleted
+
+                    val mergedItemsMap = linkedMapOf<String, HistoryItemEntityV2>()
+                    remoteArchive?.items.orEmpty().forEach { remoteItem ->
+                        if (remoteItem.id.isNotBlank() && remoteItem.id !in excludedIds) {
+                            val existing = mergedItemsMap[remoteItem.id]
+                            if (existing == null || remoteItem.timestamp >= existing.timestamp) {
+                                mergedItemsMap[remoteItem.id] = remoteItem
+                            }
+                        }
+                    }
+                    AndroidWatchHistoryManager.snapshotArchivedItems().values.forEach { localItem ->
+                        if (localItem.id.isNotBlank() && localItem.id !in excludedIds) {
+                            val existing = mergedItemsMap[localItem.id]
+                            if (existing == null || localItem.timestamp >= existing.timestamp) {
+                                mergedItemsMap[localItem.id] = localItem
+                            }
+                        }
+                    }
+
+                    val mergedWatchedIds = linkedSetOf<String>()
+                    remoteArchive?.watchedIds.orEmpty()
+                        .filter { it.isNotBlank() && it !in excludedIds }
+                        .forEach { mergedWatchedIds.add(it) }
+                    AndroidWatchHistoryManager.snapshotArchivedIds()
+                        .filter { it.isNotBlank() && it !in excludedIds }
+                        .forEach { mergedWatchedIds.add(it) }
+                    mergedItemsMap.values.forEach { item ->
+                        if (item.isWatched || item.progressFraction >= 0.90f) {
+                            mergedWatchedIds.add(item.id)
+                        } else if (item.isInProgressForProtection) {
+                            mergedWatchedIds.remove(item.id)
+                        }
+                    }
+
+                    AndroidWatchHistoryManager.replaceArchiveFromCloud(
+                        context = appContext,
+                        items = mergedItemsMap.values,
+                        watchedIds = mergedWatchedIds
+                    )
+
+                    val archivePayloadJson = ArchivePayloadV2(
+                        version = 2,
+                        updatedAt = System.currentTimeMillis(),
+                        watchedIds = mergedWatchedIds.toList(),
+                        items = mergedItemsMap.values.toList()
+                    ).toJsonString()
+                    val archiveMedia = ByteArrayContent.fromString("application/json", archivePayloadJson)
+                    val archiveOk = upsertHistoryFile(
                         driveService = driveService,
                         historyFolderId = historyFolderId,
                         fileName = ARCHIVE_SYNC_FILE,
@@ -340,6 +728,9 @@ class DriveWatchHistorySync(private val context: Context) {
                         mediaContent = archiveMedia,
                         priority = priority
                     )
+                    if (archiveOk) {
+                        AndroidWatchHistoryManager.clearPendingDeletedFromArchiveIds(pendingDeleted)
+                    }
                 }
 
                 lastUploadTime.set(System.currentTimeMillis())
